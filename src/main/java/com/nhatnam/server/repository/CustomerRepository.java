@@ -25,6 +25,7 @@ public interface CustomerRepository extends JpaRepository<Customer, Long> {
             "    OR LOWER(c.phone) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.email) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.companyName) LIKE LOWER(CONCAT('%', :q, '%')) " +
+            "    OR LOWER(c.contractName) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.customerCode) LIKE LOWER(CONCAT('%', :q, '%'))) " +
             "AND (:type IS NULL OR c.customerType = :type) " +
             "AND (:isActive IS NULL OR c.isActive = :isActive) " +
@@ -44,6 +45,7 @@ public interface CustomerRepository extends JpaRepository<Customer, Long> {
             "    OR LOWER(c.phone) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.email) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.companyName) LIKE LOWER(CONCAT('%', :q, '%')) " +
+            "    OR LOWER(c.contractName) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.customerCode) LIKE LOWER(CONCAT('%', :q, '%'))) " +
             "AND (:type IS NULL OR c.customerType = :type) " +
             "AND (:isActive IS NULL OR c.isActive = :isActive) " +
@@ -60,6 +62,7 @@ public interface CustomerRepository extends JpaRepository<Customer, Long> {
             "    OR LOWER(c.phone) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.email) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.companyName) LIKE LOWER(CONCAT('%', :q, '%')) " +
+            "    OR LOWER(c.contractName) LIKE LOWER(CONCAT('%', :q, '%')) " +
             "    OR LOWER(c.customerCode) LIKE LOWER(CONCAT('%', :q, '%'))) " +
             "AND (:type IS NULL OR c.customerType = :type) " +
             "AND (:isActive IS NULL OR c.isActive = :isActive)")

@@ -7,4 +7,7 @@ import java.util.List;
 public interface FactoryProductRepository extends JpaRepository<FactoryProduct, Long> {
     List<FactoryProduct> findByIsActiveTrueOrderByNameAsc();
     List<FactoryProduct> findAllByOrderByNameAsc();
+
+    /** Tất cả FactoryProduct đang liên kết tới 1 Ingredient — dùng để đồng bộ tên/đơn vị khi Ingredient đổi */
+    List<FactoryProduct> findByIngredientId(Long ingredientId);
 }

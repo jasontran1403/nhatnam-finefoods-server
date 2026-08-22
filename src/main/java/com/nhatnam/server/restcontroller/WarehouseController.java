@@ -16,6 +16,7 @@ import com.nhatnam.server.repository.UserRepository;
 import com.nhatnam.server.service.*;
 import com.nhatnam.server.service.serviceimpl.WarehouseService;
 import com.nhatnam.server.utils.InvoicePdf;
+import com.nhatnam.server.utils.TransportSlipPdf;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
@@ -43,14 +44,22 @@ import java.util.stream.Collectors;
 public class WarehouseController {
 
     private final WarehouseService warehouseService;
+    /**
+     * Quy tắc "đơn này có phải thu tiền trước không" nằm ở impl chứ không trên interface
+     * OrderService, và giờ cần AddressCatalogService để tra vùng COD — nên không còn static.
+     */
+    private final com.nhatnam.server.service.serviceimpl.OrderServiceImpl orderServiceImpl;
+    private final TransportSlipPdf transportSlipPdf;
     private final InvoicePdf invoicePdf;
     private final DriverRepository driverRepository;
+    private final com.nhatnam.server.service.DriverUserSyncService driverUserSyncService;
     private final com.nhatnam.server.repository.DriverAttendanceRepository driverAttendanceRepository;
     private final FileStorageService fileStorageService;
     private final CategoryService categoryService;
     private final SubCategoryService subCategoryService;
 
     private final WarehouseInventoryExportService exportService;
+    private final com.nhatnam.server.service.IngredientWarehouseService ingredientWarehouseService;
 
     @PostMapping("/export-inventory-check")
     public ResponseEntity<?> exportInventoryCheck(
@@ -63,8 +72,23 @@ public class WarehouseController {
             // Luôn dùng thời điểm hiện tại làm ngày kiểm kho
             LocalDateTime checkDateTime = LocalDateTime.now();
 
+            // Chỉ giữ nguyên liệu CÒN được gán cho kho đang chọn.
+            //   Sau khi gỡ nguyên liệu khỏi kho, bảng gán (ingredient_warehouse)
+            //   đã xoá mapping nhưng dòng tồn (IngredientStock) vẫn còn, khiến
+            //   nguyên liệu vẫn lọt vào phiếu. Lọc lại theo assignment ở đây để
+            //   đảm bảo đúng dù client gửi gì. Item không kèm ingredientId sẽ
+            //   được giữ (tương thích ngược với client cũ).
+            List<ItemRequest> srcItems = req.items() != null ? req.items() : List.of();
+            if (req.warehouseId() != null) {
+                java.util.Set<Long> assignedIds = new java.util.HashSet<>(
+                        ingredientWarehouseService.getIngredientIdsByWarehouse(req.warehouseId()));
+                srcItems = srcItems.stream()
+                        .filter(it -> it.ingredientId() == null || assignedIds.contains(it.ingredientId()))
+                        .toList();
+            }
+
             // Map request DTOs → service DTOs
-            List<WarehouseInventoryExportService.InventoryItem> items = req.items().stream().map(it ->
+            List<WarehouseInventoryExportService.InventoryItem> items = srcItems.stream().map(it ->
                     new WarehouseInventoryExportService.InventoryItem(
                             it.ingredientName(),
                             it.spec(),
@@ -77,7 +101,11 @@ public class WarehouseController {
                                             e.expiryDate(),
                                             e.quantity()
                                     )
-                            ).toList()
+                            ).toList(),
+                            it.categoryId(),
+                            it.categoryName(),
+                            it.subCategoryId(),
+                            it.subCategoryName()
                     )
             ).toList();
 
@@ -109,11 +137,16 @@ public class WarehouseController {
     ) {}
 
     public record ItemRequest(
+            Long   ingredientId,
             String ingredientName,
             String spec,
             String unit,
             Double stockQuantity,
-            List<ExpiryRequest> expiryList
+            List<ExpiryRequest> expiryList,
+            Long   categoryId,
+            String categoryName,
+            Long   subCategoryId,
+            String subCategoryName
     ) {}
 
     public record ExpiryRequest(
@@ -173,10 +206,29 @@ public class WarehouseController {
                         "Chỉ được xác nhận đã giao khi đơn đang ở trạng thái Đang giao"));
             }
 
-            // Dùng markAsPendingPayment để chuyển DELIVERING → PENDING_PAYMENT
-            orderService.markAsPendingPayment(id, actorName, actor.getId());
+            // markAsPendingPayment: DELIVERING → PENDING_PAYMENT.
+            // NGOẠI LỆ: nếu đơn ĐÃ THU ĐỦ TIỀN (điển hình là khách bắt buộc thanh toán trước)
+            // thì service sẽ tự chuyển thẳng sang COMPLETED — không có gì để "chờ thu" nữa.
+            var result = orderService.markAsPendingPayment(id, actorName, actor.getId());
 
-            return ResponseEntity.ok(ApiResponse.success(null, "Đã xác nhận giao hàng thành công"));
+            boolean completed = result != null
+                    && OrderStatus.COMPLETED.name().equals(String.valueOf(result.getStatus()));
+
+            // TRẢ VỀ TRẠNG THÁI THẬT thay vì null.
+            //
+            // Đơn đã thu đủ tiền trước sẽ được service chuyển thẳng sang COMPLETED, nhưng
+            // FE trước đây tự gán cứng PENDING_PAYMENT nên hiển thị sai cho tới khi F5.
+            // Có dữ liệu trả về thì FE dùng đúng cái server quyết định.
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("id",            result != null ? result.getId() : id);
+            data.put("status",        result != null ? result.getStatus() : null);
+            data.put("paymentStatus", result != null ? result.getPaymentStatus() : null);
+            data.put("paidAmount",    result != null ? result.getPaidAmount() : null);
+            data.put("completed",     completed);
+
+            return ResponseEntity.ok(ApiResponse.success(data, completed
+                    ? "Đã xác nhận giao hàng — đơn đã thu đủ tiền nên được HOÀN THÀNH luôn"
+                    : "Đã xác nhận giao hàng thành công"));
         } catch (RuntimeException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
         } catch (Exception e) {
@@ -277,6 +329,12 @@ public class WarehouseController {
                 m.put("finalAmount",    o.getFinalAmount());
                 m.put("notes",          o.getNotes());
                 m.put("orderedByName",  o.getOrderedByName());
+                m.put("deliveryAddress",  o.getDeliveryAddress());
+                m.put("shippingAddress",  o.getShippingAddress());
+                m.put("provinceName",     o.getProvinceName());
+                m.put("wardName",         o.getWardName());
+                m.put("receiverName",     o.getReceiverName());
+                m.put("deliveryDatetime", o.getDeliveryDatetime());
                 m.put("createdByName",  o.getUser() != null
                         ? (o.getUser().getFullName() != null && !o.getUser().getFullName().isBlank()
                         ? o.getUser().getFullName() : o.getUser().getUsername())
@@ -286,6 +344,20 @@ public class WarehouseController {
                 m.put("debtDays",       o.getDebtDays());
                 m.put("paidAmount",     o.getPaidAmount() != null
                         ? o.getPaidAmount() : java.math.BigDecimal.ZERO);
+
+                // ── YÊU CẦU THANH TOÁN TRƯỚC ─────────────────────────────────
+                boolean prepay2 = orderServiceImpl.isPrepaymentRequired(o);
+                java.math.BigDecimal fin2  = o.getFinalAmount() != null
+                        ? o.getFinalAmount() : java.math.BigDecimal.ZERO;
+                java.math.BigDecimal paid2 = o.getPaidAmount() != null
+                        ? o.getPaidAmount() : java.math.BigDecimal.ZERO;
+                boolean fullyPaid2 = o.getPaymentStatus() == com.nhatnam.server.enumtype.PaymentStatus.PAID
+                        || paid2.compareTo(fin2.subtract(java.math.BigDecimal.ONE)) >= 0;
+                m.put("requirePrepayment", prepay2);
+                m.put("remainingAmount",   fin2.subtract(paid2).max(java.math.BigDecimal.ZERO)
+                        .setScale(0, java.math.RoundingMode.HALF_UP));
+                // false → FE khoá nút "Bắt đầu giao hàng"
+                m.put("canDeliver",        !prepay2 || fullyPaid2);
                 return m;
             }).collect(Collectors.toList());
 
@@ -344,11 +416,21 @@ public class WarehouseController {
         return ResponseEntity.ok(warehouseService.updateWarehouse(id, req));
     }
 
+    /**
+     * Danh mục nguyên liệu.
+     *
+     * <p>Truyền {@code warehouseId} để chỉ lấy nguyên liệu ĐÃ GÁN cho kho đó —
+     * màn Quản lý kho dùng tham số này. Bỏ trống thì vẫn trả toàn bộ danh mục
+     * như trước, để các màn dùng chung (chọn nguyên liệu khi tạo phiếu, đối chiếu
+     * công thức…) không bị đổi hành vi.
+     */
     @GetMapping("/all-ingredients")
-    public ResponseEntity<ApiResponse<List<IngredientResponse>>> getAllIngredients() {
+    public ResponseEntity<ApiResponse<List<IngredientResponse>>> getAllIngredients(
+            @RequestParam(required = false) Long warehouseId) {
         try {
             return ResponseEntity.ok(ApiResponse.success(
-                    ingredientService.getAllIngredients(), "Ingredients retrieved successfully"));
+                    ingredientService.getAllIngredientsOfWarehouse(warehouseId),
+                    "Ingredients retrieved successfully"));
         } catch (Exception e) {
             log.error("❌ Failed to get ingredients", e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
@@ -443,6 +525,33 @@ public class WarehouseController {
         return ResponseEntity.ok(warehouseService.transferStock(req, user.getId()));
     }
 
+    // ── Mục 4.2: Chuyển kho sang KHO SẢN XUẤT (xưởng) ─────────────────────────
+    @GetMapping("/{warehouseId}/registered-ingredient-ids")
+    public ResponseEntity<java.util.List<Long>> registeredIngredientIds(@PathVariable Long warehouseId) {
+        return ResponseEntity.ok(warehouseService.getRegisteredIngredientIds(warehouseId));
+    }
+
+    @GetMapping("/production-factories")
+    public ResponseEntity<java.util.List<java.util.Map<String, Object>>> listProductionFactories() {
+        return ResponseEntity.ok(warehouseService.listProductionFactoriesForTransfer());
+    }
+
+    @GetMapping("/production-factories/{id}/material-names")
+    public ResponseEntity<java.util.List<String>> factoryMaterialNames(@PathVariable Long id) {
+        return ResponseEntity.ok(warehouseService.getFactoryMaterialNames(id));
+    }
+
+    // Mục 1 — chuyển kho hàng → kho THÀNH PHẨM xưởng
+    @GetMapping("/finished-goods-factories")
+    public ResponseEntity<java.util.List<java.util.Map<String, Object>>> listFinishedGoodsFactories() {
+        return ResponseEntity.ok(warehouseService.listFinishedGoodsFactoriesForTransfer());
+    }
+
+    @GetMapping("/finished-goods-factories/{id}/product-names")
+    public ResponseEntity<java.util.List<String>> finishedGoodsProductNames(@PathVariable Long id) {
+        return ResponseEntity.ok(warehouseService.getFinishedGoodsProductNames(id));
+    }
+
     // ── Lịch sử ──────────────────────────────────────────────────────────────
     // FIX #4: Lọc lịch sử theo warehouseId của user nếu không phải ADMIN/OWNER
     @GetMapping("/history")
@@ -472,6 +581,30 @@ public class WarehouseController {
     @GetMapping("/receipt/{receiptId}")
     public ResponseEntity<ReceiptResponse> getReceiptDetail(@PathVariable Long receiptId) {
         return ResponseEntity.ok(warehouseService.getReceiptDetail(receiptId));
+    }
+
+    /**
+     * In PHIẾU ĐI ĐƯỜNG (Giấy thông tin nguồn gốc động vật) cho một phiếu chuyển kho ra.
+     * Trả về file PDF để tải/in trực tiếp.
+     */
+    @GetMapping("/receipt/{receiptId}/transport-slip")
+    public ResponseEntity<byte[]> getTransportSlip(@PathVariable Long receiptId) {
+        try {
+            var data = warehouseService.buildTransportSlip(receiptId);
+            byte[] pdf = transportSlipPdf.generate(data);
+            String filename = "phieu-di-duong-" + data.receiptCode() + ".pdf";
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
+                    .contentType(MediaType.APPLICATION_PDF)
+                    .body(pdf);
+        } catch (com.nhatnam.server.common.BusinessException e) {
+            return ResponseEntity.badRequest()
+                    .body(e.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.error("Lỗi tạo phiếu đi đường cho phiếu {}", receiptId, e);
+            return ResponseEntity.status(500)
+                    .body("Không tạo được phiếu đi đường".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
     }
 
     // ── Orders ───────────────────────────────────────────────────────────────
@@ -513,6 +646,42 @@ public class WarehouseController {
                         m.put("status",        o.getStatus());
                         m.put("notes",         o.getNotes());
                         m.put("createdAt",     o.getCreatedAt());
+
+                        // ── THÔNG TIN GIAO HÀNG ──────────────────────────────
+                        // Kho cần địa chỉ và người nhận ngay trên màn hình soạn hàng.
+                        // Thiếu chúng nên modal "Bắt đầu giao" trước đây hiện địa chỉ "—"
+                        // dù đơn có địa chỉ đầy đủ.
+                        m.put("deliveryAddress",  o.getDeliveryAddress());
+                        m.put("shippingAddress",  o.getShippingAddress());
+                        m.put("provinceName",     o.getProvinceName());
+                        m.put("wardName",         o.getWardName());
+                        m.put("receiverName",     o.getReceiverName());
+                        m.put("orderedByName",    o.getOrderedByName());
+                        m.put("deliveryDatetime", o.getDeliveryDatetime());
+
+                        // ── YÊU CẦU THANH TOÁN TRƯỚC ─────────────────────────
+                        // FE dùng các cờ này để KHOÁ nút "Giao hàng" khi khách bắt buộc
+                        // thanh toán trước mà đơn chưa thu đủ tiền. (BE cũng chặn lại
+                        // trong OrderServiceImpl.markAsDelivering — đây chỉ là lớp UX.)
+                        boolean prepay = orderServiceImpl.isPrepaymentRequired(o);
+                        java.math.BigDecimal fin  = o.getFinalAmount() != null
+                                ? o.getFinalAmount() : java.math.BigDecimal.ZERO;
+                        java.math.BigDecimal paid = o.getPaidAmount() != null
+                                ? o.getPaidAmount() : java.math.BigDecimal.ZERO;
+                        java.math.BigDecimal remaining = fin.subtract(paid)
+                                .max(java.math.BigDecimal.ZERO)
+                                .setScale(0, java.math.RoundingMode.HALF_UP);
+                        boolean fullyPaid = o.getPaymentStatus() == com.nhatnam.server.enumtype.PaymentStatus.PAID
+                                || paid.compareTo(fin.subtract(java.math.BigDecimal.ONE)) >= 0;
+
+                        m.put("requirePrepayment", prepay);
+                        m.put("paymentStatus",     o.getPaymentStatus());
+                        m.put("finalAmount",       fin.setScale(0, java.math.RoundingMode.HALF_UP));
+                        m.put("paidAmount",        paid.setScale(0, java.math.RoundingMode.HALF_UP));
+                        m.put("remainingAmount",   remaining);
+                        // false → FE khoá nút "Giao hàng"
+                        m.put("canDeliver",        !prepay || fullyPaid);
+
                         m.put("items", o.getOrderItems().stream()
                                 .map(item -> {
                                     Map<String, Object> i = new java.util.LinkedHashMap<>();
@@ -682,6 +851,8 @@ public class WarehouseController {
                     .contactName(order.getContactName())
                     .hideAllPrices(order.getHideAllPrices())
                     .deliveryAddress(order.getDeliveryAddress())
+                    .provinceName(order.getProvinceName())
+                    .wardName(order.getWardName())
                     .vatBreakdownInclusive(vatBreakdownInclusive)
                     .vatBreakdownExclusive(vatBreakdownExclusive)
                     .items(order.getItems().stream()
@@ -775,24 +946,35 @@ public class WarehouseController {
         }
     }
 
-    /** POST /api/warehouse/drivers — tạo tài xế mới */
+    /** POST /api/warehouse/drivers — tạo tài xế mới (kèm tài khoản, chặn trùng tên) */
     @PostMapping("/drivers")
     public ResponseEntity<ApiResponse<Map<String, Object>>> createDriver(
             @RequestBody Map<String, String> body) {
         try {
             String name = body.getOrDefault("name", "").trim();
             if (name.isBlank()) return ResponseEntity.ok(ApiResponse.error(400, "Tên tài xế không được trống"));
+
             Driver.VehicleType vt = Driver.VehicleType.BOTH;
             try {
                 String vtStr = body.get("vehicleType");
                 if (vtStr != null && !vtStr.isBlank()) vt = Driver.VehicleType.valueOf(vtStr.toUpperCase());
             } catch (IllegalArgumentException ignored) {}
-            Driver d = driverRepository.save(Driver.builder().name(name).active(true).vehicleType(vt).build());
+
+            // Tạo tài xế + tài khoản; ném IllegalArgumentException nếu trùng tên
+            // → FE nhận message và toast cảnh báo.
+            Driver d = driverUserSyncService.createDriverWithAccount(name, vt, false);
+
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("id", d.getId());
             result.put("name", d.getName());
             result.put("vehicleType", d.getVehicleType().name());
+            if (d.getUser() != null) {
+                result.put("userId", d.getUser().getId());
+                result.put("username", d.getUser().getUsername());
+            }
             return ResponseEntity.ok(ApiResponse.success(result, "OK"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(400, e.getMessage()));
         } catch (Exception e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
@@ -836,11 +1018,14 @@ public class WarehouseController {
         try {
             String d = (date != null && !date.isBlank()) ? date
                     : java.time.LocalDate.now(java.time.ZoneId.of("Asia/Ho_Chi_Minh"))
-                            .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE);
+                    .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE);
 
-            // Lấy tất cả tài xế active
+            // Tài xế active VÀ có theo dõi ODO.
+            // systemDriver = true nghĩa là "không xử lý": các lựa chọn giao hàng ảo
+            // (Grab, Giao tại kho, Khách tự lấy…) — không có công-tơ-mét để điểm danh
+            // nên không hiển thị ở màn này.
             List<com.nhatnam.server.entity.Driver> allDrivers =
-                    driverRepository.findByActiveTrueOrderByNameAsc();
+                    driverRepository.findByActiveTrueAndSystemDriverFalseOrderByNameAsc();
 
             // Lấy điểm danh của ngày
             List<com.nhatnam.server.entity.DriverAttendance> attList =
@@ -851,7 +1036,7 @@ public class WarehouseController {
             for (com.nhatnam.server.entity.DriverAttendance a : attList) {
                 String key = a.getDriver().getId() + "-" + a.getVehicleType().name();
                 attMap.computeIfAbsent(key, k -> new LinkedHashMap<>())
-                      .put(a.getSessionType().name(), a);
+                        .put(a.getSessionType().name(), a);
             }
 
             // Build result: 1 object per driver, vehicles = [{vehicleType, start{}, end{}}]
@@ -875,12 +1060,22 @@ public class WarehouseController {
                     com.nhatnam.server.entity.DriverAttendance startAtt = sessions.get("START");
                     com.nhatnam.server.entity.DriverAttendance endAtt   = sessions.get("END");
 
+                    // MỐC SÀN: số ODO đã ghi gần nhất ở những ngày TRƯỚC. FE dùng nó
+                    // để khoá ô nhập, không cho gõ số nhỏ hơn — công-tơ-mét không
+                    // quay ngược, gõ nhầm sẽ làm số km ra âm.
+                    List<com.nhatnam.server.entity.DriverAttendance> prevList =
+                            driverAttendanceRepository.findPreviousBefore(driver, vt, d);
+                    Integer prevOdo = prevList.isEmpty() ? null : prevList.get(0).getOdometer();
+                    String prevDate = prevList.isEmpty() ? null : prevList.get(0).getAttendanceDate();
+
                     Map<String, Object> vMap = new LinkedHashMap<>();
                     vMap.put("vehicleType",     vt.name());
                     vMap.put("startOdometer",   startAtt != null ? startAtt.getOdometer()   : null);
                     vMap.put("startRecordedBy", startAtt != null ? startAtt.getRecordedBy() : null);
                     vMap.put("endOdometer",     endAtt   != null ? endAtt.getOdometer()     : null);
                     vMap.put("endRecordedBy",   endAtt   != null ? endAtt.getRecordedBy()   : null);
+                    vMap.put("prevOdometer",    prevOdo);
+                    vMap.put("prevOdometerDate", prevDate);
                     vehicles.add(vMap);
                 }
 
@@ -920,27 +1115,27 @@ public class WarehouseController {
             Integer odo   = body.get("odometer") instanceof Number n ? n.intValue() : null;
             String date   = body.get("date") instanceof String s && !s.isBlank() ? s
                     : java.time.LocalDate.now(java.time.ZoneId.of("Asia/Ho_Chi_Minh"))
-                            .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE);
+                    .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE);
 
             if (odo == null || odo < 0) throw new IllegalArgumentException("ODO không hợp lệ");
 
             // Resolve driver, vehicleType, sessionType
             com.nhatnam.server.entity.Driver driver = driverRepository.findById(driverId)
-                .orElseThrow(() -> new RuntimeException("Tài xế không tồn tại: " + driverId));
+                    .orElseThrow(() -> new RuntimeException("Tài xế không tồn tại: " + driverId));
             com.nhatnam.server.entity.Driver.VehicleType vt =
-                com.nhatnam.server.entity.Driver.VehicleType.valueOf(vtStr.toUpperCase());
+                    com.nhatnam.server.entity.Driver.VehicleType.valueOf(vtStr.toUpperCase());
             com.nhatnam.server.entity.DriverAttendance.SessionType st =
-                com.nhatnam.server.entity.DriverAttendance.SessionType.valueOf(stStr.toUpperCase());
+                    com.nhatnam.server.entity.DriverAttendance.SessionType.valueOf(stStr.toUpperCase());
 
             // Validate: đầu ca ≤ cuối ca
             com.nhatnam.server.entity.DriverAttendance.SessionType otherSt =
-                (st == com.nhatnam.server.entity.DriverAttendance.SessionType.START)
-                    ? com.nhatnam.server.entity.DriverAttendance.SessionType.END
-                    : com.nhatnam.server.entity.DriverAttendance.SessionType.START;
+                    (st == com.nhatnam.server.entity.DriverAttendance.SessionType.START)
+                            ? com.nhatnam.server.entity.DriverAttendance.SessionType.END
+                            : com.nhatnam.server.entity.DriverAttendance.SessionType.START;
 
             java.util.Optional<com.nhatnam.server.entity.DriverAttendance> otherAttOpt =
-                driverAttendanceRepository.findByAttendanceDateAndSessionTypeAndDriverAndVehicleType(
-                    date, otherSt, driver, vt);
+                    driverAttendanceRepository.findByAttendanceDateAndSessionTypeAndDriverAndVehicleType(
+                            date, otherSt, driver, vt);
 
             if (otherAttOpt.isPresent()) {
                 int otherOdo = otherAttOpt.get().getOdometer();
@@ -948,13 +1143,54 @@ public class WarehouseController {
                     throw new IllegalArgumentException("ODO đầu ca không được lớn hơn ODO cuối ca (" + otherOdo + " km)");
                 if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.END && odo < otherOdo)
                     throw new IllegalArgumentException("ODO cuối ca không được nhỏ hơn ODO đầu ca (" + otherOdo + " km)");
+            } else if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.END) {
+                // KẾT CA PHẢI CÓ VÀO CA TRƯỚC.
+                //
+                // Không có ODO đầu ca thì quãng đường ngày đó không tính được, mà
+                // dòng kết ca đơn độc lại làm ô "đầu ca" bị khoá bởi mốc sàn của
+                // chính nó — càng khó sửa. Chặn ngay từ đầu là cách rẻ nhất.
+                throw new IllegalArgumentException(
+                        "Chưa điểm danh đầu ca ngày " + date + " — vui lòng nhập ODO đầu ca trước.");
+            }
+
+            // Validate: không được nhỏ hơn số ODO đã ghi ở NGÀY TRƯỚC.
+            //
+            // Trước đây chỉ đối chiếu trong cùng một ngày, nên gõ nhầm thiếu chữ số
+            // vẫn lọt và ngày hôm sau ra quãng đường âm. Chặn ngay tại đây thay vì
+            // sửa số liệu về sau — báo cáo tháng thường chỉ được rà lại khi đã muộn.
+            List<com.nhatnam.server.entity.DriverAttendance> prevList =
+                    driverAttendanceRepository.findPreviousBefore(driver, vt, date);
+            if (!prevList.isEmpty()) {
+                com.nhatnam.server.entity.DriverAttendance prev = prevList.get(0);
+                if (odo < prev.getOdometer()) {
+                    throw new IllegalArgumentException(
+                            "ODO không được nhỏ hơn số đã ghi ngày " + prev.getAttendanceDate()
+                                    + " (" + prev.getOdometer() + " km)");
+                }
+            }
+
+            // ── TỰ BÙ KẾT CA CHO NGÀY CŨ CÒN THIẾU ──────────────────────────
+            //
+            // Tài xế quên bấm kết ca thì ngày đó treo mãi, và số km của nó không
+            // bao giờ được tính. Khi điểm danh ĐẦU CA của một ngày sau, ODO hiện
+            // tại chính là mốc cuối cùng mà xe đã chạy tới — dùng nó bù vào kết ca
+            // còn thiếu là con số sát thực tế nhất có được.
+            //
+            // VD: 1/8 có đầu ca, quên kết ca. Ngày 4/8 nhập đầu ca 10.500 km →
+            // kết ca ngày 1/8 được ghi 10.500 km.
+            //
+            // Chỉ bù NGÀY GẦN NHẤT còn thiếu, không quét ngược toàn bộ lịch sử:
+            // dồn hết quãng đường của nhiều ngày vào một ngày sẽ sai nặng hơn là
+            // để trống. Bản ghi bù ghi rõ nguồn gốc ở recordedBy để còn truy lại.
+            if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.START) {
+                autoFillMissingEnd(driver, vt, date, odo, recorderName);
             }
 
             // Upsert
             com.nhatnam.server.entity.DriverAttendance att =
                     driverAttendanceRepository.findByAttendanceDateAndSessionTypeAndDriverAndVehicleType(
-                            date, st, driver, vt)
-                    .orElse(null);
+                                    date, st, driver, vt)
+                            .orElse(null);
 
             if (att == null) {
                 att = com.nhatnam.server.entity.DriverAttendance.builder()
@@ -985,6 +1221,64 @@ public class WarehouseController {
             log.error("upsertAttendance error", e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
+    }
+
+    /**
+     * BÙ KẾT CA CHO NGÀY GẦN NHẤT CÓ ĐẦU CA MÀ THIẾU KẾT CA.
+     *
+     * <p>Gọi khi nhập ĐẦU CA của {@code date}. Duyệt ngược các ngày trước đó, gặp
+     * ngày đầu tiên có START mà không có END thì ghi END = {@code odoNow}.
+     *
+     * <p>Nếu ngày gần nhất đã đủ cả hai ca thì không làm gì — dữ liệu đang lành.
+     * Nếu ngày đó chỉ có END mà không có START (dữ liệu cũ, trước khi có ràng
+     * buộc) cũng bỏ qua: không đoán được đầu ca là bao nhiêu.
+     *
+     * @param odoNow ODO đầu ca vừa nhập — đã được validate ≥ mọi ODO trước đó
+     * @return true nếu có bù, để nơi gọi ghi log nếu cần
+     */
+    private boolean autoFillMissingEnd(com.nhatnam.server.entity.Driver driver,
+                                       com.nhatnam.server.entity.Driver.VehicleType vt,
+                                       String date,
+                                       int odoNow,
+                                       String recorderName) {
+
+        List<com.nhatnam.server.entity.DriverAttendance> prevList =
+                driverAttendanceRepository.findPreviousBefore(driver, vt, date);
+        if (prevList.isEmpty()) return false;
+
+        // Gom theo ngày, giữ nguyên thứ tự ngày giảm dần của truy vấn.
+        Map<String, Map<String, com.nhatnam.server.entity.DriverAttendance>> byDate =
+                new LinkedHashMap<>();
+        for (com.nhatnam.server.entity.DriverAttendance a : prevList) {
+            byDate.computeIfAbsent(a.getAttendanceDate(), k -> new LinkedHashMap<>())
+                    .put(a.getSessionType().name(), a);
+        }
+
+        // Ngày gần nhất = phần tử đầu tiên.
+        Map.Entry<String, Map<String, com.nhatnam.server.entity.DriverAttendance>> latest =
+                byDate.entrySet().iterator().next();
+
+        Map<String, com.nhatnam.server.entity.DriverAttendance> sessions = latest.getValue();
+        com.nhatnam.server.entity.DriverAttendance startAtt = sessions.get("START");
+        if (startAtt == null || sessions.get("END") != null) return false;
+
+        // Không bù ngược: kết ca luôn phải ≥ đầu ca của chính ngày đó.
+        if (odoNow < startAtt.getOdometer()) return false;
+
+        driverAttendanceRepository.save(
+                com.nhatnam.server.entity.DriverAttendance.builder()
+                        .driver(driver)
+                        .attendanceDate(latest.getKey())
+                        .sessionType(com.nhatnam.server.entity.DriverAttendance.SessionType.END)
+                        .vehicleType(vt)
+                        .odometer(odoNow)
+                        .recordedBy("Tự bù từ đầu ca " + date
+                                + (recorderName != null ? " (" + recorderName + ")" : ""))
+                        .build());
+
+        log.info("Bù kết ca thiếu: tài xế {} xe {} ngày {} → ODO {}",
+                driver.getId(), vt, latest.getKey(), odoNow);
+        return true;
     }
 
     /**
@@ -1043,20 +1337,20 @@ public class WarehouseController {
             com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
             Map<String, Integer> ordersByName = new java.util.HashMap<>();
             orderRepository.findAll().stream()
-                .filter(o -> (o.getStatus() == com.nhatnam.server.enumtype.OrderStatus.PENDING_PAYMENT
-                              || o.getStatus() == com.nhatnam.server.enumtype.OrderStatus.COMPLETED)
-                        && o.getCreatedAt() >= fromMs && o.getCreatedAt() <= toMs
-                        && o.getDeliveryInfoJson() != null && !o.getDeliveryInfoJson().isBlank())
-                .forEach(o -> {
-                    try {
-                        List<Map<String,Object>> info = om.readValue(o.getDeliveryInfoJson(),
-                                new com.fasterxml.jackson.core.type.TypeReference<List<Map<String,Object>>>(){});
-                        for (Map<String,Object> d : info) {
-                            String n = String.valueOf(d.getOrDefault("name","")).trim();
-                            if (!n.isBlank()) ordersByName.merge(n, 1, Integer::sum);
-                        }
-                    } catch (Exception ignored) {}
-                });
+                    .filter(o -> (o.getStatus() == com.nhatnam.server.enumtype.OrderStatus.PENDING_PAYMENT
+                            || o.getStatus() == com.nhatnam.server.enumtype.OrderStatus.COMPLETED)
+                            && o.getCreatedAt() >= fromMs && o.getCreatedAt() <= toMs
+                            && o.getDeliveryInfoJson() != null && !o.getDeliveryInfoJson().isBlank())
+                    .forEach(o -> {
+                        try {
+                            List<Map<String,Object>> info = om.readValue(o.getDeliveryInfoJson(),
+                                    new com.fasterxml.jackson.core.type.TypeReference<List<Map<String,Object>>>(){});
+                            for (Map<String,Object> d : info) {
+                                String n = String.valueOf(d.getOrDefault("name","")).trim();
+                                if (!n.isBlank()) ordersByName.merge(n, 1, Integer::sum);
+                            }
+                        } catch (Exception ignored) {}
+                    });
 
             try (org.apache.poi.xssf.usermodel.XSSFWorkbook wb = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
                  java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream()) {
@@ -1082,29 +1376,29 @@ public class WarehouseController {
 
                 // ── Helper: create style ──────────────────────────────────────
                 java.util.function.BiFunction<byte[], Boolean, org.apache.poi.ss.usermodel.CellStyle> makeStyle =
-                    (bg, bold) -> {
-                        org.apache.poi.ss.usermodel.CellStyle s = wb.createCellStyle();
-                        if (bg != null) {
-                            s.setFillForegroundColor(new org.apache.poi.xssf.usermodel.XSSFColor(bg, null));
-                            s.setFillPattern(org.apache.poi.ss.usermodel.FillPatternType.SOLID_FOREGROUND);
-                        }
-                        org.apache.poi.xssf.usermodel.XSSFFont f = (org.apache.poi.xssf.usermodel.XSSFFont) wb.createFont();
-                        if (bold) f.setBold(true);
-                        f.setFontHeightInPoints((short)10);
-                        s.setFont(f);
-                        s.setVerticalAlignment(org.apache.poi.ss.usermodel.VerticalAlignment.CENTER);
-                        s.setBorderTop(org.apache.poi.ss.usermodel.BorderStyle.THIN);
-                        s.setBorderBottom(org.apache.poi.ss.usermodel.BorderStyle.THIN);
-                        s.setBorderLeft(org.apache.poi.ss.usermodel.BorderStyle.THIN);
-                        s.setBorderRight(org.apache.poi.ss.usermodel.BorderStyle.THIN);
-                        return s;
-                    };
+                        (bg, bold) -> {
+                            org.apache.poi.ss.usermodel.CellStyle s = wb.createCellStyle();
+                            if (bg != null) {
+                                s.setFillForegroundColor(new org.apache.poi.xssf.usermodel.XSSFColor(bg, null));
+                                s.setFillPattern(org.apache.poi.ss.usermodel.FillPatternType.SOLID_FOREGROUND);
+                            }
+                            org.apache.poi.xssf.usermodel.XSSFFont f = (org.apache.poi.xssf.usermodel.XSSFFont) wb.createFont();
+                            if (bold) f.setBold(true);
+                            f.setFontHeightInPoints((short)10);
+                            s.setFont(f);
+                            s.setVerticalAlignment(org.apache.poi.ss.usermodel.VerticalAlignment.CENTER);
+                            s.setBorderTop(org.apache.poi.ss.usermodel.BorderStyle.THIN);
+                            s.setBorderBottom(org.apache.poi.ss.usermodel.BorderStyle.THIN);
+                            s.setBorderLeft(org.apache.poi.ss.usermodel.BorderStyle.THIN);
+                            s.setBorderRight(org.apache.poi.ss.usermodel.BorderStyle.THIN);
+                            return s;
+                        };
 
                 // ── Column widths ─────────────────────────────────────────────
                 // STT|Tên|Km XM|Phiếu XM|Km XT|Phiếu XT|Đơn giao|(Lương XM)|(Lương XT)|Tổng lương
                 int[] colW = hasSalary
-                    ? new int[]{5, 22, 11, 11, 11, 11, 11, 14, 14, 14}
-                    : new int[]{5, 22, 11, 11, 11, 11, 11};
+                        ? new int[]{5, 22, 11, 11, 11, 11, 11, 14, 14, 14}
+                        : new int[]{5, 22, 11, 11, 11, 11, 11};
                 for (int i = 0; i < colW.length; i++) ws.setColumnWidth(i, colW[i] * 256);
 
                 int totalCols = colW.length;
@@ -1139,8 +1433,8 @@ public class WarehouseController {
                 metaStyle.setFont(metaFont);
                 org.apache.poi.ss.usermodel.Cell c1 = r1.createCell(0);
                 c1.setCellValue("Xuất lúc: " + exportedAt + "   |   Người xuất: " + exportedBy
-                    + (hasSalary ? "   |   Lương XM: " + String.format("%,.0f", bikeRatePerKm) + " đ/km"
-                                   + "   |   Lương XT: " + String.format("%,.0f", truckRatePerKm) + " đ/km" : ""));
+                        + (hasSalary ? "   |   Lương XM: " + String.format("%,.0f", bikeRatePerKm) + " đ/km"
+                        + "   |   Lương XT: " + String.format("%,.0f", truckRatePerKm) + " đ/km" : ""));
                 c1.setCellStyle(metaStyle);
                 ws.addMergedRegion(new org.apache.poi.ss.util.CellRangeAddress(1, 1, 0, totalCols - 1));
 
@@ -1153,10 +1447,10 @@ public class WarehouseController {
                 org.apache.poi.ss.usermodel.CellStyle hStyle = makeStyle.apply(darkNavy, true);
                 hStyle.setAlignment(org.apache.poi.ss.usermodel.HorizontalAlignment.CENTER);
                 ((org.apache.poi.xssf.usermodel.XSSFCellStyle)hStyle).getFont()
-                    .setColor(new org.apache.poi.xssf.usermodel.XSSFColor(white, null));
+                        .setColor(new org.apache.poi.xssf.usermodel.XSSFColor(white, null));
 
                 java.util.List<String> headers = new java.util.ArrayList<>(java.util.Arrays.asList(
-                    "STT", "Tài xế", "Km xe máy", "Phiếu XM", "Km xe tải", "Phiếu XT", "Đơn đã giao"
+                        "STT", "Tài xế", "Km xe máy", "Phiếu XM", "Km xe tải", "Phiếu XT", "Đơn đã giao"
                 ));
                 if (hasSalary) {
                     headers.add("Lương xe máy"); headers.add("Lương xe tải"); headers.add("Tổng lương");
@@ -1213,7 +1507,7 @@ public class WarehouseController {
                     if (hasSalary) {
                         // Bike salary
                         org.apache.poi.ss.usermodel.CellStyle bStyle = makeStyle.apply(
-                            alt ? new byte[]{(byte)0xE3,(byte)0xF2,(byte)0xFD} : new byte[]{(byte)0xF0,(byte)0xF8,(byte)0xFF}, false);
+                                alt ? new byte[]{(byte)0xE3,(byte)0xF2,(byte)0xFD} : new byte[]{(byte)0xF0,(byte)0xF8,(byte)0xFF}, false);
                         bStyle.setAlignment(org.apache.poi.ss.usermodel.HorizontalAlignment.RIGHT);
                         bStyle.setDataFormat(currFmt);
                         org.apache.poi.ss.usermodel.Cell bc = dr.createCell(7);
@@ -1221,7 +1515,7 @@ public class WarehouseController {
 
                         // Truck salary
                         org.apache.poi.ss.usermodel.CellStyle tStyle = makeStyle.apply(
-                            alt ? new byte[]{(byte)0xFF,(byte)0xF3,(byte)0xE0} : new byte[]{(byte)0xFF,(byte)0xF8,(byte)0xF0}, false);
+                                alt ? new byte[]{(byte)0xFF,(byte)0xF3,(byte)0xE0} : new byte[]{(byte)0xFF,(byte)0xF8,(byte)0xF0}, false);
                         tStyle.setAlignment(org.apache.poi.ss.usermodel.HorizontalAlignment.RIGHT);
                         tStyle.setDataFormat(currFmt);
                         org.apache.poi.ss.usermodel.Cell tc = dr.createCell(8);
@@ -1229,7 +1523,7 @@ public class WarehouseController {
 
                         // Total salary
                         org.apache.poi.ss.usermodel.CellStyle tsStyle = makeStyle.apply(
-                            totalSalary > 0 ? new byte[]{(byte)0xE8,(byte)0xF5,(byte)0xE9} : rowBg, true);
+                                totalSalary > 0 ? new byte[]{(byte)0xE8,(byte)0xF5,(byte)0xE9} : rowBg, true);
                         tsStyle.setAlignment(org.apache.poi.ss.usermodel.HorizontalAlignment.RIGHT);
                         tsStyle.setDataFormat(currFmt);
                         org.apache.poi.ss.usermodel.Cell tsc = dr.createCell(9);
@@ -1244,11 +1538,11 @@ public class WarehouseController {
                 totStyle.setAlignment(org.apache.poi.ss.usermodel.HorizontalAlignment.RIGHT);
                 totStyle.setDataFormat(currFmt);
                 ((org.apache.poi.xssf.usermodel.XSSFCellStyle)totStyle).getFont()
-                    .setColor(new org.apache.poi.xssf.usermodel.XSSFColor(white, null));
+                        .setColor(new org.apache.poi.xssf.usermodel.XSSFColor(white, null));
                 org.apache.poi.ss.usermodel.CellStyle totLabelStyle = makeStyle.apply(totalBg, true);
                 totLabelStyle.setAlignment(org.apache.poi.ss.usermodel.HorizontalAlignment.RIGHT);
                 ((org.apache.poi.xssf.usermodel.XSSFCellStyle)totLabelStyle).getFont()
-                    .setColor(new org.apache.poi.xssf.usermodel.XSSFColor(white, null));
+                        .setColor(new org.apache.poi.xssf.usermodel.XSSFColor(white, null));
 
                 org.apache.poi.ss.usermodel.Cell tlCell = totalRow.createCell(0);
                 tlCell.setCellValue("TỔNG CỘNG (" + names.size() + " tài xế)");

@@ -212,9 +212,11 @@ public class SellerDashboardService {
     private List<SellerDashboardDTO.TopCustomer> buildTopCustomers(
             List<com.nhatnam.server.entity.Order> orders, int topN) {
 
-        Map<String, long[]>     counts = new LinkedHashMap<>();
-        Map<String, BigDecimal> spent  = new LinkedHashMap<>();
-        Map<String, String[]>   meta   = new LinkedHashMap<>(); // [name, phone, customerId]
+        // counts[0] = tổng đơn active, counts[1] = đơn COMPLETED, counts[2] = đơn đã thu đủ
+        Map<String, long[]>     counts    = new LinkedHashMap<>();
+        Map<String, BigDecimal> spent     = new LinkedHashMap<>();
+        Map<String, BigDecimal> collected = new LinkedHashMap<>();
+        Map<String, String[]>   meta      = new LinkedHashMap<>(); // [name, phone, customerId]
 
         for (var order : orders) {
             if (!isActive(order)) continue; // bỏ CANCELLED
@@ -229,13 +231,22 @@ public class SellerDashboardService {
                     order.getCustomer() != null ? order.getCustomer().getId().toString() : null
             });
 
-            counts.computeIfAbsent(key, k -> new long[2]);
+            counts.computeIfAbsent(key, k -> new long[3]);
             counts.get(key)[0]++; // total active
             if (isCompleted(order)) counts.get(key)[1]++; // completed
+            if (order.getPaymentStatus() == com.nhatnam.server.enumtype.PaymentStatus.PAID)
+                counts.get(key)[2]++; // đã thanh toán đủ
 
             // Chi tiêu = finalAmount tất cả đơn active (không chỉ COMPLETED)
             spent.merge(key,
                     order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO,
+                    BigDecimal::add);
+
+            // Đã thu = paidAmount thực tế. Đơn thu một phần cộng đúng phần đã thu;
+            // suy từ trạng thái (PAID → cộng đủ, còn lại → 0) sẽ làm mất các
+            // khoản thu dở dang, vốn chiếm phần lớn ở khách mua công nợ.
+            collected.merge(key,
+                    order.getPaidAmount() != null ? order.getPaidAmount() : BigDecimal.ZERO,
                     BigDecimal::add);
         }
 
@@ -245,7 +256,7 @@ public class SellerDashboardService {
                 .map(e -> {
                     String   key = e.getKey();
                     String[] m   = meta.getOrDefault(key, new String[]{"?", null, null});
-                    long[]   cnt = counts.getOrDefault(key, new long[2]);
+                    long[]   cnt = counts.getOrDefault(key, new long[3]);
                     Long     cid = m[2] != null ? Long.parseLong(m[2]) : null;
                     return SellerDashboardDTO.TopCustomer.builder()
                             .customerId(cid)
@@ -253,7 +264,9 @@ public class SellerDashboardService {
                             .customerPhone(m[1])
                             .totalOrders(cnt[0])
                             .completedOrders(cnt[1])
+                            .paidOrders(cnt[2])
                             .totalSpent(e.getValue())
+                            .collectedAmount(collected.getOrDefault(key, BigDecimal.ZERO))
                             .build();
                 })
                 .collect(Collectors.toList());

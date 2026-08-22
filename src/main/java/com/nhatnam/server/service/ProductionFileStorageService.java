@@ -45,6 +45,10 @@ public class ProductionFileStorageService {
         return saveFile(file, "step" + stepSeq + "-b" + batchId);
     }
 
+    public String saveWorkOrderStepImage(Long stepId, MultipartFile file) throws IOException {
+        return saveFile(file, "wostep-" + stepId);
+    }
+
     public String saveBatchCancelImage(Long batchId, MultipartFile file) throws IOException {
         return saveFile(file, "cancel-b" + batchId);
     }

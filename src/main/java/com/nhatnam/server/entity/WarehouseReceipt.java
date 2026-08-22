@@ -9,10 +9,11 @@ import java.util.List;
 /**
  * Phiếu kho.
  *
- * THAY ĐỔI (Feature 2):
- * - Thêm status: PENDING_COST (chờ kế toán nhập giá vốn) | CONFIRMED (đã xác nhận)
- *   Khi WAREHOUSE tạo phiếu IMPORT → status = PENDING_COST, chưa cộng tồn kho.
- *   Khi ACCOUNTANT nhập giá vốn đủ và xác nhận → status = CONFIRMED, cộng tồn kho.
+ * FLOW NHẬP KHO (đã đổi):
+ * - WAREHOUSE tạo phiếu IMPORT → status = PENDING_COST, ĐÃ CỘNG TỒN KHO NGAY
+ *   (tạo lô IngredientExpiry theo HSD, costPrice tạm = 0).
+ * - ACCOUNTANT (kế toán trưởng) nhập đơn giá + thuế/phí → status = CONFIRMED,
+ *   hệ thống CHỈ CẬP NHẬT LẠI giá vốn của các lô đã tạo (không cộng tồn lần nữa).
  */
 @Data
 @Builder
@@ -92,6 +93,11 @@ public class WarehouseReceipt {
     @OneToMany(mappedBy = "receipt", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
     private List<WarehouseReceiptItem> items = new ArrayList<>();
+
+    /** Các dòng thuế/phí do kế toán trưởng nhập ở bước xác nhận giá vốn (chỉ IMPORT). */
+    @OneToMany(mappedBy = "receipt", cascade = CascadeType.ALL, orphanRemoval = true)
+    @Builder.Default
+    private List<WarehouseReceiptCostEntry> costEntries = new ArrayList<>();
 
     private Long createdAt;
     private Long updatedAt;

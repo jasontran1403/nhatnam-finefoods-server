@@ -18,6 +18,11 @@
 		<itext.version>9.5.0</itext.version>
 	</properties>
 
+	<!--
+		dependencyManagement = CHỈ khai version, KHÔNG kéo jar về.
+		Mọi entry ở đây BẮT BUỘC phải có <version>: Spring Boot parent không quản lý
+		artifact của iText nên không kế thừa version từ đâu được.
+	-->
 	<dependencyManagement>
 		<dependencies>
 			<dependency>
@@ -38,6 +43,12 @@
 			<dependency>
 				<groupId>com.itextpdf</groupId>
 				<artifactId>commons</artifactId>
+				<version>${itext.version}</version>
+			</dependency>
+			<!-- barcodes: cần cho BarcodeQRCode (QR trên phiếu voucher) -->
+			<dependency>
+				<groupId>com.itextpdf</groupId>
+				<artifactId>barcodes</artifactId>
 				<version>${itext.version}</version>
 			</dependency>
 			<dependency>
@@ -73,8 +84,12 @@
 		</dependencies>
 	</dependencyManagement>
 
+	<!--
+		dependencies = jar thật sự được kéo về.
+		Các artifact iText ở đây KHÔNG cần <version> vì đã khai ở dependencyManagement.
+	-->
 	<dependencies>
-		<!-- iText 8 core -->
+		<!-- iText -->
 		<dependency>
 			<groupId>com.itextpdf</groupId>
 			<artifactId>html2pdf</artifactId>
@@ -83,22 +98,22 @@
 		<dependency>
 			<groupId>com.itextpdf</groupId>
 			<artifactId>kernel</artifactId>
-			<version>${itext.version}</version>
 		</dependency>
 		<dependency>
 			<groupId>com.itextpdf</groupId>
 			<artifactId>layout</artifactId>
-			<version>${itext.version}</version>
 		</dependency>
 		<dependency>
 			<groupId>com.itextpdf</groupId>
 			<artifactId>io</artifactId>
-			<version>${itext.version}</version>
 		</dependency>
 		<dependency>
 			<groupId>com.itextpdf</groupId>
 			<artifactId>commons</artifactId>
-			<version>${itext.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.itextpdf</groupId>
+			<artifactId>barcodes</artifactId>
 		</dependency>
 
 		<!-- WebSocket / STOMP -->

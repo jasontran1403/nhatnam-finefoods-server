@@ -40,6 +40,9 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     List<Order> findByCustomerIdAndStatus(Long customerId, OrderStatus status);
     List<Order> findByCustomerIdOrderByCreatedAtDesc(Long customerId);
 
+    /** Lấy tất cả đơn của một tập khách hàng (dùng để tính công nợ chưa thanh toán theo lô). */
+    List<Order> findByCustomerIdIn(java.util.Collection<Long> customerIds);
+
     // ── Revenue chart ─────────────────────────────────────────────────────────
 
     @Query(value = """
@@ -193,6 +196,19 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     @Query("SELECT o FROM Order o WHERE o.createdAt >= :from AND o.createdAt <= :to order by o.id desc")
     List<Order> findByCreatedAtBetween(@Param("from") long from, @Param("to") long to);
 
+    @Query("""
+    SELECT o
+    FROM Order o
+    WHERE o.createdAt BETWEEN :from AND :to
+      AND o.status <> :canceled
+    ORDER BY o.id DESC
+    """)
+    List<Order> findByCreatedAtBetweenAndStatusIsNot(
+            @Param("from") long from,
+            @Param("to") long to,
+            @Param("canceled") OrderStatus canceled
+    );
+
     // Feature 4 KPI: tìm thời điểm đặt hàng đầu tiên của customer
     @Query("SELECT MIN(o.createdAt) FROM Order o WHERE o.customer.id = :customerId")
     Long findFirstOrderTimeByCustomerId(@Param("customerId") Long customerId);
@@ -258,4 +274,75 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             @Param("search") String search,
             @Param("status") OrderStatus status,
             Pageable pageable);
+
+    /**
+     * Đơn công nợ dùng cho báo cáo Aged Receivables.
+     *
+     * <p>FIX: trước đây chỉ lọc {@code paymentMethod='DEBT'} + {@code paymentStatus ∈ {UNPAID, PARTIAL}},
+     * KHÔNG lọc trạng thái đơn → kéo cả đơn ĐÃ HUỶ (CANCELLED/FAILED) và đơn CHƯA GIAO
+     * (PENDING/CONFIRMED/PREPARING/READY) vào công nợ. Với tính năng "thanh toán trước",
+     * đơn đang chuẩn bị có thể ở PARTIAL → sẽ bị tính nhầm thành nợ phải thu.
+     *
+     * <p>Công nợ chỉ phát sinh khi hàng ĐÃ RỜI KHO → chỉ lấy
+     * DELIVERING / PENDING_PAYMENT / COMPLETED.
+     */
+    @Query("""
+            SELECT o FROM Order o
+            LEFT JOIN FETCH o.customer c
+            WHERE UPPER(o.paymentMethod) = 'DEBT'
+              AND o.paymentStatus IN (
+                    com.nhatnam.server.enumtype.PaymentStatus.UNPAID,
+                    com.nhatnam.server.enumtype.PaymentStatus.PARTIAL)
+              AND o.status IN (
+                    com.nhatnam.server.enumtype.OrderStatus.DELIVERING,
+                    com.nhatnam.server.enumtype.OrderStatus.PENDING_PAYMENT,
+                    com.nhatnam.server.enumtype.OrderStatus.COMPLETED)
+            """)
+    List<Order> findDebtReceivables();
+
+    /**
+     * Toàn bộ đơn công nợ dùng cho dashboard (KHÔNG lọc ngày tháng):
+     * status = PENDING_PAYMENT và paymentStatus ∈ {UNPAID, PARTIAL}.
+     * JOIN FETCH customer để đọc customer.debtDays mà không bị lazy-load.
+     */
+    @Query("""
+            SELECT o FROM Order o
+            LEFT JOIN FETCH o.customer c
+            WHERE o.status = com.nhatnam.server.enumtype.OrderStatus.PENDING_PAYMENT
+              AND o.paymentStatus IN (
+                    com.nhatnam.server.enumtype.PaymentStatus.UNPAID,
+                    com.nhatnam.server.enumtype.PaymentStatus.PARTIAL)
+            """)
+    List<Order> findPendingPaymentReceivables();
+
+    /**
+     * Đơn có gắn tài xế trong một khoảng thời gian — dùng cho báo cáo ODO tài xế.
+     *
+     * <p>Mốc thời gian ưu tiên {@code deliveryDatetime} (ngày giao thực tế), thiếu thì
+     * lùi về {@code createdAt}, vì đơn cũ có thể chưa nhập ngày giao. Đơn CANCELLED bị
+     * loại vì không phát sinh quãng đường. Lọc {@code delivery_info_json} khác rỗng để
+     * không kéo về toàn bộ đơn không liên quan tài xế.
+     */
+    @Query(value = """
+            SELECT * FROM `order` o
+            WHERE o.status <> 'CANCELLED'
+              AND o.delivery_info_json IS NOT NULL
+              AND o.delivery_info_json <> ''
+              AND COALESCE(o.delivery_datetime, o.created_at) BETWEEN :from AND :to
+            ORDER BY COALESCE(o.delivery_datetime, o.created_at) ASC
+            """, nativeQuery = true)
+    List<Order> findWithDriversBetween(@Param("from") long from, @Param("to") long to);
+
+    /**
+     * Tổng tiền khách thanh toán dư (overpaidAmount) CHƯA ĐƯỢC HOÀN LẠI (chưa lập
+     * phiếu chi hoàn) — trong khoảng thời gian [from, to].
+     */
+    @Query("""
+            SELECT COALESCE(SUM(o.overpaidAmount), 0)
+            FROM Order o
+            WHERE o.overpaidAmount > 0
+              AND o.overpaidRefundVoucherCode IS NULL
+              AND o.createdAt >= :from AND o.createdAt <= :to
+            """)
+    BigDecimal sumUnrefundedOverpaidBetween(@Param("from") long from, @Param("to") long to);
 }

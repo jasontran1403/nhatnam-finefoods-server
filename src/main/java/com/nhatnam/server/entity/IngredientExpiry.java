@@ -40,6 +40,14 @@ public class IngredientExpiry {
     @Column(name = "expiry_date")
     private LocalDate expiryDate;
 
+    /**
+     * Ngày sản xuất — nullable, chỉ có giá trị khi lô được tạo từ việc CHUYỂN KHO
+     * thành phẩm (Issue #2) sang kho bán hàng. Các lô tạo theo flow nhập hàng cũ
+     * (phiếu nhập NVL) sẽ không có giá trị này.
+     */
+    @Column(name = "manufacture_date")
+    private LocalDate manufactureDate;
+
     /** Số lượng còn lại của lô này */
     @Column(nullable = false, precision = 12, scale = 3)
     private BigDecimal quantity;

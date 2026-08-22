@@ -14,6 +14,17 @@ public class CreateOrderRequest {
     private String customerPhone;
     private String customerEmail;
     private String shippingAddress;
+
+    /**
+     * TỈNH/THÀNH và PHƯỜNG/XÃ của địa chỉ giao — chọn từ dropdown, không gõ tay.
+     *
+     * <p>Bắt buộc với đơn cần xác định vùng COD. Thiếu thì {@code isCodAllowed} trả false
+     * và đơn rơi vào diện phải thu tiền trước — an toàn nhưng gây phiền, nên frontend
+     * chặn submit khi chưa chọn.
+     */
+    private String provinceName;
+    private String wardName;
+
     private Integer discountRate = 0;
     private List<SurchargeItem> surchargeItems;
 

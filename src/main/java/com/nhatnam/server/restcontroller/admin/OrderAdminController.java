@@ -130,6 +130,8 @@ public class OrderAdminController {
                     .companyAddress(order.getCompanyAddress())
                     .contactName(order.getContactName())
                     .deliveryAddress(order.getDeliveryAddress())
+                    .provinceName(order.getProvinceName())
+                    .wardName(order.getWardName())
                     .hideAllPrices(order.getHideAllPrices())
                     .vatBreakdownInclusive(vatBreakdownInclusive)
                     .vatBreakdownExclusive(vatBreakdownExclusive)

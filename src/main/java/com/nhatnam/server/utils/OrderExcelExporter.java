@@ -16,6 +16,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -73,12 +74,97 @@ public class OrderExcelExporter {
             "BANK_TRANSFER","Chuyển khoản","DEBT","Công nợ","OTHER","Công nợ"
     );
 
+    // ════════════════════════════════════════════════════════════════
+    // STYLE CACHE
+    //
+    // Nguyên nhân lỗi "maximum number of Cell Styles was exceeded (64000)":
+    // trước đây mỗi ô đều gọi wb.createCellStyle() → export nhiều đơn là nổ.
+    // StyleCache tạo MỘT style cho mỗi tổ hợp thuộc tính (màu nền, màu chữ,
+    // đậm, cỡ, canh lề, định dạng số, có/không border trên/dưới) rồi tái sử
+    // dụng. Số style giảm từ hàng triệu xuống còn vài trăm.
+    //
+    // LƯU Ý: style được cache là DÙNG CHUNG nên TUYỆT ĐỐI không mutate nó
+    // (không setDataFormat / setBorder... sau khi lấy về). Mọi thuộc tính
+    // phải truyền vào ngay lúc get(). Một cache được tạo mới cho mỗi workbook
+    // (mỗi lần export) — style thuộc về workbook nào chỉ dùng trong workbook đó.
+    // ════════════════════════════════════════════════════════════════
+    private static final class StyleCache {
+        private final XSSFWorkbook wb;
+        private final Map<String, XSSFCellStyle> styles = new HashMap<>();
+        private final Map<String, XSSFFont> fonts = new HashMap<>();
+        private final XSSFColor borderColor;
+
+        StyleCache(XSSFWorkbook wb) {
+            this.wb = wb;
+            this.borderColor = new XSSFColor(hexToBytes(C_BORDER), null);
+        }
+
+        private XSSFFont font(String fgHex, boolean bold, int size) {
+            String key = fgHex + '|' + bold + '|' + size;
+            XSSFFont f = fonts.get(key);
+            if (f == null) {
+                f = wb.createFont();
+                f.setFontName("Arial");
+                f.setBold(bold);
+                f.setFontHeightInPoints((short) size);
+                f.setColor(new XSSFColor(hexToBytes(fgHex), null));
+                fonts.put(key, f);
+            }
+            return f;
+        }
+
+        /** Full control. Border trái/phải luôn THIN; trên/dưới tuỳ tham số. */
+        XSSFCellStyle get(String bgHex, String fgHex, boolean bold, int size,
+                          HorizontalAlignment align, short dataFmt,
+                          boolean borderTop, boolean borderBottom) {
+            String key = bgHex + '|' + fgHex + '|' + bold + '|' + size + '|' + align
+                    + '|' + dataFmt + '|' + borderTop + '|' + borderBottom;
+            XSSFCellStyle cs = styles.get(key);
+            if (cs != null) return cs;
+
+            cs = wb.createCellStyle();
+            cs.setFillForegroundColor(new XSSFColor(hexToBytes(bgHex), null));
+            cs.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            cs.setAlignment(align);
+            cs.setVerticalAlignment(VerticalAlignment.CENTER);
+            cs.setWrapText(true);
+            cs.setDataFormat(dataFmt);
+            cs.setBorderLeft(BorderStyle.THIN);
+            cs.setBorderColor(XSSFCellBorder.BorderSide.LEFT, borderColor);
+            cs.setBorderRight(BorderStyle.THIN);
+            cs.setBorderColor(XSSFCellBorder.BorderSide.RIGHT, borderColor);
+            if (borderTop) {
+                cs.setBorderTop(BorderStyle.THIN);
+                cs.setBorderColor(XSSFCellBorder.BorderSide.TOP, borderColor);
+            }
+            if (borderBottom) {
+                cs.setBorderBottom(BorderStyle.THIN);
+                cs.setBorderColor(XSSFCellBorder.BorderSide.BOTTOM, borderColor);
+            }
+            cs.setFont(font(fgHex, bold, size));
+            styles.put(key, cs);
+            return cs;
+        }
+
+        // Convenience: border trên + dưới, format General
+        XSSFCellStyle get(String bgHex, String fgHex, boolean bold, int size, HorizontalAlignment align) {
+            return get(bgHex, fgHex, bold, size, align, (short) 0, true, true);
+        }
+
+        // Convenience: có format số, border trên + dưới
+        XSSFCellStyle get(String bgHex, String fgHex, boolean bold, int size,
+                          HorizontalAlignment align, short dataFmt) {
+            return get(bgHex, fgHex, bold, size, align, dataFmt, true, true);
+        }
+    }
+
     // ── Public API ───────────────────────────────────────────────────────────
     public byte[] export(List<Order> orders, String title, String exportedBy) throws Exception {
         try (XSSFWorkbook wb = new XSSFWorkbook();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            buildSummarySheet(wb, orders, title, exportedBy);
-            buildDetailSheet(wb, orders, true);
+            StyleCache sc = new StyleCache(wb);
+            buildSummarySheet(sc, wb, orders, title, exportedBy);
+            buildDetailSheet(sc, wb, orders, true);
             wb.write(out);
             return out.toByteArray();
         }
@@ -87,21 +173,19 @@ public class OrderExcelExporter {
     // ════════════════════════════════════════════════════════════════
     // SHEET 1 — SUMMARY (bản thường, không có cột phiếu thu)
     // ════════════════════════════════════════════════════════════════
-    private void buildSummarySheet(XSSFWorkbook wb, List<Order> orders,
+    private void buildSummarySheet(StyleCache sc, XSSFWorkbook wb, List<Order> orders,
                                    String title, String exportedBy) {
         XSSFSheet ws = wb.createSheet("Đơn hàng");
         ws.setDisplayGridlines(false);
-
-        CellStyle headerStyle = mkStyle(wb, C_PRIMARY, C_WHITE,  true,  10, HorizontalAlignment.CENTER);
-        CellStyle titleStyle  = mkStyle(wb, C_PRIMARY, C_ACCENT, true,  16, HorizontalAlignment.LEFT);
-        CellStyle metaStyle   = mkStyle(wb, "F9F9F9",  "888888", false, 9,  HorizontalAlignment.LEFT);
 
         DataFormat fmt = wb.createDataFormat();
         short vndFormat = fmt.getFormat("#,##0");
 
         Row r1 = ws.createRow(0); r1.setHeightInPoints(36);
         ws.addMergedRegion(new CellRangeAddress(0, 0, 0, 17));
-        Cell t = r1.createCell(0); t.setCellValue(title.toUpperCase()); t.setCellStyle(titleStyle);
+        Cell t = r1.createCell(0);
+        t.setCellValue(title.toUpperCase());
+        t.setCellStyle(sc.get(C_PRIMARY, C_ACCENT, true, 16, HorizontalAlignment.LEFT));
 
         Row r2 = ws.createRow(1); r2.setHeightInPoints(20);
         ws.addMergedRegion(new CellRangeAddress(1, 1, 0, 17));
@@ -109,7 +193,7 @@ public class OrderExcelExporter {
         m.setCellValue("Xuất lúc: " + LocalDateTime.now(TZ).format(DT_FMT)
                 + "   |   Người xuất: " + exportedBy
                 + "   |   Tổng đơn: " + orders.size());
-        m.setCellStyle(metaStyle);
+        m.setCellStyle(sc.get("F9F9F9", "888888", false, 9, HorizontalAlignment.LEFT));
 
         String[] headers = {
                 "STT","Mã đơn","Ngày tạo","Khách hàng","SĐT","Loại KH","Kho",
@@ -123,7 +207,7 @@ public class OrderExcelExporter {
         for (int i = 0; i < headers.length; i++) {
             Cell c = hdrRow.createCell(i);
             c.setCellValue(headers[i]);
-            c.setCellStyle(headerStyle);
+            c.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.CENTER));
             ws.setColumnWidth(i, colWidths[i] * 256);
         }
         ws.createFreezePane(0, 3);
@@ -174,42 +258,38 @@ public class OrderExcelExporter {
                 Cell cell = row.createCell(col);
                 if (cancelled && col == 9) {
                     cell.setCellValue(rowData[col] != null ? rowData[col].toString() : "");
-                    CellStyle cs = mkStyle(wb, C_CANCEL_ROW, "6B7280", false, 9, HorizontalAlignment.LEFT);
-                    cs.setWrapText(true);
-                    cell.setCellStyle(cs);
+                    cell.setCellStyle(sc.get(C_CANCEL_ROW, "6B7280", false, 9, HorizontalAlignment.LEFT));
                     continue;
                 }
                 if (cancelled && col > 9) {
                     cell.setCellValue("");
-                    cell.setCellStyle(mkStyle(wb, C_CANCEL_ROW, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
+                    cell.setCellStyle(sc.get(C_CANCEL_ROW, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
                     continue;
                 }
                 if ("__STATUS__".equals(rowData[col])) {
-                    applyStatusCell(wb, cell, o.getStatus().name(), STATUS_LABELS, STATUS_COLORS);
+                    applyStatusCell(sc, cell, o.getStatus().name(), STATUS_LABELS, STATUS_COLORS);
                 } else if ("__PAY_STATUS__".equals(rowData[col])) {
                     if (cancelled) {
                         cell.setCellValue("—");
-                        cell.setCellStyle(mkStyle(wb, rowBg, "888888", false, 9, HorizontalAlignment.CENTER));
+                        cell.setCellStyle(sc.get(rowBg, "888888", false, 9, HorizontalAlignment.CENTER));
                     } else {
-                        applyStatusCell(wb, cell, o.getPaymentStatus().name(), PAY_STATUS_LABELS, PAY_STATUS_COLORS);
+                        applyStatusCell(sc, cell, o.getPaymentStatus().name(), PAY_STATUS_LABELS, PAY_STATUS_COLORS);
                     }
                 } else if (rowData[col] instanceof Long num) {
                     cell.setCellValue(num);
-                    CellStyle cs = mkStyle(wb, rowBg,
-                            col == 15 ? "1C1C1E" : col == 17 && debt > 0 ? "EF4444" : "1C1C1E",
-                            col == 15 || col == 17, 9, HorizontalAlignment.LEFT);
-                    cs.setDataFormat(vndFormat);
-                    cell.setCellStyle(cs);
+                    String fg = (col == 17 && debt > 0) ? "EF4444" : "1C1C1E";
+                    boolean bold = (col == 15 || col == 17);
+                    cell.setCellStyle(sc.get(rowBg, fg, bold, 9, HorizontalAlignment.LEFT, vndFormat));
                 } else if (rowData[col] instanceof Integer num) {
                     cell.setCellValue(num);
-                    cell.setCellStyle(mkStyle(wb, rowBg, "888888", false, 9, HorizontalAlignment.CENTER));
+                    cell.setCellStyle(sc.get(rowBg, "888888", false, 9, HorizontalAlignment.CENTER));
                 } else {
                     String val = rowData[col] != null ? rowData[col].toString() : "";
                     cell.setCellValue(val);
                     String color = cancelled ? "9CA3AF" : "1C1C1E";
                     HorizontalAlignment align = (col == 0 || col == 2) ? HorizontalAlignment.CENTER : HorizontalAlignment.LEFT;
                     String fgColor = col == 1 ? (cancelled ? "9CA3AF" : C_ACCENT) : color;
-                    cell.setCellStyle(mkStyle(wb, rowBg, fgColor, col == 1, col == 1 ? 10 : 9, align));
+                    cell.setCellStyle(sc.get(rowBg, fgColor, col == 1, col == 1 ? 10 : 9, align));
                 }
             }
             rowNum++;
@@ -219,15 +299,13 @@ public class OrderExcelExporter {
         ws.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 0, 10));
         Cell sumLabel = sumRow.createCell(0);
         sumLabel.setCellValue("TỔNG CỘNG  (" + orders.size() + " đơn)");
-        sumLabel.setCellStyle(mkStyle(wb, C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT));
+        sumLabel.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT));
 
         for (int col : new int[]{11, 12, 13, 14, 15, 16, 17}) {
-            Cell sc = sumRow.createCell(col);
+            Cell scell = sumRow.createCell(col);
             char colLetter = (char) ('A' + col);
-            sc.setCellFormula("SUM(" + colLetter + "4:" + colLetter + rowNum + ")");
-            CellStyle cs = mkStyle(wb, C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT);
-            cs.setDataFormat(vndFormat);
-            sc.setCellStyle(cs);
+            scell.setCellFormula("SUM(" + colLetter + "4:" + colLetter + rowNum + ")");
+            scell.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT, vndFormat));
         }
         ws.setAutoFilter(new CellRangeAddress(2, rowNum - 1, 0, headers.length - 1));
     }
@@ -236,25 +314,21 @@ public class OrderExcelExporter {
     // SHEET 1 — SUMMARY (bản kế toán, có cột "Số phiếu thu" index 11)
     // Map<orderCode, List<receiptNumber>> — hỗ trợ nhiều phiếu thu / đơn
     // ════════════════════════════════════════════════════════════════
-    private void buildSummarySheet(XSSFWorkbook wb, List<Order> orders, String title,
+    private void buildSummarySheet(StyleCache sc, XSSFWorkbook wb, List<Order> orders, String title,
                                    String exportedBy, Map<String, List<String>> orderCodeToReceipts, boolean isAccountant) {
         XSSFSheet ws = wb.createSheet("Đơn hàng");
         ws.setDisplayGridlines(false);
 
-        CellStyle headerStyle = mkStyle(wb, C_PRIMARY, C_WHITE,  true,  10, HorizontalAlignment.CENTER);
-        CellStyle titleStyle  = mkStyle(wb, C_PRIMARY, C_ACCENT, true,  16, HorizontalAlignment.LEFT);
-        CellStyle metaStyle   = mkStyle(wb, "F9F9F9",  "888888", false, 9,  HorizontalAlignment.LEFT);
-
         DataFormat fmt = wb.createDataFormat();
         short vndFormat = fmt.getFormat("#,##0");
 
-        // Số cột: 20 nếu isAccountant, ngược lại 19
         int totalCols = isAccountant ? 20 : 19;
 
-        // 20 cột: 0–19 hoặc 19 cột: 0-18
         Row r1 = ws.createRow(0); r1.setHeightInPoints(36);
         ws.addMergedRegion(new CellRangeAddress(0, 0, 0, totalCols - 1));
-        Cell t = r1.createCell(0); t.setCellValue(title.toUpperCase()); t.setCellStyle(titleStyle);
+        Cell t = r1.createCell(0);
+        t.setCellValue(title.toUpperCase());
+        t.setCellStyle(sc.get(C_PRIMARY, C_ACCENT, true, 16, HorizontalAlignment.LEFT));
 
         Row r2 = ws.createRow(1); r2.setHeightInPoints(20);
         ws.addMergedRegion(new CellRangeAddress(1, 1, 0, totalCols - 1));
@@ -262,54 +336,20 @@ public class OrderExcelExporter {
         m.setCellValue("Xuất lúc: " + LocalDateTime.now(TZ).format(DT_FMT)
                 + "   |   Người xuất: " + exportedBy
                 + "   |   Tổng đơn: " + orders.size());
-        m.setCellStyle(metaStyle);
+        m.setCellStyle(sc.get("F9F9F9", "888888", false, 9, HorizontalAlignment.LEFT));
 
-        // Headers
         String[] headersWithReceipt = {
-                "STT",                   // 0
-                "Mã đơn",                // 1
-                "Ngày tạo",              // 2
-                "Khách hàng",            // 3
-                "SĐT",                   // 4
-                "Loại KH",               // 5
-                "Kho",                   // 6
-                "Người tạo đơn",         // 7
-                "Trạng thái đơn",        // 8
-                "Phương thức TT",        // 9
-                "TT thanh toán",         // 10
-                "Số phiếu thu",          // 11
-                "Tạm tính (đ)",          // 12
-                "Giảm giá (đ)",          // 13
-                "Phụ phí (đ)",           // 14
-                "VAT (đ)",               // 15
-                "Tổng tiền (đ)",         // 16
-                "Đã thu (đ)",            // 17
-                "Còn nợ (đ)",            // 18
-                "Thông tin giao hàng"    // 19
+                "STT","Mã đơn","Ngày tạo","Khách hàng","SĐT","Loại KH","Kho",
+                "Người tạo đơn","Trạng thái đơn","Phương thức TT","TT thanh toán",
+                "Số phiếu thu","Tạm tính (đ)","Giảm giá (đ)","Phụ phí (đ)","VAT (đ)",
+                "Tổng tiền (đ)","Đã thu (đ)","Còn nợ (đ)","Thông tin giao hàng"
         };
-
         String[] headersWithoutReceipt = {
-                "STT",                   // 0
-                "Mã đơn",                // 1
-                "Ngày tạo",              // 2
-                "Khách hàng",            // 3
-                "SĐT",                   // 4
-                "Loại KH",               // 5
-                "Kho",                   // 6
-                "Người tạo đơn",         // 7
-                "Trạng thái đơn",        // 8
-                "Phương thức TT",        // 9
-                "TT thanh toán",         // 10
-                "Tạm tính (đ)",          // 11
-                "Giảm giá (đ)",          // 12
-                "Phụ phí (đ)",           // 13
-                "VAT (đ)",               // 14
-                "Tổng tiền (đ)",         // 15
-                "Đã thu (đ)",            // 16
-                "Còn nợ (đ)",            // 17
-                "Thông tin giao hàng"    // 18
+                "STT","Mã đơn","Ngày tạo","Khách hàng","SĐT","Loại KH","Kho",
+                "Người tạo đơn","Trạng thái đơn","Phương thức TT","TT thanh toán",
+                "Tạm tính (đ)","Giảm giá (đ)","Phụ phí (đ)","VAT (đ)",
+                "Tổng tiền (đ)","Đã thu (đ)","Còn nợ (đ)","Thông tin giao hàng"
         };
-
         int[] colWidthsWithReceipt = {5,16,18,30,14,9,18,20,18,18,16,16,16,14,13,12,16,14,14,28};
         int[] colWidthsWithoutReceipt = {5,16,18,30,14,9,18,20,18,18,16,16,14,13,12,16,14,14,28};
 
@@ -320,7 +360,7 @@ public class OrderExcelExporter {
         for (int i = 0; i < headers.length; i++) {
             Cell c = hdrRow.createCell(i);
             c.setCellValue(headers[i]);
-            c.setCellStyle(headerStyle);
+            c.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.CENTER));
             ws.setColumnWidth(i, colWidths[i] * 256);
         }
         ws.createFreezePane(0, 3);
@@ -350,7 +390,7 @@ public class OrderExcelExporter {
                             o.getWarehouseName(),
                             o.getUser() != null ? o.getUser().getFullName() : o.getOrderedByName(),
                             "__STATUS__", cancelReason,
-                            "", "", "", "", "", "", "", "", "", ""  // 10–19
+                            "", "", "", "", "", "", "", "", "", ""
                     };
                 } else {
                     rowData = new Object[]{
@@ -360,7 +400,7 @@ public class OrderExcelExporter {
                             o.getWarehouseName(),
                             o.getUser() != null ? o.getUser().getFullName() : o.getOrderedByName(),
                             "__STATUS__", cancelReason,
-                            "", "", "", "", "", "", "", "", ""  // 10–18
+                            "", "", "", "", "", "", "", "", ""
                     };
                 }
             } else {
@@ -374,15 +414,15 @@ public class OrderExcelExporter {
                             "__STATUS__",
                             PAY_METHOD_LABELS.getOrDefault(o.getPaymentMethod(), o.getPaymentMethod()),
                             "__PAY_STATUS__",
-                            receiptNums,                // 11
-                            round(o.getSubtotal()),     // 12
-                            round(o.getDiscountAmount()),// 13
-                            round(o.getSurcharge()),    // 14
-                            round(o.getVatAmount()),    // 15
-                            finalAmt,                   // 16
-                            paidAmt,                    // 17
-                            debt,                       // 18
-                            deliveryInfo,               // 19
+                            receiptNums,
+                            round(o.getSubtotal()),
+                            round(o.getDiscountAmount()),
+                            round(o.getSurcharge()),
+                            round(o.getVatAmount()),
+                            finalAmt,
+                            paidAmt,
+                            debt,
+                            deliveryInfo,
                     };
                 } else {
                     rowData = new Object[]{
@@ -394,14 +434,14 @@ public class OrderExcelExporter {
                             "__STATUS__",
                             PAY_METHOD_LABELS.getOrDefault(o.getPaymentMethod(), o.getPaymentMethod()),
                             "__PAY_STATUS__",
-                            round(o.getSubtotal()),     // 11
-                            round(o.getDiscountAmount()),// 12
-                            round(o.getSurcharge()),    // 13
-                            round(o.getVatAmount()),    // 14
-                            finalAmt,                   // 15
-                            paidAmt,                    // 16
-                            debt,                       // 17
-                            deliveryInfo,               // 18
+                            round(o.getSubtotal()),
+                            round(o.getDiscountAmount()),
+                            round(o.getSurcharge()),
+                            round(o.getVatAmount()),
+                            finalAmt,
+                            paidAmt,
+                            debt,
+                            deliveryInfo,
                     };
                 }
             }
@@ -409,7 +449,6 @@ public class OrderExcelExporter {
             Row row = ws.createRow(rowNum);
             row.setHeightInPoints(calcRowHeight(rowData, colWidths));
 
-            // Đơn hủy: merge cột 9 → (totalCols - 1)
             if (cancelled) {
                 int mergeStart = 9;
                 int mergeEnd = isAccountant ? 19 : 18;
@@ -421,111 +460,95 @@ public class OrderExcelExporter {
 
                 if (cancelled && col == 9) {
                     cell.setCellValue(rowData[col] != null ? rowData[col].toString() : "");
-                    CellStyle cs = mkStyle(wb, C_CANCEL_ROW, "6B7280", false, 9, HorizontalAlignment.LEFT);
-                    cs.setWrapText(true);
-                    cell.setCellStyle(cs);
+                    cell.setCellStyle(sc.get(C_CANCEL_ROW, "6B7280", false, 9, HorizontalAlignment.LEFT));
                     continue;
                 }
                 if (cancelled && col > 9) {
                     cell.setCellValue("");
-                    cell.setCellStyle(mkStyle(wb, C_CANCEL_ROW, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
+                    cell.setCellStyle(sc.get(C_CANCEL_ROW, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
                     continue;
                 }
 
                 if ("__STATUS__".equals(rowData[col])) {
-                    applyStatusCell(wb, cell, o.getStatus().name(), STATUS_LABELS, STATUS_COLORS);
+                    applyStatusCell(sc, cell, o.getStatus().name(), STATUS_LABELS, STATUS_COLORS);
                 } else if ("__PAY_STATUS__".equals(rowData[col])) {
-                    applyStatusCell(wb, cell, o.getPaymentStatus().name(), PAY_STATUS_LABELS, PAY_STATUS_COLORS);
+                    applyStatusCell(sc, cell, o.getPaymentStatus().name(), PAY_STATUS_LABELS, PAY_STATUS_COLORS);
                 } else if (isAccountant && col == 11) {
-                    // Số phiếu thu — mỗi phiếu 1 dòng
                     String rc = rowData[col] != null ? rowData[col].toString() : "";
                     cell.setCellValue(rc);
                     boolean hasReceipt   = !rc.isEmpty();
                     boolean multiReceipt = rc.contains("\n");
-                    CellStyle cs = mkStyle(wb, rowBg,
-                            !hasReceipt  ? "CCCCCC" :
-                                    multiReceipt ? "7C3AED" : C_ACCENT,
-                            hasReceipt, 9, HorizontalAlignment.CENTER);
-                    cs.setWrapText(true);
-                    cell.setCellStyle(cs);
+                    String fg = !hasReceipt ? "CCCCCC" : (multiReceipt ? "7C3AED" : C_ACCENT);
+                    cell.setCellStyle(sc.get(rowBg, fg, hasReceipt, 9, HorizontalAlignment.CENTER));
                 } else if (col == (isAccountant ? 19 : 18)) {
-                    // Thông tin giao hàng — wrap text (cột cuối cùng)
                     String di = rowData[col] != null ? rowData[col].toString() : "";
                     cell.setCellValue(di);
-                    CellStyle cs = mkStyle(wb, rowBg,
-                            di.isEmpty() ? "CCCCCC" : "374151",
-                            false, 9, HorizontalAlignment.LEFT);
-                    cs.setWrapText(true);
-                    cell.setCellStyle(cs);
+                    cell.setCellStyle(sc.get(rowBg, di.isEmpty() ? "CCCCCC" : "374151",
+                            false, 9, HorizontalAlignment.LEFT));
                 } else if (rowData[col] instanceof Long num) {
                     cell.setCellValue(num);
-                    // Xác định cột Tổng tiền và Còn nợ dựa trên isAccountant
                     int totalCol = isAccountant ? 16 : 15;
-                    int debtCol = isAccountant ? 18 : 17;
-                    CellStyle cs = mkStyle(wb, rowBg,
-                            col == totalCol ? "1C1C1E" : col == debtCol && debt > 0 ? "EF4444" : "1C1C1E",
-                            col == totalCol || col == debtCol, 9, HorizontalAlignment.LEFT);
-                    cs.setDataFormat(vndFormat);
-                    cell.setCellStyle(cs);
+                    int debtCol  = isAccountant ? 18 : 17;
+                    String fg = (col == debtCol && debt > 0) ? "EF4444" : "1C1C1E";
+                    boolean bold = (col == totalCol || col == debtCol);
+                    cell.setCellStyle(sc.get(rowBg, fg, bold, 9, HorizontalAlignment.LEFT, vndFormat));
                 } else if (rowData[col] instanceof Integer num) {
                     cell.setCellValue(num);
-                    cell.setCellStyle(mkStyle(wb, rowBg, "888888", false, 9, HorizontalAlignment.CENTER));
+                    cell.setCellStyle(sc.get(rowBg, "888888", false, 9, HorizontalAlignment.CENTER));
                 } else {
                     String val = rowData[col] != null ? rowData[col].toString() : "";
                     cell.setCellValue(val);
                     String color = cancelled ? "9CA3AF" : "1C1C1E";
                     HorizontalAlignment align = (col == 0 || col == 2) ? HorizontalAlignment.CENTER : HorizontalAlignment.LEFT;
                     String fgColor = col == 1 ? (cancelled ? "9CA3AF" : C_ACCENT) : color;
-                    cell.setCellStyle(mkStyle(wb, rowBg, fgColor, col == 1, col == 1 ? 10 : 9, align));
+                    cell.setCellStyle(sc.get(rowBg, fgColor, col == 1, col == 1 ? 10 : 9, align));
                 }
             }
             rowNum++;
         }
 
-        // Summary row — merge 0→12 (bao gồm cả cột phiếu thu nếu có)
         Row sumRow = ws.createRow(rowNum); sumRow.setHeightInPoints(28);
-        int mergeEnd = isAccountant ? 12 : 11; // Nếu không có phiếu thu, merge đến cột 11
+        int mergeEnd = isAccountant ? 12 : 11;
         ws.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 0, mergeEnd));
         Cell sumLabel = sumRow.createCell(0);
         sumLabel.setCellValue("TỔNG CỘNG  (" + orders.size() + " đơn)");
-        sumLabel.setCellStyle(mkStyle(wb, C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT));
+        sumLabel.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT));
 
-        // Các cột cần tính SUM
-        int[] sumCols;
-        if (isAccountant) {
-            sumCols = new int[]{12, 13, 14, 15, 16, 17, 18};
-        } else {
-            sumCols = new int[]{11, 12, 13, 14, 15, 16, 17};
-        }
+        int[] sumCols = isAccountant
+                ? new int[]{12, 13, 14, 15, 16, 17, 18}
+                : new int[]{11, 12, 13, 14, 15, 16, 17};
 
         for (int col : sumCols) {
-            Cell sc = sumRow.createCell(col);
+            Cell scell = sumRow.createCell(col);
             char colLetter = (char) ('A' + col);
-            sc.setCellFormula("SUM(" + colLetter + "4:" + colLetter + rowNum + ")");
-            CellStyle cs = mkStyle(wb, C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT);
-            cs.setDataFormat(vndFormat);
-            sc.setCellStyle(cs);
+            scell.setCellFormula("SUM(" + colLetter + "4:" + colLetter + rowNum + ")");
+            scell.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.LEFT, vndFormat));
         }
 
-        // Cột cuối cùng (Thông tin giao hàng) — không sum, tạo cell trống style header
         int lastCol = isAccountant ? 19 : 18;
-        sumRow.createCell(lastCol).setCellStyle(mkStyle(wb, C_PRIMARY, C_WHITE, false, 9, HorizontalAlignment.LEFT));
+        sumRow.createCell(lastCol).setCellStyle(sc.get(C_PRIMARY, C_WHITE, false, 9, HorizontalAlignment.LEFT));
 
         ws.setAutoFilter(new CellRangeAddress(2, rowNum - 1, 0, totalCols - 1));
     }
 
     // ════════════════════════════════════════════════════════════════
     // SHEET 2 — ITEM DETAIL
+    //
+    // "Giả merge" (fix filter/sort mất dòng trên Excel): KHÔNG merge ô theo
+    // chiều dọc. Set giá trị THẬT cho mọi dòng của một khối. Để nhìn vẫn như
+    // merge: các dòng "phụ" (không phải dòng đầu khối) được set màu chữ = màu
+    // nền để chữ ẩn đi, đồng thời border trên/dưới giữa các dòng trong khối bị
+    // bỏ. Border được TÍNH SẴN theo vị trí (đầu/giữa/cuối khối) và lấy style đã
+    // cache — không mutate style dùng chung (đó là lý do gây lỗi 64000 style cũ).
     // ════════════════════════════════════════════════════════════════
-    private void buildDetailSheet(XSSFWorkbook wb, List<Order> orders, boolean accountantMode) {
+    private void buildDetailSheet(StyleCache sc, XSSFWorkbook wb, List<Order> orders, boolean accountantMode) {
         XSSFSheet ws = wb.createSheet("Chi tiết sản phẩm");
         ws.setDisplayGridlines(false);
 
-        CellStyle headerStyle = mkStyle(wb, C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.CENTER);
-        DataFormat fmt     = wb.createDataFormat();
-        short vndFormat    = fmt.getFormat("#,##0");
-        short vnd2Format   = fmt.getFormat("#,##0.00");
-        short qtyFormat    = fmt.getFormat("#,##0.###");
+        DataFormat fmt  = wb.createDataFormat();
+        short vndFormat = fmt.getFormat("#,##0");
+        short vnd2Format = fmt.getFormat("#,##0.00");
+        short qtyFormat  = fmt.getFormat("#,##0.###");
 
         int lastCol = accountantMode ? 13 : 8;
 
@@ -533,11 +556,10 @@ public class OrderExcelExporter {
         ws.addMergedRegion(new CellRangeAddress(0, 0, 0, lastCol));
         Cell t = r1.createCell(0);
         t.setCellValue("CHI TIẾT SẢN PHẨM TRONG ĐƠN HÀNG");
-        t.setCellStyle(mkStyle(wb, C_PRIMARY, C_ACCENT, true, 14, HorizontalAlignment.LEFT));
+        t.setCellStyle(sc.get(C_PRIMARY, C_ACCENT, true, 14, HorizontalAlignment.LEFT));
 
         String[] hdrs;
         int[]    widths;
-
         if (accountantMode) {
             hdrs = new String[]{
                     "Mã đơn", "Khách hàng", "Ngày tạo", "Trạng thái",
@@ -560,7 +582,7 @@ public class OrderExcelExporter {
         for (int i = 0; i < hdrs.length; i++) {
             Cell c = hdrRow.createCell(i);
             c.setCellValue(hdrs[i]);
-            c.setCellStyle(headerStyle);
+            c.setCellStyle(sc.get(C_PRIMARY, C_WHITE, true, 10, HorizontalAlignment.CENTER));
             ws.setColumnWidth(i, widths[i] * 256);
         }
         ws.createFreezePane(0, 2);
@@ -583,37 +605,44 @@ public class OrderExcelExporter {
             int orderFirstRow = rowNum;
             int orderLastRow  = rowNum + orderTotalRows - 1;
 
+            // Pre-create tất cả dòng của đơn với ô trống nền theo rowBg
             for (int r = orderFirstRow; r <= orderLastRow; r++) {
                 Row row = ws.createRow(r);
                 row.setHeightInPoints(LINE_HEIGHT_PT + ROW_PADDING_PT);
                 for (int col = 0; col <= lastCol; col++) {
                     Cell cell = row.createCell(col);
                     cell.setCellValue("");
-                    cell.setCellStyle(mkStyle(wb, rowBg, "1C1C1E", false, 9, HorizontalAlignment.LEFT));
+                    cell.setCellStyle(sc.get(rowBg, "1C1C1E", false, 9, HorizontalAlignment.LEFT));
                 }
             }
 
-            Row orderFirstRowObj = ws.getRow(orderFirstRow);
+            String orderCode    = o.getOrderCode();
+            String customerName = o.getCustomerName() != null ? o.getCustomerName() : "";
+            String createdAtStr = fmtTs(o.getCreatedAt());
+            String fgMain       = cancelled ? "9CA3AF" : "1C1C1E";
+            String fgCode       = cancelled ? "9CA3AF" : C_ACCENT;
 
-            Cell c0 = orderFirstRowObj.getCell(0);
-            c0.setCellValue(o.getOrderCode());
-            c0.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : C_ACCENT, true, 10, HorizontalAlignment.LEFT));
+            // Cols 0–3: khối = toàn bộ đơn (giá trị giống nhau mọi dòng)
+            for (int r = orderFirstRow; r <= orderLastRow; r++) {
+                Row row = ws.getRow(r);
 
-            Cell c1 = orderFirstRowObj.getCell(1);
-            c1.setCellValue(o.getCustomerName() != null ? o.getCustomerName() : "");
-            c1.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", false, 9, HorizontalAlignment.LEFT));
+                Cell c0 = row.getCell(0);
+                c0.setCellValue(orderCode);
+                styleMerged(sc, c0, r, orderFirstRow, orderLastRow, rowBg, fgCode, true, 10,
+                        HorizontalAlignment.LEFT, (short) 0);
 
-            Cell c2 = orderFirstRowObj.getCell(2);
-            c2.setCellValue(fmtTs(o.getCreatedAt()));
-            c2.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", false, 9, HorizontalAlignment.CENTER));
+                Cell c1 = row.getCell(1);
+                c1.setCellValue(customerName);
+                styleMerged(sc, c1, r, orderFirstRow, orderLastRow, rowBg, fgMain, false, 9,
+                        HorizontalAlignment.LEFT, (short) 0);
 
-            Cell c3 = orderFirstRowObj.getCell(3);
-            applyStatusCell(wb, c3, o.getStatus().name(), STATUS_LABELS, STATUS_COLORS);
+                Cell c2 = row.getCell(2);
+                c2.setCellValue(createdAtStr);
+                styleMerged(sc, c2, r, orderFirstRow, orderLastRow, rowBg, fgMain, false, 9,
+                        HorizontalAlignment.CENTER, (short) 0);
 
-            if (orderTotalRows > 1) {
-                for (int col = 0; col <= 3; col++) {
-                    ws.addMergedRegion(new CellRangeAddress(orderFirstRow, orderLastRow, col, col));
-                }
+                Cell c3 = row.getCell(3);
+                styleStatusMerged(sc, c3, o.getStatus().name(), r, orderFirstRow, orderLastRow);
             }
 
             if (accountantMode) {
@@ -649,28 +678,28 @@ public class OrderExcelExporter {
 
                 java.math.BigDecimal surchargeVal = o.getSurcharge() != null ? o.getSurcharge() : java.math.BigDecimal.ZERO;
                 long surchargeDisplay = surchargeVal.setScale(0, java.math.RoundingMode.HALF_UP).longValue();
-
-                Cell cSur = orderFirstRowObj.getCell(12);
-                cSur.setCellValue(surchargeDisplay > 0 ? surchargeDisplay : 0);
-                CellStyle csSur = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", false, 9, HorizontalAlignment.LEFT);
-                csSur.setDataFormat(vndFormat);
-                cSur.setCellStyle(csSur);
-                if (orderTotalRows > 1) ws.addMergedRegion(new CellRangeAddress(orderFirstRow, orderLastRow, 12, 12));
-
                 long nValue = sumL.add(surchargeVal).setScale(0, java.math.RoundingMode.HALF_UP).longValue();
-                Cell cn = orderFirstRowObj.getCell(13);
-                cn.setCellValue(nValue);
-                CellStyle csN = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", true, 10, HorizontalAlignment.LEFT);
-                csN.setDataFormat(vndFormat);
-                cn.setCellStyle(csN);
-                if (orderTotalRows > 1) ws.addMergedRegion(new CellRangeAddress(orderFirstRow, orderLastRow, 13, 13));
+
+                // Cols 12,13: khối = toàn bộ đơn
+                for (int r = orderFirstRow; r <= orderLastRow; r++) {
+                    Row row = ws.getRow(r);
+
+                    Cell cSur = row.getCell(12);
+                    cSur.setCellValue(surchargeDisplay > 0 ? surchargeDisplay : 0);
+                    styleMerged(sc, cSur, r, orderFirstRow, orderLastRow, rowBg, fgMain, false, 9,
+                            HorizontalAlignment.LEFT, vndFormat);
+
+                    Cell cn = row.getCell(13);
+                    cn.setCellValue(nValue);
+                    styleMerged(sc, cn, r, orderFirstRow, orderLastRow, rowBg, fgMain, true, 10,
+                            HorizontalAlignment.LEFT, vndFormat);
+                }
 
                 for (OrderItem item : items) {
                     var ings = item.getOrderItemIngredients();
                     int ingCount     = (ings != null && !ings.isEmpty()) ? ings.size() : 1;
                     int itemFirstRow = rowNum;
                     int itemLastRow  = rowNum + ingCount - 1;
-                    Row itemFirstRowObj = ws.getRow(itemFirstRow);
 
                     java.math.BigDecimal sub = item.getSubtotal() != null ? item.getSubtotal() : java.math.BigDecimal.ZERO;
                     java.math.BigDecimal qty = item.getQuantity()  != null ? item.getQuantity()  : java.math.BigDecimal.ONE;
@@ -688,39 +717,47 @@ public class OrderExcelExporter {
                             .divide(java.math.BigDecimal.valueOf(100), 10, java.math.RoundingMode.HALF_UP);
                     java.math.BigDecimal l  = j.add(k);
 
-                    Cell ch = itemFirstRowObj.getCell(7);
-                    ch.setCellValue(h.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue());
-                    CellStyle csH = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", false, 9, HorizontalAlignment.LEFT);
-                    csH.setDataFormat(vnd2Format); ch.setCellStyle(csH);
-
-                    Cell ci = itemFirstRowObj.getCell(8);
-                    ci.setCellValue(i2.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue());
-                    CellStyle csI = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "991B1B", false, 9, HorizontalAlignment.LEFT);
-                    csI.setDataFormat(vnd2Format); ci.setCellStyle(csI);
-
-                    Cell cj = itemFirstRowObj.getCell(9);
-                    cj.setCellValue(j.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue());
-                    CellStyle csJ = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", false, 9, HorizontalAlignment.LEFT);
-                    csJ.setDataFormat(vnd2Format); cj.setCellStyle(csJ);
-
-                    Cell ck = itemFirstRowObj.getCell(10);
-                    ck.setCellValue(k.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue());
-                    CellStyle csK = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT);
-                    csK.setDataFormat(vnd2Format); ck.setCellStyle(csK);
-
-                    Cell cl = itemFirstRowObj.getCell(11);
-                    cl.setCellValue(l.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue());
-                    CellStyle csL = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", true, 9, HorizontalAlignment.LEFT);
-                    csL.setDataFormat(vnd2Format); cl.setCellStyle(csL);
-
-                    if (ingCount > 1) {
-                        for (int col : new int[]{7, 8, 9, 10, 11}) {
-                            ws.addMergedRegion(new CellRangeAddress(itemFirstRow, itemLastRow, col, col));
-                        }
-                    }
+                    double hVal = h.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
+                    double iVal = i2.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
+                    double jVal = j.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
+                    double kVal = k.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
+                    double lVal = l.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
 
                     boolean isBox = "BOX".equalsIgnoreCase(item.getSaleType());
                     String displayUnit = isBox ? "Thùng" : (item.getUnit() != null ? item.getUnit() : "");
+
+                    String fgDisc = cancelled ? "9CA3AF" : "991B1B";
+                    String fgVat  = cancelled ? "9CA3AF" : "374151";
+
+                    // Cols 7–11: khối = item (giá trị giống nhau mọi dòng của item)
+                    for (int r = itemFirstRow; r <= itemLastRow; r++) {
+                        Row itemRow = ws.getRow(r);
+
+                        Cell ch = itemRow.getCell(7);
+                        ch.setCellValue(hVal);
+                        styleMerged(sc, ch, r, itemFirstRow, itemLastRow, rowBg, fgMain, false, 9,
+                                HorizontalAlignment.LEFT, vnd2Format);
+
+                        Cell ci = itemRow.getCell(8);
+                        ci.setCellValue(iVal);
+                        styleMerged(sc, ci, r, itemFirstRow, itemLastRow, rowBg, fgDisc, false, 9,
+                                HorizontalAlignment.LEFT, vnd2Format);
+
+                        Cell cj = itemRow.getCell(9);
+                        cj.setCellValue(jVal);
+                        styleMerged(sc, cj, r, itemFirstRow, itemLastRow, rowBg, fgMain, false, 9,
+                                HorizontalAlignment.LEFT, vnd2Format);
+
+                        Cell ck = itemRow.getCell(10);
+                        ck.setCellValue(kVal);
+                        styleMerged(sc, ck, r, itemFirstRow, itemLastRow, rowBg, fgVat, false, 9,
+                                HorizontalAlignment.LEFT, vnd2Format);
+
+                        Cell cl = itemRow.getCell(11);
+                        cl.setCellValue(lVal);
+                        styleMerged(sc, cl, r, itemFirstRow, itemLastRow, rowBg, fgMain, true, 9,
+                                HorizontalAlignment.LEFT, vnd2Format);
+                    }
 
                     if (ings != null && !ings.isEmpty()) {
                         for (int idx = 0; idx < ings.size(); idx++) {
@@ -729,24 +766,25 @@ public class OrderExcelExporter {
 
                             Cell cIng = ingRow.getCell(4);
                             cIng.setCellValue(ii.getIngredientName() != null ? ii.getIngredientName() : "");
-                            cIng.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT));
+                            cIng.setCellStyle(sc.get(rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT));
 
                             Cell cQty = ingRow.getCell(5);
                             if (idx == 0) {
                                 cQty.setCellValue(qty.doubleValue());
-                                CellStyle qtyCs = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT);
-                                qtyCs.setDataFormat(qtyFormat);
-                                cQty.setCellStyle(qtyCs);
+                                cQty.setCellStyle(sc.get(rowBg, cancelled ? "9CA3AF" : "374151", false, 9,
+                                        HorizontalAlignment.LEFT, qtyFormat));
                             } else {
-                                cQty.setCellValue(""); cQty.setCellStyle(mkStyle(wb, rowBg, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
+                                cQty.setCellValue("");
+                                cQty.setCellStyle(sc.get(rowBg, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
                             }
 
                             Cell cUnit = ingRow.getCell(6);
                             if (idx == 0) {
                                 cUnit.setCellValue(displayUnit);
-                                cUnit.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.CENTER));
+                                cUnit.setCellStyle(sc.get(rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.CENTER));
                             } else {
-                                cUnit.setCellValue(""); cUnit.setCellStyle(mkStyle(wb, rowBg, "9CA3AF", false, 9, HorizontalAlignment.CENTER));
+                                cUnit.setCellValue("");
+                                cUnit.setCellStyle(sc.get(rowBg, "9CA3AF", false, 9, HorizontalAlignment.CENTER));
                             }
                         }
                     }
@@ -759,21 +797,23 @@ public class OrderExcelExporter {
                     int ingCount     = (ings != null && !ings.isEmpty()) ? ings.size() : 1;
                     int itemFirstRow = rowNum;
                     int itemLastRow  = rowNum + ingCount - 1;
-                    Row itemFirstRowObj = ws.getRow(itemFirstRow);
 
-                    Cell c7 = itemFirstRowObj.getCell(7);
-                    c7.setCellValue(round(item.getUnitPrice()));
-                    CellStyle priceCs = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", false, 9, HorizontalAlignment.LEFT);
-                    priceCs.setDataFormat(vndFormat); c7.setCellStyle(priceCs);
+                    long unitPriceVal = round(item.getUnitPrice());
+                    long subtotalVal  = round(item.getSubtotal());
 
-                    Cell c8 = itemFirstRowObj.getCell(8);
-                    c8.setCellValue(round(item.getSubtotal()));
-                    CellStyle totalCs = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "1C1C1E", true, 9, HorizontalAlignment.LEFT);
-                    totalCs.setDataFormat(vndFormat); c8.setCellStyle(totalCs);
+                    // Cols 7,8: khối = item
+                    for (int r = itemFirstRow; r <= itemLastRow; r++) {
+                        Row itemRow = ws.getRow(r);
 
-                    if (ingCount > 1) {
-                        ws.addMergedRegion(new CellRangeAddress(itemFirstRow, itemLastRow, 7, 7));
-                        ws.addMergedRegion(new CellRangeAddress(itemFirstRow, itemLastRow, 8, 8));
+                        Cell c7 = itemRow.getCell(7);
+                        c7.setCellValue(unitPriceVal);
+                        styleMerged(sc, c7, r, itemFirstRow, itemLastRow, rowBg, fgMain, false, 9,
+                                HorizontalAlignment.LEFT, vndFormat);
+
+                        Cell c8 = itemRow.getCell(8);
+                        c8.setCellValue(subtotalVal);
+                        styleMerged(sc, c8, r, itemFirstRow, itemLastRow, rowBg, fgMain, true, 9,
+                                HorizontalAlignment.LEFT, vndFormat);
                     }
 
                     if (ings != null && !ings.isEmpty()) {
@@ -783,20 +823,21 @@ public class OrderExcelExporter {
 
                             Cell cIng = ingRow.getCell(4);
                             cIng.setCellValue(ii.getIngredientName() != null ? ii.getIngredientName() : "");
-                            cIng.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT));
+                            cIng.setCellStyle(sc.get(rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT));
 
                             Cell cQty = ingRow.getCell(5);
                             if (ii.getQuantityUsed() != null) {
                                 cQty.setCellValue(ii.getQuantityUsed().doubleValue());
-                                CellStyle ingQtyCs = mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.LEFT);
-                                ingQtyCs.setDataFormat(qtyFormat); cQty.setCellStyle(ingQtyCs);
+                                cQty.setCellStyle(sc.get(rowBg, cancelled ? "9CA3AF" : "374151", false, 9,
+                                        HorizontalAlignment.LEFT, qtyFormat));
                             } else {
-                                cQty.setCellValue(""); cQty.setCellStyle(mkStyle(wb, rowBg, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
+                                cQty.setCellValue("");
+                                cQty.setCellStyle(sc.get(rowBg, "9CA3AF", false, 9, HorizontalAlignment.LEFT));
                             }
 
                             Cell cUnit = ingRow.getCell(6);
                             cUnit.setCellValue(ii.getUnit() != null ? ii.getUnit() : "");
-                            cUnit.setCellStyle(mkStyle(wb, rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.CENTER));
+                            cUnit.setCellStyle(sc.get(rowBg, cancelled ? "9CA3AF" : "374151", false, 9, HorizontalAlignment.CENTER));
                         }
                     }
                     rowNum = itemLastRow + 1;
@@ -811,8 +852,7 @@ public class OrderExcelExporter {
     // exportForAccountant — build map orderCode → List<receiptNumber>
     // ════════════════════════════════════════════════════════════════
     public byte[] exportForAccountant(List<Order> orders, String title, String exportedBy, boolean isAccountant) throws Exception {
-        // orderCode → danh sách số phiếu thu (hỗ trợ nhiều phiếu / đơn)
-        Map<String, List<String>> orderCodeToReceipts = new java.util.HashMap<>();
+        Map<String, List<String>> orderCodeToReceipts = new HashMap<>();
         try {
             List<IncomeVoucher> vouchers = incomeVoucherRepository.findAllWithLinkedOrders();
             com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
@@ -834,8 +874,9 @@ public class OrderExcelExporter {
 
         try (XSSFWorkbook wb = new XSSFWorkbook();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            buildSummarySheet(wb, orders, title, exportedBy, orderCodeToReceipts, isAccountant);
-            buildDetailSheet(wb, orders, true);
+            StyleCache sc = new StyleCache(wb);
+            buildSummarySheet(sc, wb, orders, title, exportedBy, orderCodeToReceipts, isAccountant);
+            buildDetailSheet(sc, wb, orders, true);
             wb.write(out);
             return out.toByteArray();
         }
@@ -862,47 +903,44 @@ public class OrderExcelExporter {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-    private CellStyle mkStyle(XSSFWorkbook wb, String bgHex, String fgHex,
-                              boolean bold, int size, HorizontalAlignment align) {
-        XSSFCellStyle cs = wb.createCellStyle();
-        cs.setFillForegroundColor(new XSSFColor(hexToBytes(bgHex), null));
-        cs.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-        cs.setAlignment(align);
-        cs.setVerticalAlignment(VerticalAlignment.CENTER);
-        cs.setWrapText(true);
-        XSSFColor borderColor = new XSSFColor(hexToBytes(C_BORDER), null);
-        cs.setBorderLeft(BorderStyle.THIN);   cs.setBorderColor(XSSFCellBorder.BorderSide.LEFT,   borderColor);
-        cs.setBorderRight(BorderStyle.THIN);  cs.setBorderColor(XSSFCellBorder.BorderSide.RIGHT,  borderColor);
-        cs.setBorderTop(BorderStyle.THIN);    cs.setBorderColor(XSSFCellBorder.BorderSide.TOP,    borderColor);
-        cs.setBorderBottom(BorderStyle.THIN); cs.setBorderColor(XSSFCellBorder.BorderSide.BOTTOM, borderColor);
-        XSSFFont font = wb.createFont();
-        font.setFontName("Arial"); font.setBold(bold); font.setFontHeightInPoints((short) size);
-        font.setColor(new XSSFColor(hexToBytes(fgHex), null));
-        cs.setFont(font);
-        return cs;
+
+    /**
+     * Áp style cho một ô thuộc "khối giả-merge". Dòng đầu khối hiển thị chữ
+     * (màu fg thật) và có border trên; các dòng sau ẩn chữ (màu chữ = màu nền)
+     * và bỏ border trên. Border dưới chỉ có ở dòng cuối khối. Dữ liệu thật vẫn
+     * được set cho mọi dòng (do caller) nên filter/sort trên Excel hoạt động đúng.
+     */
+    private void styleMerged(StyleCache sc, Cell cell, int r, int first, int last,
+                             String bg, String fg, boolean bold, int size,
+                             HorizontalAlignment align, short dataFmt) {
+        boolean isFirst = (r == first);
+        boolean isLast  = (r == last);
+        String useFg = isFirst ? fg : bg; // ẩn chữ ở các dòng nối tiếp
+        cell.setCellStyle(sc.get(bg, useFg, bold, size, align, dataFmt, isFirst, isLast));
     }
 
-    private void applyStatusCell(XSSFWorkbook wb, Cell cell, String status,
+    /**
+     * Giống styleMerged nhưng cho ô Trạng thái: nền là màu theo status. Giá trị
+     * trạng thái được set cho mọi dòng (để filter/sort đúng), ẩn chữ ở dòng phụ
+     * bằng cách cho màu chữ = màu nền status.
+     */
+    private void styleStatusMerged(StyleCache sc, Cell cell, String status, int r, int first, int last) {
+        cell.setCellValue(STATUS_LABELS.getOrDefault(status, status));
+        String[] clr = STATUS_COLORS.get(status);
+        String sbg = clr != null ? clr[0] : C_WHITE;
+        String sfg = clr != null ? clr[1] : "374151";
+        boolean isFirst = (r == first);
+        boolean isLast  = (r == last);
+        String useFg = isFirst ? sfg : sbg;
+        cell.setCellStyle(sc.get(sbg, useFg, true, 9, HorizontalAlignment.CENTER, (short) 0, isFirst, isLast));
+    }
+
+    private void applyStatusCell(StyleCache sc, Cell cell, String status,
                                  Map<String, String> labels, Map<String, String[]> colors) {
         cell.setCellValue(labels.getOrDefault(status, status));
         String[] clr = colors.get(status);
         if (clr != null) {
-            XSSFCellStyle cs = wb.createCellStyle();
-            cs.setFillForegroundColor(new XSSFColor(hexToBytes(clr[0]), null));
-            cs.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-            cs.setAlignment(HorizontalAlignment.CENTER);
-            cs.setVerticalAlignment(VerticalAlignment.CENTER);
-            cs.setWrapText(true);
-            XSSFColor borderColor = new XSSFColor(hexToBytes(C_BORDER), null);
-            cs.setBorderLeft(BorderStyle.THIN);   cs.setBorderColor(XSSFCellBorder.BorderSide.LEFT,   borderColor);
-            cs.setBorderRight(BorderStyle.THIN);  cs.setBorderColor(XSSFCellBorder.BorderSide.RIGHT,  borderColor);
-            cs.setBorderTop(BorderStyle.THIN);    cs.setBorderColor(XSSFCellBorder.BorderSide.TOP,    borderColor);
-            cs.setBorderBottom(BorderStyle.THIN); cs.setBorderColor(XSSFCellBorder.BorderSide.BOTTOM, borderColor);
-            XSSFFont f = wb.createFont();
-            f.setFontName("Arial"); f.setBold(true); f.setFontHeightInPoints((short) 9);
-            f.setColor(new XSSFColor(hexToBytes(clr[1]), null));
-            cs.setFont(f);
-            cell.setCellStyle(cs);
+            cell.setCellStyle(sc.get(clr[0], clr[1], true, 9, HorizontalAlignment.CENTER));
         }
     }
 
@@ -1206,14 +1244,12 @@ public class OrderExcelExporter {
                     new com.fasterxml.jackson.core.type.TypeReference<List<Map<String, Object>>>() {});
             if (list == null || list.isEmpty()) return "";
 
-            // Kiểm tra nếu tất cả đều là "Kho giao tại kho"
             boolean allAtWarehouse = list.stream().allMatch(d ->
                     "Kho giao tại kho".equalsIgnoreCase(String.valueOf(d.getOrDefault("name", ""))));
             if (allAtWarehouse) {
                 return "Giao tại kho\n" + (warehouseName != null ? warehouseName : "");
             }
 
-            // Nhóm theo type, giữ thứ tự xuất hiện
             Map<String, List<String>> byType = new java.util.LinkedHashMap<>();
             for (Map<String, Object> d : list) {
                 String type  = String.valueOf(d.getOrDefault("type", "MOTORBIKE"));

@@ -24,7 +24,12 @@ public class IncomeVoucher {
     @Column(length = 300)
     private String payerName;
 
-    @Column(name = "receipt_number", nullable = false, unique = true, length = 100)
+    /**
+     * Số phiếu thu — do người dùng nhập (hoặc dùng số gợi ý). KHÔNG unique vì số
+     * phiếu chạy tới 15000 sẽ quay vòng về 1, nên các phiếu ở những vòng khác nhau
+     * có thể trùng số. Vẫn bắt buộc phải có.
+     */
+    @Column(name = "receipt_number", nullable = false, length = 100)
     private String receiptNumber;
 
     @Column(nullable = false, columnDefinition = "TEXT")
@@ -77,6 +82,14 @@ public class IncomeVoucher {
     @Builder.Default
     @OneToMany(mappedBy = "voucher", cascade = CascadeType.ALL, orphanRemoval = true)
     private List<IncomeItem> items = new ArrayList<>();
+
+    /**
+     * SỐ TIỀN ĐÃ GHI CHO TỪNG ĐƠN. Nguồn sự thật để sửa/hoàn tác chính xác khi
+     * một đơn được nhiều phiếu cùng trả. Xem {@link IncomeVoucherOrderAllocation}.
+     */
+    @OneToMany(mappedBy = "voucher", cascade = CascadeType.ALL, orphanRemoval = true)
+    @Builder.Default
+    private List<IncomeVoucherOrderAllocation> orderAllocations = new ArrayList<>();
 
     @Column(name = "image_urls", columnDefinition = "TEXT")
     private String imageUrls;

@@ -28,6 +28,9 @@ public class OrderResponse {
     private String orderedByName;
     private String receiverName;
     private String surchargeDetail;
+
+    /** Số phiếu thu (receiptNumber) của các phiếu thu đã liên kết với đơn này — có thể nhiều phiếu nếu thu nhiều lần */
+    private List<String> receiptNumbers;
     @Builder.Default
     private List<DriverInfo> drivers = new java.util.ArrayList<>();
     @Builder.Default
@@ -118,6 +121,23 @@ public class OrderResponse {
 
         private List<IngredientUsed> ingredientsUsed;
     }
+
+    // ── Quy tắc thu tiền trước (chỉ đọc, tính ở server) ──────────────────────
+    /**
+     * true = kho KHÔNG được bắt đầu giao khi đơn chưa thu đủ tiền.
+     *
+     * <p>Tính ở server để giao diện kho vô hiệu hoá nút "Bắt đầu giao" ngay từ đầu, thay
+     * vì cho bấm rồi mới trả lỗi — nhân viên kho không có cách nào biết trước là đơn nào
+     * bị chặn, và mỗi lần bấm hụt là một lần phải đi hỏi lại kinh doanh.
+     */
+    private Boolean requirePrepaymentEffective;
+
+    /** Tỉnh/thành và phường/xã của địa chỉ giao — để màn hình kho hiển thị đủ. */
+    private String provinceName;
+    private String wardName;
+
+    /** Lý do bị chặn, hiển thị làm tooltip cạnh nút bị khoá. */
+    private String prepaymentReason;
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
     public static class IngredientUsed {

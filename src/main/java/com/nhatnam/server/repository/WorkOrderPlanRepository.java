@@ -10,6 +10,6 @@ public interface WorkOrderPlanRepository extends JpaRepository<WorkOrderPlan, Lo
 
     Optional<WorkOrderPlan> findByWorkOrder_Id(Long workOrderId);
 
-    @Query("SELECT p FROM WorkOrderPlan p LEFT JOIN FETCH p.materials WHERE p.workOrder.id = :workOrderId")
+    @Query("SELECT p FROM WorkOrderPlan p LEFT JOIN FETCH p.materials LEFT JOIN FETCH p.recipe WHERE p.workOrder.id = :workOrderId")
     Optional<WorkOrderPlan> findByWorkOrderIdWithMaterials(@Param("workOrderId") Long workOrderId);
 }

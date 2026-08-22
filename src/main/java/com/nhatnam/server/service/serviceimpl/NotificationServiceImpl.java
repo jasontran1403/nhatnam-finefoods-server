@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Map;
+import java.util.Set;
 
 @Service
 @RequiredArgsConstructor
@@ -21,6 +22,29 @@ public class NotificationServiceImpl implements NotificationService {
 
     private final NotificationRepository notificationRepo;
     private final SimpMessagingTemplate messagingTemplate;
+
+    /**
+     * ROLE KHÔNG NHẬN PUSH WEBSOCKET cho các sự kiện đơn hàng.
+     *
+     * <p>OWNER/ADMIN theo dõi toàn bộ đơn của công ty. Ở quy mô vài chục đơn mỗi ngày,
+     * mỗi lần tạo đơn / đổi hình thức thanh toán / lập phiếu thu đều bắn toast thì màn
+     * hình của họ liên tục bị che, và đúng cái toast quan trọng lại bị bỏ qua vì đã
+     * quen tay tắt.
+     */
+    private static final Set<String> SILENT_ROLES_FOR_ORDER_EVENTS = Set.of("OWNER", "ADMIN");
+
+    /**
+     * SỰ KIỆN ĐƠN HÀNG — vẫn LƯU thông báo vào DB (OWNER/ADMIN mở chuông là thấy đủ),
+     * chỉ bỏ bước đẩy WebSocket nên không nổi toast.
+     *
+     * <p>Lọc theo tiền tố thay vì liệt kê từng mã: các sự kiện đơn hàng đều bắt đầu bằng
+     * {@code ORDER_} hoặc {@code PAYMENT_}, và sự kiện mới thêm sau này sẽ tự động được
+     * áp dụng mà không ai phải nhớ quay lại sửa danh sách ở đây.
+     */
+    private static boolean isOrderEvent(String eventType) {
+        if (eventType == null) return false;
+        return eventType.startsWith("ORDER_") || eventType.startsWith("PAYMENT_");
+    }
 
     @Override
     @Transactional
@@ -34,6 +58,15 @@ public class NotificationServiceImpl implements NotificationService {
                 .createdAt(System.currentTimeMillis())
                 .build();
         notificationRepo.save(n);
+
+        // Thông báo đã nằm trong DB. Với sự kiện đơn hàng gửi cho OWNER/ADMIN thì dừng
+        // ở đây — không push WS nên FE không hiện toast, nhưng chuông vẫn đếm và danh
+        // sách thông báo vẫn đầy đủ.
+        if (isOrderEvent(eventType)
+                && SILENT_ROLES_FOR_ORDER_EVENTS.contains(role.toUpperCase())) {
+            log.debug("[WS] Bỏ qua push {} cho role {} (sự kiện đơn hàng)", eventType, role);
+            return;
+        }
 
         try {
             messagingTemplate.convertAndSend(
@@ -67,6 +100,14 @@ public class NotificationServiceImpl implements NotificationService {
                 .createdAt(System.currentTimeMillis())
                 .build();
         notificationRepo.save(n);
+
+        // Cùng lý do như sendToRole: OWNER/ADMIN không nhận toast cho sự kiện đơn hàng.
+        if (isOrderEvent(eventType)
+                && SILENT_ROLES_FOR_ORDER_EVENTS.contains(roleName)) {
+            log.debug("[WS] Bỏ qua push {} cho user {} role {} (sự kiện đơn hàng)",
+                    eventType, user.getId(), roleName);
+            return;
+        }
 
         try {
             Map<String, Object> body = Map.of(

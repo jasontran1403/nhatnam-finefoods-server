@@ -16,6 +16,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -27,6 +28,7 @@ public class DashboardServiceImpl implements DashboardService {
 
     private final OrderRepository     orderRepository;
     private final OrderItemRepository orderItemRepository;
+    private final com.nhatnam.server.service.DebtStatsService debtStatsService;
 
     private static final ZoneId VN_ZONE    = ZoneId.of("Asia/Ho_Chi_Minh");
     private static final int    MAX_POINTS = 12;
@@ -49,6 +51,18 @@ public class DashboardServiceImpl implements DashboardService {
                 || o.getStatus() == OrderStatus.PENDING_PAYMENT;
     }
 
+    /** Đơn KHÔNG tính vào doanh thu: CANCELLED, PREPARING và FAILED. */
+    private static boolean isRevenueExcluded(Order o) {
+        return o.getStatus() == OrderStatus.CANCELLED
+                || o.getStatus() == OrderStatus.PREPARING
+                || o.getStatus() == OrderStatus.FAILED;
+    }
+
+    /** Làm tròn về đồng (0 chữ số thập phân, HALF_UP); null → 0. */
+    private static BigDecimal roundVnd(BigDecimal v) {
+        return v == null ? BigDecimal.ZERO : v.setScale(0, RoundingMode.HALF_UP);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Summary — 4 card mới giống SellerDashboard
     // ─────────────────────────────────────────────────────────────────────────
@@ -63,25 +77,49 @@ public class DashboardServiceImpl implements DashboardService {
         long pendingPaymentOrders = orders.stream().filter(o -> o.getStatus() == OrderStatus.PENDING_PAYMENT).count();
         long completedOrders      = orders.stream().filter(DashboardServiceImpl::isCompleted).count();
 
-        // Card 2: doanh thu
-        BigDecimal totalRevenue = orders.stream()
-                .filter(DashboardServiceImpl::isActive)
-                .map(o -> o.getFinalAmount() != null ? o.getFinalAmount() : BigDecimal.ZERO)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        // Card 2: doanh thu + breakdown ĐẦY ĐỦ (làm tròn TỪNG đơn HALF_UP TRƯỚC khi cộng).
+        //  • Tổng doanh thu = Σ round(final) của đơn KHÔNG ở CANCELLED/PREPARING/FAILED.
+        //  Breakdown (phân hoạch TẤT CẢ đơn trong kỳ theo round(final)):
+        //  • Đang xử lý = Σ round(final) của PREPARING + DELIVERING.
+        //  • Đã thu     = Σ round(paid) của PENDING_PAYMENT + Σ round(final) của COMPLETED.
+        //  • Chưa thu   = Σ (UNPAID→round(final), PARTIAL→round(final−paid)) của PENDING_PAYMENT.
+        //  • Đã hủy     = Σ round(final) của CANCELLED + FAILED.
+        BigDecimal totalRevenue       = BigDecimal.ZERO;
+        BigDecimal processingAmount   = BigDecimal.ZERO;
+        BigDecimal collectedRevenue   = BigDecimal.ZERO;
+        BigDecimal uncollectedRevenue = BigDecimal.ZERO;
+        BigDecimal cancelledAmount    = BigDecimal.ZERO;
+        for (Order o : orders) {
+            // ⬇ chỉ cộng doanh thu khi KHÔNG phải CANCELLED / FAILED
+            if (o.getStatus() != OrderStatus.CANCELLED
+                    && o.getStatus() != OrderStatus.FAILED) {
+                totalRevenue = totalRevenue.add(roundVnd(o.getFinalAmount()));
+            }
 
-        BigDecimal collectedRevenue = orders.stream()
-                .filter(DashboardServiceImpl::isCompleted)
-                .map(o -> o.getFinalAmount() != null ? o.getFinalAmount() : BigDecimal.ZERO)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+            switch (o.getStatus()) {
+                case PREPARING, DELIVERING ->
+                        processingAmount = processingAmount.add(roundVnd(o.getFinalAmount()));
+                case PENDING_PAYMENT -> {
+                    collectedRevenue = collectedRevenue.add(roundVnd(o.getPaidAmount()));
+                    PaymentStatus ps = o.getPaymentStatus();
+                    if (ps == PaymentStatus.UNPAID || ps == PaymentStatus.PARTIAL) {
+                        uncollectedRevenue = uncollectedRevenue.add(
+                                com.nhatnam.server.service.DebtStatsService.orderReceivable(o));
+                    }
+                }
+                case COMPLETED ->
+                        collectedRevenue = collectedRevenue.add(roundVnd(o.getFinalAmount()));
+                case CANCELLED, FAILED ->
+                        cancelledAmount = cancelledAmount.add(roundVnd(o.getFinalAmount()));
+                default -> { /* PENDING/CONFIRMED/READY (legacy): bỏ qua */ }
+            }
+        }
 
-        BigDecimal uncollectedRevenue = orders.stream()
-                .filter(DashboardServiceImpl::isPending)
-                .map(o -> o.getFinalAmount() != null ? o.getFinalAmount() : BigDecimal.ZERO)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        // Card 3 & 4: công nợ — placeholder, xử lý sau
-        BigDecimal nearingDeadlineAmount = new BigDecimal("0");
-        BigDecimal overdueAmount         = new BigDecimal("0");
+        // Card 3 & 4 + hàng aging: công nợ (KHÔNG lọc ngày). Dùng chung DebtStatsService
+        // với cả 4 role để số liệu đồng nhất.
+        var debt = debtStatsService.compute();
+        BigDecimal nearingDeadlineAmount = debt.nearingAmount();
+        BigDecimal overdueAmount         = debt.overdueAmount();
 
         return DashboardSummaryResponse.builder()
                 // card 1
@@ -94,9 +132,16 @@ public class DashboardServiceImpl implements DashboardService {
                 .totalRevenue(totalRevenue)
                 .collectedRevenue(collectedRevenue)
                 .uncollectedRevenue(uncollectedRevenue)
+                .processingAmount(processingAmount)
+                .cancelledAmount(cancelledAmount)
                 // card 3 & 4
                 .nearingDeadlineAmount(nearingDeadlineAmount)
                 .overdueAmount(overdueAmount)
+                // hàng aging
+                .aging0to30(debt.aging0to30())
+                .aging31to60(debt.aging31to60())
+                .aging61to90(debt.aging61to90())
+                .aging90plus(debt.aging90plus())
                 // giữ lại các field cũ để không break các chỗ khác dùng
                 .successOrders(completedOrders)
                 .totalPaid(collectedRevenue)

@@ -12,6 +12,7 @@ import com.nhatnam.server.enumtype.StatusCode;
 import com.nhatnam.server.exception.PriceChangedException;
 import com.nhatnam.server.repository.*;
 import com.nhatnam.server.service.*;
+import com.nhatnam.server.utils.CustomerDebtUtil;
 import com.nhatnam.server.utils.InvoicePdf;
 import com.nhatnam.server.utils.OrderExcelExporter;
 import org.apache.poi.ss.usermodel.*;
@@ -25,6 +26,7 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -56,6 +58,7 @@ public class SellerController {
     private final FileStorageService        fileStorageService;
     private final CategoryService           categoryService;
     private final CustomerService           customerService;
+    private final com.nhatnam.server.service.CustomerContractService customerContractService;
     private final com.nhatnam.server.service.SuperSellerOrderService superSellerOrderService;
     private final ObjectMapper              objectMapper;
     private final CustomerRepository        customerRepository;
@@ -63,6 +66,8 @@ public class SellerController {
     private final OrderRepository orderRepository;
     private final OrderExcelExporter exporter;
     private final SellerKpiRepository sellerKpiRepository;
+    private final AgedReceivablesReportService agedReceivablesReportService;
+    private final OrderProductReportPdfService orderProductReportPdfService;
 
     private static final ZoneId VN = ZoneId.of("Asia/Ho_Chi_Minh");
 
@@ -580,6 +585,9 @@ public class SellerController {
                                 .receiverName(name  != null && !name.isBlank()  ? name.trim()  : null)
                                 .receiverPhone(phone != null && !phone.isBlank() ? phone.trim() : null)
                                 .receiverAddress(address.trim())
+                                // Tỉnh + phường chọn từ danh mục; quyết định vùng COD.
+                                .provinceName(_str(data, "provinceName"))
+                                .wardName(_str(data, "wardName"))
                                 .isDefault(false)
                                 .build();
                         receiverInfoRepository.save(info);
@@ -607,6 +615,16 @@ public class SellerController {
                                 info.setReceiverAddress(addr.trim());
                             info.setReceiverName(name   != null && !name.isBlank()   ? name.trim()   : null);
                             info.setReceiverPhone(phone != null && !phone.isBlank() ? phone.trim() : null);
+                            // Tỉnh/phường: chỉ cập nhật khi client có gửi field (tránh xoá nhầm
+                            // khi payload chỉ đổi tên/SĐT). "Nhận tại kho" gửi chuỗi rỗng → null.
+                            if (data.containsKey("provinceName")) {
+                                String prov = _str(data, "provinceName");
+                                info.setProvinceName(prov != null && !prov.isBlank() ? prov.trim() : null);
+                            }
+                            if (data.containsKey("wardName")) {
+                                String ward = _str(data, "wardName");
+                                info.setWardName(ward != null && !ward.isBlank() ? ward.trim() : null);
+                            }
                             receiverInfoRepository.save(info);
                         });
                     }
@@ -724,6 +742,52 @@ public class SellerController {
         }
     }
 
+    /**
+     * BÁO CÁO SẢN PHẨM (PDF, khổ A4 dọc để in).
+     *
+     * <p>Mỗi dòng = 1 sản phẩm trong 1 đơn. Đơn có nhiều sản phẩm thì các cột
+     * STT / khách hàng / số phiếu / ngày được merge lại.</p>
+     *
+     * @param categoryIds danh mục cần lọc — có thể truyền nhiều lần
+     *                    ({@code ?categoryIds=1&categoryIds=2}) hoặc ngăn cách
+     *                    bằng dấu phẩy. Bỏ trống hoặc chọn hết = xuất tất cả.
+     */
+    @GetMapping("/orders/export-product-report")
+    public ResponseEntity<?> exportOrderProductReport(
+            @RequestParam Long from,
+            @RequestParam Long to,
+            @RequestParam(required = false) List<Long> categoryIds,
+            Authentication authentication) {
+        try {
+            if (authentication == null || !authentication.isAuthenticated())
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.UNAUTHORIZED, "Unauthorized"));
+            if (from == null || to == null || from > to)
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST,
+                        "Khoảng thời gian không hợp lệ"));
+
+            User user = (User) authentication.getPrincipal();
+            String actor = user.getFullName() != null && !user.getFullName().isBlank()
+                    ? user.getFullName() : user.getUsername();
+
+            byte[] pdf = orderProductReportPdfService.generatePdf(from, to, categoryIds, actor);
+
+            String fromStr = Instant.ofEpochMilli(from).atZone(VN)
+                    .format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String toStr = Instant.ofEpochMilli(to).atZone(VN)
+                    .format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String filename = "bao-cao-san-pham_" + fromStr + "_" + toStr + ".pdf";
+
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION,
+                            "inline; filename=\"" + filename + "\"")
+                    .contentType(MediaType.APPLICATION_PDF)
+                    .body(pdf);
+        } catch (Exception e) {
+            log.error("[SELLER] exportOrderProductReport error", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
     @PostMapping("/customers/{customerId}/receiver-infos")
     public ResponseEntity<ApiResponse<Map<String, Object>>> addReceiverInfo(
             @PathVariable Long customerId,
@@ -750,6 +814,8 @@ public class SellerController {
                     .receiverName(name != null && !name.isBlank() ? name.trim() : null)
                     .receiverPhone(phone != null && !phone.isBlank() ? phone.trim() : null)
                     .receiverAddress(address.trim())
+                    .provinceName(_str(req, "provinceName"))
+                    .wardName(_str(req, "wardName"))
                     .isDefault(false)
                     .build();
 
@@ -760,6 +826,8 @@ public class SellerController {
             m.put("receiverName",    info.getReceiverName());
             m.put("receiverPhone",   info.getReceiverPhone());
             m.put("receiverAddress", info.getReceiverAddress());
+            m.put("provinceName", info.getProvinceName());
+            m.put("wardName", info.getWardName());
             m.put("isDefault",       info.getIsDefault());
             m.put("createdAt",       info.getCreatedAt());
 
@@ -808,6 +876,15 @@ public class SellerController {
                 info.setReceiverPhone(phone != null && !phone.isBlank() ? phone.trim() : null);
             if (address != null && !address.isBlank())
                 info.setReceiverAddress(address.trim());
+            // Tỉnh/phường: chỉ đụng tới khi client gửi field. "Nhận tại kho" gửi rỗng → null.
+            if (req.containsKey("provinceName")) {
+                String prov = _str(req, "provinceName");
+                info.setProvinceName(prov != null && !prov.isBlank() ? prov.trim() : null);
+            }
+            if (req.containsKey("wardName")) {
+                String ward = _str(req, "wardName");
+                info.setWardName(ward != null && !ward.isBlank() ? ward.trim() : null);
+            }
 
             info = receiverInfoRepository.save(info);
 
@@ -816,6 +893,8 @@ public class SellerController {
             m.put("receiverName",    info.getReceiverName());
             m.put("receiverPhone",   info.getReceiverPhone());
             m.put("receiverAddress", info.getReceiverAddress());
+            m.put("provinceName", info.getProvinceName());
+            m.put("wardName", info.getWardName());
             m.put("isDefault",       info.getIsDefault());
             m.put("createdAt",       info.getCreatedAt());
 
@@ -853,12 +932,18 @@ public class SellerController {
         }
     }
 
+    /**
+     * @param withDebt true → kèm thêm trường {@code unpaidDebt} cho từng khách (tốn thêm
+     *                 1 query gộp). Mặc định false để không làm chậm màn hình KH thông thường;
+     *                 chỉ modal "Chọn khách hàng cho báo cáo công nợ" mới bật lên.
+     */
     @GetMapping("/customers/b2b")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getB2bCustomers(
             @RequestParam(required = false) String type,
             @RequestParam(required = false) String search,
             @RequestParam(defaultValue = "0")  int page,
             @RequestParam(defaultValue = "50") int size,
+            @RequestParam(defaultValue = "false") boolean withDebt,
             Authentication auth) {
         try {
             User currentUser = (User) auth.getPrincipal();
@@ -867,47 +952,9 @@ public class SellerController {
 
             Set<Role> userRoles = currentUser.getAllRoles();
 
-            boolean canSeeAll = userRoles.contains(Role.ADMIN)
-                    || userRoles.contains(Role.OWNER)
-                    || userRoles.contains(Role.SUPERADMIN)
-                    || userRoles.contains(Role.SUPER_SELLER);
-
-            var stream = canSeeAll
-                    ? customerRepository.findAllByDeletedAtIsNullOrderByCustomerCodeAscNameAsc().stream()
-                    : customerRepository.findAllByDeletedAtIsNullOrderByCustomerCodeAscNameAsc().stream()
-                    .filter(c -> {
-                        Long uid = currentUser.getId();
-
-                        // Khách cá nhân (RETAIL)
-                        if (c.getCustomerType() == Customer.CustomerType.RETAIL) {
-                            // Đã gán assignedSeller → chỉ người được gán thấy
-                            if (c.getAssignedSeller() != null) {
-                                return Objects.equals(c.getAssignedSeller().getId(), uid);
-                            }
-                            // Chưa gán → tất cả seller đều thấy
-                            return true;
-                        }
-
-                        // Khách công ty (COMPANY)
-                        if (c.getCustomerType() == Customer.CustomerType.COMPANY) {
-                            // Được gán chăm sóc → thấy
-                            if (c.getAssignedSeller() != null
-                                    && Objects.equals(c.getAssignedSeller().getId(), uid)) {
-                                return true;
-                            }
-                            // Do chính seller này tạo → thấy
-                            if (c.getCreatedBySeller() != null
-                                    && Objects.equals(c.getCreatedBySeller().getId(), uid)) {
-                                return true;
-                            }
-                            // Admin/Owner tạo (createdBySeller == null) → tất cả seller thấy
-                            if (c.getCreatedBySeller() == null) {
-                                return true;
-                            }
-                            return false;
-                        }
-                        return false;
-                    });
+            var stream = customerRepository.findAllByDeletedAtIsNullOrderByCustomerCodeAscNameAsc()
+                    .stream()
+                    .filter(c -> _canSellerSeeCustomer(c, currentUser, userRoles));
 
             if (type != null && !type.isBlank()) {
                 final var t = Customer.CustomerType.valueOf(type.toUpperCase());
@@ -924,7 +971,25 @@ public class SellerController {
                 );
             }
 
-            var allList = stream.map(this::_toB2bMap).toList();
+            List<Customer> visible = stream.toList();
+
+            // Công nợ (tuỳ chọn) — 1 query gộp, dùng chung công thức với màn hình kế toán
+            final Map<Long, Long> debtMap;
+            if (withDebt) {
+                List<Long> ids = visible.stream()
+                        .map(Customer::getId).filter(Objects::nonNull).toList();
+                debtMap = ids.isEmpty()
+                        ? Map.of()
+                        : CustomerDebtUtil.unpaidByCustomer(orderRepository.findByCustomerIdIn(ids));
+            } else {
+                debtMap = Map.of();
+            }
+
+            var allList = visible.stream().map(c -> {
+                Map<String, Object> m = _toB2bMap(c);
+                if (withDebt) m.put("unpaidDebt", debtMap.getOrDefault(c.getId(), 0L));
+                return m;
+            }).toList();
             int total = allList.size();
             int start = page * size;
             int end   = Math.min(start + size, total);
@@ -1046,6 +1111,51 @@ public class SellerController {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
         } catch (Exception e) {
             log.error("[SUPER_SELLER] updateOrder error orderId={}", orderId, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // SUPER_SELLER — Hủy đơn hàng (mọi trạng thái, kể cả đã thanh toán/đã giao/hoàn thành)
+    // ════════════════════════════════════════════════════════════════
+
+    /** Kiểm tra thông tin trước khi hủy: đã thanh toán chưa, có phiếu thu liên kết không */
+    @GetMapping("/orders/{orderId}/super-cancel/check")
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('SUPER_SELLER','OWNER','ADMIN','SUPERADMIN')")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> checkCancelInfo(@PathVariable Long orderId) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(
+                    superSellerOrderService.checkCancelInfo(orderId), "OK"));
+        } catch (RuntimeException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[SUPER_SELLER] checkCancelInfo error orderId={}", orderId, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /** Hủy đơn hàng — SUPER_SELLER, cho phép hủy mọi trạng thái */
+    @PutMapping("/orders/{orderId}/super-cancel")
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('SUPER_SELLER','OWNER','ADMIN','SUPERADMIN')")
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.response.OrderResponse>> superSellerCancelOrder(
+            @PathVariable Long orderId,
+            @RequestBody SuperSellerCancelOrderRequest req,
+            Authentication authentication) {
+        try {
+            if (authentication == null || !authentication.isAuthenticated())
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.UNAUTHORIZED, "Unauthorized"));
+            com.nhatnam.server.entity.User user = (com.nhatnam.server.entity.User) authentication.getPrincipal();
+            com.nhatnam.server.dto.response.OrderResponse cancelled =
+                    superSellerOrderService.cancelOrder(orderId, user.getId(), req);
+            return ResponseEntity.ok(ApiResponse.success(cancelled, "Đã hủy đơn hàng"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (RuntimeException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[SUPER_SELLER] cancelOrder error orderId={}", orderId, e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
     }
@@ -1183,10 +1293,10 @@ public class SellerController {
                         || (c.getCreatedBySeller() != null && Objects.equals(c.getCreatedBySeller().getId(), userId)))
                 .filter(c ->
                         (c.getCustomerCode() != null && c.getCustomerCode().toLowerCase().contains(code.toLowerCase())) ||
-                        (c.getTaxCode() != null && c.getTaxCode().contains(code)) ||
-                        (c.getPhone()   != null && c.getPhone().contains(code)) ||
-                        (c.getName()    != null && c.getName().toLowerCase().contains(code.toLowerCase())) ||
-                        (c.getCompanyName() != null && c.getCompanyName().toLowerCase().contains(code.toLowerCase())))
+                                (c.getTaxCode() != null && c.getTaxCode().contains(code)) ||
+                                (c.getPhone()   != null && c.getPhone().contains(code)) ||
+                                (c.getName()    != null && c.getName().toLowerCase().contains(code.toLowerCase())) ||
+                                (c.getCompanyName() != null && c.getCompanyName().toLowerCase().contains(code.toLowerCase())))
                 .map(this::_toB2bMap)
                 .toList();
         return ResponseEntity.ok(ApiResponse.success(list, "OK"));
@@ -1274,6 +1384,8 @@ public class SellerController {
                         m.put("receiverName",    r.getReceiverName());
                         m.put("receiverPhone",   r.getReceiverPhone());
                         m.put("receiverAddress", r.getReceiverAddress());
+                        m.put("provinceName", r.getProvinceName());
+                        m.put("wardName", r.getWardName());
                         m.put("isDefault",       r.getIsDefault());
                         m.put("createdAt",       r.getCreatedAt());
                         return m;
@@ -1445,7 +1557,8 @@ public class SellerController {
             List<?> rawReceivers = req.get("receiverInfos") instanceof List<?>
                     ? (List<?>) req.get("receiverInfos") : List.of();
 
-            record ReceiverData(String name, String rPhone, String address, boolean isDefault) {}
+            record ReceiverData(String name, String rPhone, String address,
+                                String provinceName, String wardName, boolean isDefault) {}
             List<ReceiverData> parsedReceivers = new ArrayList<>();
 
             for (int i = 0; i < rawReceivers.size(); i++) {
@@ -1455,6 +1568,9 @@ public class SellerController {
                 String rName    = rMap.get("receiverName")    instanceof String s ? s.trim() : null;
                 String rPhone   = rMap.get("receiverPhone")   instanceof String s ? s.trim() : null;
                 String rAddress = rMap.get("receiverAddress") instanceof String s ? s.trim() : null;
+                // Tỉnh/thành + phường/xã chọn từ danh mục — quyết định vùng COD.
+                String rProvince = rMap.get("provinceName")   instanceof String s ? s.trim() : null;
+                String rWard     = rMap.get("wardName")       instanceof String s ? s.trim() : null;
                 boolean isDefault = Boolean.TRUE.equals(rMap.get("isDefault"));
 
                 // Chỉ cần địa chỉ — nếu trống thì bỏ qua
@@ -1463,8 +1579,10 @@ public class SellerController {
                 // Normalize: empty string → null
                 if (rName != null && rName.isBlank()) rName = null;
                 if (rPhone != null && rPhone.isBlank()) rPhone = null;
+                if (rProvince != null && rProvince.isBlank()) rProvince = null;
+                if (rWard != null && rWard.isBlank()) rWard = null;
 
-                parsedReceivers.add(new ReceiverData(rName, rPhone, rAddress, isDefault));
+                parsedReceivers.add(new ReceiverData(rName, rPhone, rAddress, rProvince, rWard, isDefault));
             }
 
             // ── Validate duplicate address across receivers ─────────────
@@ -1520,8 +1638,9 @@ public class SellerController {
                 c.setAssignedSellerName(assignedName);
             }
 
+            // Triển khai khóa công nợ - cod ngoài HCM thì bỏ dòng dưới đây
+            c.setContractRequired(false);
             c = customerRepository.save(c);
-
 
             // ── Lưu receiverInfos ─────────────────────────────────────────────
             final Customer savedCustomer = c;
@@ -1540,6 +1659,8 @@ public class SellerController {
                         .receiverName(r.name())       // null ok
                         .receiverPhone(r.rPhone())    // null ok
                         .receiverAddress(r.address())
+                        .provinceName(r.provinceName())  // null ok
+                        .wardName(r.wardName())          // null ok
                         .isDefault(r.isDefault() || i == 0)
                         .build());
             }
@@ -2273,6 +2394,9 @@ public class SellerController {
         _setStrNullable(req, "companyAddress", c::setCompanyAddress);
         _setStrNullable(req, "name",           c::setName);
         _setStrNullable(req, "email",          c::setEmail);
+        // Tên trên hợp đồng — để trống thì fallback về tên công ty / tên khách
+        // (xem Customer.resolvedContractName()).
+        _setStrNullable(req, "contractName",   c::setContractName);
 
         // ── Phone ─────────────────────────────────────────────────────────────
         if (req.containsKey("phone")) {
@@ -2335,6 +2459,13 @@ public class SellerController {
             }
         }
 
+        // ── Ngày kỷ niệm ─────────────────────────────────────────────────────
+        // Nhận số (epoch millis) hoặc null. Key vắng mặt = giữ nguyên giá trị cũ.
+        if (req.containsKey("birthday"))
+            c.setBirthday(_parseEpoch(req.get("birthday")));
+        if (req.containsKey("storeOpeningDate"))
+            c.setStoreOpeningDate(_parseEpoch(req.get("storeOpeningDate")));
+
         // ── isActive ──────────────────────────────────────────────────────────
         if (isCreate) c.setIsActive(true);
 
@@ -2345,6 +2476,9 @@ public class SellerController {
             c.setContactName(null);
             c.setCompanyPhone(null);
             c.setCompanyAddress(null);
+            // Đổi sang khách lẻ thì ngày khai trương không còn ý nghĩa.
+            c.setStoreOpeningDate(null);
+            // Sinh nhật không bắt buộc — bỏ trống nếu chưa có thông tin.
         }
 
         // ── Khi COMPANY → name = contactName nếu name trống ──────────────────
@@ -2352,6 +2486,9 @@ public class SellerController {
             if (c.getName() == null || c.getName().isBlank())
                 if (c.getContactName() != null && !c.getContactName().isBlank())
                     c.setName(c.getContactName());
+            // Khách công ty KHÔNG bắt buộc ngày khai trương — xem javadoc
+            // CustomerAdminService#_validateAnniversary.
+            c.setBirthday(null);
         }
     }
 
@@ -2375,6 +2512,112 @@ public class SellerController {
         return v instanceof String s ? s : null;
     }
 
+    /**
+     * Quyền NHÌN THẤY khách hàng của tài khoản kinh doanh.
+     *
+     * <p>ADMIN / OWNER / SUPERADMIN / SUPER_SELLER → thấy tất cả.
+     * <p>SELLER:
+     *   - Khách RETAIL : chưa gán ai, hoặc được gán cho chính mình.
+     *   - Khách COMPANY: mình chăm sóc, hoặc mình tạo, hoặc do admin/owner tạo.
+     *
+     * <p>Dùng CHUNG cho danh sách khách hàng và báo cáo công nợ để hai nơi không thể
+     * lệch quyền — tránh việc seller xuất được công nợ của khách mình không được xem.
+     */
+    /**
+     * Đọc epoch millis từ payload JSON.
+     *
+     * <p>Nhận cả Number lẫn String: một số client gửi timestamp dạng chuỗi khi số vượt
+     * quá {@code Number.MAX_SAFE_INTEGER} của JavaScript. Giá trị không parse được coi
+     * như null thay vì ném lỗi — ngày kỷ niệm sai định dạng không đáng làm hỏng cả
+     * thao tác lưu khách hàng.
+     */
+    private Long _parseEpoch(Object raw) {
+        if (raw == null) return null;
+        if (raw instanceof Number n) return n.longValue();
+        try { return Long.parseLong(raw.toString().trim()); }
+        catch (Exception e) { return null; }
+    }
+
+    private boolean _canSellerSeeCustomer(Customer c, User u, Set<Role> roles) {
+        if (c == null) return false;
+
+        if (roles.contains(Role.ADMIN)
+                || roles.contains(Role.OWNER)
+                || roles.contains(Role.SUPERADMIN)
+                || roles.contains(Role.SUPER_SELLER)) return true;
+
+        Long uid = u.getId();
+
+        if (c.getCustomerType() == Customer.CustomerType.RETAIL) {
+            if (c.getAssignedSeller() != null)
+                return Objects.equals(c.getAssignedSeller().getId(), uid);
+            return true;                                  // chưa gán → seller nào cũng thấy
+        }
+
+        if (c.getCustomerType() == Customer.CustomerType.COMPANY) {
+            if (c.getAssignedSeller() != null
+                    && Objects.equals(c.getAssignedSeller().getId(), uid)) return true;
+            if (c.getCreatedBySeller() != null
+                    && Objects.equals(c.getCreatedBySeller().getId(), uid)) return true;
+            return c.getCreatedBySeller() == null;        // admin/owner tạo → seller nào cũng thấy
+        }
+        return false;
+    }
+
+    /**
+     * Báo cáo công nợ (Aged Receivables) — bản dành cho SELLER / SUPER_SELLER.
+     *
+     * <p>GET /api/seller/reports/aged-receivables?customerIds=1,2,3
+     *
+     * <p>Khác bản của kế toán ở chỗ: danh sách khách LUÔN bị giới hạn trong phạm vi
+     * khách mà tài khoản này được phép nhìn thấy. Kể cả khi client gửi lên customerIds
+     * của khách khác, phần ngoài phạm vi sẽ bị loại bỏ trước khi dựng báo cáo.
+     * Bỏ trống customerIds = xuất toàn bộ khách trong phạm vi của mình.
+     */
+    @GetMapping("/reports/aged-receivables")
+    public ResponseEntity<byte[]> exportAgedReceivablesForSeller(
+            @RequestParam(required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate asOf,
+            @RequestParam(required = false) List<Long> customerIds,
+            Authentication auth) {
+
+        User currentUser = (User) auth.getPrincipal();
+        Set<Role> userRoles = currentUser.getAllRoles();
+
+        // Phạm vi khách hàng được phép xem
+        Set<Long> visibleIds = customerRepository
+                .findAllByDeletedAtIsNullOrderByCustomerCodeAscNameAsc().stream()
+                .filter(c -> _canSellerSeeCustomer(c, currentUser, userRoles))
+                .map(Customer::getId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        // Giao với danh sách khách được chọn ở modal (nếu có)
+        Set<Long> allowed = visibleIds;
+        if (customerIds != null && !customerIds.isEmpty()) {
+            allowed = customerIds.stream()
+                    .filter(Objects::nonNull)
+                    .filter(visibleIds::contains)
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+        }
+
+        LocalDate reportDate = (asOf != null) ? asOf : LocalDate.now(ZoneId.of("Asia/Ho_Chi_Minh"));
+
+        // allowed rỗng → truyền tập rỗng-nhưng-không-null để báo cáo ra trắng,
+        // KHÔNG được truyền null vì null nghĩa là "lấy tất cả khách hàng".
+        byte[] pdf = agedReceivablesReportService.generatePdf(
+                reportDate, null, null, null, null,
+                allowed.isEmpty() ? List.of(-1L) : allowed);
+
+        String filename = "aged-receivables_"
+                + reportDate.format(DateTimeFormatter.ofPattern("yyyyMMdd")) + ".pdf";
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
+                .contentType(MediaType.APPLICATION_PDF)
+                .body(pdf);
+    }
+
     private Map<String, Object> _toB2bMap(Customer c) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",           c.getId());
@@ -2396,6 +2639,9 @@ public class SellerController {
         m.put("contactName",     contact != null ? contact : "");
         m.put("phone",           c.getPhone()           != null ? c.getPhone()           : "");
         m.put("companyName",     c.getCompanyName());
+        m.put("contractName",         c.getContractName());
+        m.put("contractNameResolved", c.resolvedContractName());
+        m.put("contractNameDefault",  c.defaultContractName());
         m.put("taxCode",         c.getTaxCode());
         m.put("companyPhone",    c.getCompanyPhone());
         m.put("companyAddress",  c.getCompanyAddress());
@@ -2410,11 +2656,32 @@ public class SellerController {
         m.put("createdBySellerName", createdBySellerName);
         m.put("createdByAdmin", c.getCreatedBySeller() == null);
 
+        // ── Ngày kỷ niệm (sinh nhật / khai trương) ────────────────────────────
+        // daysUntilAnniversary + anniversaryUpcoming tính SẴN Ở SERVER theo giờ VN:
+        // để FE tự tính thì mỗi máy trạm lệch múi giờ sẽ tô màu khác nhau.
+        Long anniversary = c.getCustomerType() == Customer.CustomerType.COMPANY
+                ? c.getStoreOpeningDate() : c.getBirthday();
+        m.put("birthday",             c.getBirthday());
+        m.put("storeOpeningDate",     c.getStoreOpeningDate());
+        m.put("daysUntilAnniversary", com.nhatnam.server.utils.AnniversaryUtil.daysUntilNext(anniversary));
+        m.put("anniversaryUpcoming",  com.nhatnam.server.utils.AnniversaryUtil.isUpcomingThisMonth(anniversary));
+
         // ── Phân loại khách hàng ──────────────────────────────────────────────
         CustomerCategory cat = c.getCustomerCategory();
         m.put("categoryId",    cat != null ? cat.getId()    : null);
         m.put("categoryName",  cat != null ? cat.getName()  : null);
         m.put("categoryColor", cat != null ? cat.getColor() : null);
+
+        // ── Hợp đồng ──────────────────────────────────────────────────────────
+        // Điều kiện để khách được mua CÔNG NỢ. Trang bán hàng dựa vào cờ này để
+        // ẩn lựa chọn "Công nợ" ngay từ đầu thay vì để người bán chọn rồi bị
+        // server từ chối lúc lưu đơn.
+        boolean hasContract = customerContractService.hasContract(c.getId());
+        m.put("hasContract",      hasContract);
+        m.put("contractRequired", c.isContractRequiredForDebt());
+        // debtAllowed là cờ FE dùng để ẩn/hiện lựa chọn Công nợ. Khách cũ
+        // (contractRequired = null) được miễn hợp đồng, vẫn bán chịu như trước.
+        m.put("debtAllowed",      !c.isContractRequiredForDebt() || hasContract);
 
         return m;
     }

@@ -109,6 +109,51 @@ public class WarehouseAdminController {
             Long catId    = _s != null ? _s.getCategoryId() : null;
             Long subCatId = _s != null ? _s.getSubCategoryId() : null;
 
+            // ── Màu tình trạng lô + danh sách lô, sắp theo sắp-hết-hạn trước ──
+            //   Lô không có HSD xếp CUỐI (nullsLast). Cùng logic màu với trang
+            //   quản lý kho của WAREHOUSE để hai nơi nhất quán.
+            java.time.LocalDate today = java.time.LocalDate.now();
+            List<IngredientExpiry> sortedLots = lots.stream()
+                    .sorted(Comparator.comparing(IngredientExpiry::getExpiryDate,
+                            Comparator.nullsLast(Comparator.naturalOrder())))
+                    .toList();
+
+            String freshnessBadge = computeFreshnessBadge(sortedLots, today);
+
+            List<Map<String, Object>> lotDtos = new java.util.ArrayList<>(sortedLots.stream().map(e -> {
+                Map<String, Object> l = new LinkedHashMap<>();
+                l.put("importedAt", e.getCreatedAt());
+                l.put("quantity",   e.getQuantity());
+                l.put("costPrice",  e.getCostPrice());       // đơn giá vốn của lô
+                l.put("lotCost",    e.getCostPrice() != null
+                        ? e.getQuantity().multiply(e.getCostPrice()).setScale(2, RoundingMode.HALF_UP)
+                        : null);                              // giá vốn cả lô
+                l.put("expiryDate", e.getExpiryDate() != null ? e.getExpiryDate().toString() : null);
+                l.put("tracked",    true);
+                return l;
+            }).toList());
+
+            // ── PHẦN TỒN KHÔNG THUỘC LÔ NÀO ──────────────────────────────────
+            //   stockQuantity là tổng THẬT; các lô HSD chỉ theo dõi một phần (hàng
+            //   nhập trước khi bật theo dõi lô, hoặc điều chỉnh tồn tay không tạo
+            //   lô). Chênh lệch này phải hiện thành một dòng riêng, nếu không tổng
+            //   các lô trong modal sẽ nhỏ hơn tồn kho và người xem tưởng mất hàng.
+            BigDecimal trackedQty = sortedLots.stream()
+                    .map(IngredientExpiry::getQuantity)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            BigDecimal stockQty = s.getStockQuantity() != null ? s.getStockQuantity() : BigDecimal.ZERO;
+            BigDecimal untracked = stockQty.subtract(trackedQty);
+            if (untracked.compareTo(BigDecimal.ZERO) > 0) {
+                Map<String, Object> l = new LinkedHashMap<>();
+                l.put("importedAt", null);            // không rõ thời điểm nhập
+                l.put("quantity",   untracked);
+                l.put("costPrice",  null);
+                l.put("lotCost",    null);
+                l.put("expiryDate", null);            // không rõ hạn → xếp cuối
+                l.put("tracked",    false);           // FE hiển thị "không rõ"
+                lotDtos.add(l);
+            }
+
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("ingredientId",    ingId);
             row.put("ingredientName",  s.resolvedName());
@@ -121,6 +166,8 @@ public class WarehouseAdminController {
             row.put("subCategoryId",   subCatId);
             row.put("subCategoryName", subCatId != null ? subCatMap.getOrDefault(subCatId, null) : null);
             row.put("updatedAt",       s.getUpdatedAt());
+            row.put("freshnessBadge",  freshnessBadge);
+            row.put("lots",            lotDtos);
             return row;
         }).toList();
 
@@ -133,6 +180,37 @@ public class WarehouseAdminController {
         result.put("items",             rows);
         result.put("grandTotalCostValue", grandTotal);
         return ApiResponse.ok(result);
+    }
+
+    /** Dưới 7 ngày tới hạn = cực gấp; nhập trong 30 ngày = hàng mới. */
+    private static final int DAYS_CRITICAL = 7;
+    private static final int DAYS_DANGER = 30;
+    private static final int DAYS_NEWLY_STOCKED = 30;
+
+    /**
+     * MÀU TÌNH TRẠNG lô, ưu tiên gắt nhất thắng:
+     * EXPIRED_OR_CRITICAL (đỏ cam) &gt; NEAR_EXPIRY (vàng) &gt; NEWLY_STOCKED (xanh) &gt; NONE.
+     * Chỉ xét lô còn hàng; lô gắt xuất hết thì lần sau badge tự rớt xuống.
+     */
+    private String computeFreshnessBadge(List<IngredientExpiry> lots, java.time.LocalDate today) {
+        boolean hasCritical = false, hasNear = false, hasNew = false;
+        long newlyStockedFloorMs = today.minusDays(DAYS_NEWLY_STOCKED)
+                .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+
+        for (IngredientExpiry lot : lots) {
+            java.time.LocalDate exp = lot.getExpiryDate();
+            if (exp != null) {
+                long days = java.time.temporal.ChronoUnit.DAYS.between(today, exp);
+                if (days < DAYS_CRITICAL) hasCritical = true;       // <7 ngày hoặc đã hết hạn (âm)
+                else if (days <= DAYS_DANGER) hasNear = true;
+            }
+            if (lot.getCreatedAt() != null && lot.getCreatedAt() >= newlyStockedFloorMs) hasNew = true;
+        }
+
+        if (hasCritical) return "EXPIRED_OR_CRITICAL";
+        if (hasNear)     return "NEAR_EXPIRY";
+        if (hasNew)      return "NEWLY_STOCKED";
+        return "NONE";
     }
 
     @PostMapping

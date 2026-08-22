@@ -28,12 +28,78 @@ public class UserAdminService {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final WarehouseRepository warehouseRepository;
+    private final com.nhatnam.server.repository.TokenRepository tokenRepository;
+    private final com.nhatnam.server.service.DriverUserSyncService driverUserSyncService;
 
     @Transactional(readOnly = true)
     public PageResponse<UserDto> list(String q, Role role, Boolean locked, Pageable pageable) {
-        Page<User> page = userRepository.search(q, role, locked, pageable);
-        List<UserDto> content = page.getContent().stream().map(this::toDto).toList();
-        return PageResponse.from(page, content);
+        return list(q, role, locked, false, pageable);
+    }
+
+    /** @param includeDeleted true = hiện cả nhân viên đã xoá mềm */
+    @Transactional(readOnly = true)
+    public PageResponse<UserDto> list(String q, Role role, Boolean locked,
+                                      boolean includeDeleted, Pageable pageable) {
+        return list(q, role, locked, includeDeleted, false, pageable);
+    }
+
+    /**
+     * @param birthdaySort true = sắp xếp theo SINH NHẬT GẦN ĐẾN NHẤT (0 ngày = hôm nay lên đầu),
+     *                     người chưa khai báo ngày sinh xếp cuối.
+     *
+     * <p>Phải nạp TOÀN BỘ tập lọc rồi mới cắt trang: thứ tự này phụ thuộc ngày hiện tại
+     * và có xử lý riêng cho 29/02, không diễn đạt được bằng {@code ORDER BY} của SQL.
+     * Cùng cách làm với sort theo công nợ ở màn hình khách hàng.
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<UserDto> list(String q, Role role, Boolean locked,
+                                      boolean includeDeleted, boolean birthdaySort,
+                                      Pageable pageable) {
+        if (!birthdaySort) {
+            Page<User> page = userRepository.search(q, role, locked, includeDeleted, pageable);
+            List<UserDto> content = page.getContent().stream().map(this::toDto).toList();
+            return PageResponse.from(page, content);
+        }
+
+        Pageable all = org.springframework.data.domain.PageRequest.of(
+                0, Integer.MAX_VALUE,
+                org.springframework.data.domain.Sort.by(
+                        org.springframework.data.domain.Sort.Direction.DESC, "id"));
+
+        List<UserDto> sorted = new ArrayList<>(
+                userRepository.search(q, role, locked, includeDeleted, all)
+                        .getContent().stream().map(this::toDto).toList());
+
+        sorted.sort(Comparator.comparingInt(
+                (UserDto d) -> d.getDaysUntilBirthday() != null
+                        ? d.getDaysUntilBirthday()
+                        : Integer.MAX_VALUE)          // chưa khai báo → xuống cuối
+                .thenComparing(d -> d.getFullName() != null ? d.getFullName() : ""));
+
+        int total  = sorted.size();
+        int pageNo = pageable.getPageNumber();
+        int size   = pageable.getPageSize() > 0 ? pageable.getPageSize() : 20;
+        int start  = pageNo * size;
+        int end    = Math.min(start + size, total);
+        List<UserDto> slice = start >= total ? List.of() : sorted.subList(start, end);
+        int totalPages = size > 0 ? (int) Math.ceil((double) total / size) : 0;
+
+        return PageResponse.<UserDto>builder()
+                .content(slice)
+                .page(pageNo)
+                .size(size)
+                .totalElements(total)
+                .totalPages(totalPages)
+                .first(pageNo == 0)
+                .last(pageNo >= totalPages - 1)
+                .build();
+    }
+
+    /** Danh sách nhân viên ĐÃ XOÁ (để tra cứu / khôi phục) */
+    @Transactional(readOnly = true)
+    public PageResponse<UserDto> listDeleted(Pageable pageable) {
+        Page<User> page = userRepository.findDeleted(pageable);
+        return PageResponse.from(page, page.getContent().stream().map(this::toDto).toList());
     }
 
     @Transactional(readOnly = true)
@@ -50,6 +116,16 @@ public class UserAdminService {
                 && userRepository.existsByEmail(req.getEmail())) {
             throw new BusinessException("Email đã tồn tại");
         }
+        if (req.getPhoneNumber() != null && !req.getPhoneNumber().isBlank()
+                && userRepository.existsByPhoneNumber(req.getPhoneNumber())) {
+            throw new BusinessException("Số điện thoại đã tồn tại");
+        }
+        // Cấm tự nhập tiền tố hệ thống dùng cho xoá mềm
+        if (req.getUsername() != null && req.getUsername().startsWith(User.SOFT_DELETED_PREFIX)) {
+            throw new BusinessException("Username không được bắt đầu bằng " + User.SOFT_DELETED_PREFIX);
+        }
+        // LƯU Ý: nhân viên đã xoá mềm KHÔNG chặn ở đây — username/email/SĐT của họ
+        // đã được đổi thành "SOFT_DELETED_{id}_{...}" nên giá trị cũ đã được giải phóng.
 
         Warehouse warehouse = resolveWarehouse(req.getWarehouseId());
 
@@ -75,6 +151,7 @@ public class UserAdminService {
                 .fullName(req.getFullName())
                 .email(req.getEmail())
                 .phoneNumber(req.getPhoneNumber())
+                .dateOfBirth(req.getDateOfBirth())
                 .role(primaryRole)
                 .roles(allRoles)
                 .warehouse(warehouse)
@@ -83,7 +160,12 @@ public class UserAdminService {
                 .isLockAccount(false)
                 .mfaEnabled(false)
                 .build();
-        return toDto(userRepository.save(u));
+        User saved = userRepository.save(u);
+
+        // Có role Tài xế → tạo luôn bản ghi driver tương ứng để hai bảng khớp nhau
+        driverUserSyncService.syncFromUser(saved);
+
+        return toDto(saved);
     }
 
     @Transactional
@@ -93,6 +175,7 @@ public class UserAdminService {
         if (req.getFullName()    != null) u.setFullName(req.getFullName());
         if (req.getEmail()       != null) u.setEmail(req.getEmail());
         if (req.getPhoneNumber() != null) u.setPhoneNumber(req.getPhoneNumber());
+        if (req.getDateOfBirth() != null) u.setDateOfBirth(req.getDateOfBirth());
 
         // Cập nhật roles nếu được gửi lên
         Set<Role> allRoles = resolveRoles(req.getRoles(), req.getRole());
@@ -124,7 +207,12 @@ public class UserAdminService {
             u.setUserWarehouses(new HashSet<>());
         }
 
-        return toDto(userRepository.save(u));
+        User saved = userRepository.save(u);
+
+        // Thêm/bỏ role Tài xế hoặc đổi họ tên → cập nhật bản ghi driver tương ứng
+        driverUserSyncService.syncFromUser(saved);
+
+        return toDto(saved);
     }
 
     @Transactional
@@ -132,6 +220,117 @@ public class UserAdminService {
         User u = findOrThrow(id);
         u.setLockAccount(locked);
         return toDto(userRepository.save(u));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // XOÁ MỀM (SOFT DELETE)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * XOÁ MỀM một nhân viên.
+     *
+     * <ol>
+     *   <li>{@code deleted = true}, {@code isLockAccount = true} → không đăng nhập được
+     *       và bị loại khỏi mọi truy vấn thông báo (tất cả đều lọc isLockAccount = false).</li>
+     *   <li>Gắn tiền tố {@code SOFT_DELETED_{id}_} vào username / email / phoneNumber
+     *       → GIẢI PHÓNG các giá trị unique đó để tạo lại nhân viên mới với thông tin cũ.</li>
+     *   <li>Giá trị gốc được lưu vào {@code originalUsername/Email/PhoneNumber}.</li>
+     *   <li>Thu hồi toàn bộ token đang đăng nhập.</li>
+     * </ol>
+     *
+     * <p>KHÔNG xoá cứng: user còn được tham chiếu ở đơn hàng, phiếu kho, log… → xoá cứng
+     * sẽ vỡ khoá ngoại và mất lịch sử.
+     */
+    @Transactional
+    public UserDto softDelete(Long id, String actorName) {
+        User u = findOrThrow(id);
+
+        if (u.isDeleted()) throw new BusinessException("Nhân viên này đã bị xoá trước đó");
+        if (u.getAllRoles().contains(Role.SUPERADMIN))
+            throw new BusinessException("Không thể xoá tài khoản SUPERADMIN");
+
+        long now = System.currentTimeMillis();
+        String tag = User.SOFT_DELETED_PREFIX + id + "_";
+
+        // Lưu giá trị gốc trước khi đổi
+        u.setOriginalUsername(u.getUsername());
+        u.setOriginalEmail(u.getEmail());
+        u.setOriginalPhoneNumber(u.getPhoneNumber());
+
+        // Gắn tiền tố vào các field UNIQUE → giải phóng giá trị cũ
+        u.setUsername(truncate(tag + u.getUsername(), 150));
+        if (u.getEmail() != null && !u.getEmail().isBlank())
+            u.setEmail(truncate(tag + u.getEmail(), 190));
+        if (u.getPhoneNumber() != null && !u.getPhoneNumber().isBlank())
+            u.setPhoneNumber(truncate(tag + u.getPhoneNumber(), 40));
+
+        u.setDeleted(true);
+        u.setDeletedAt(now);
+        u.setDeletedBy(actorName);
+        u.setLockAccount(true);          // chặn đăng nhập + loại khỏi mọi query thông báo
+
+        // Thu hồi phiên đăng nhập hiện tại
+        revokeAllTokens(u);
+
+        User saved = userRepository.save(u);
+
+        // Xoá mềm luôn bản ghi driver (thêm tiền tố "[Đã xóa] " + tắt active)
+        driverUserSyncService.syncFromUser(saved);
+
+        return toDto(saved);
+    }
+
+    /**
+     * KHÔI PHỤC nhân viên đã xoá mềm.
+     *
+     * <p>Nếu username/email/SĐT gốc trong lúc đó đã bị tài khoản khác dùng mất thì
+     * KHÔNG khôi phục được — phải sửa thông tin của tài khoản kia trước.
+     */
+    @Transactional
+    public UserDto restore(Long id) {
+        User u = findOrThrow(id);
+        if (!u.isDeleted()) throw new BusinessException("Nhân viên này chưa bị xoá");
+
+        String username = u.getOriginalUsername();
+        String email    = u.getOriginalEmail();
+        String phone    = u.getOriginalPhoneNumber();
+
+        if (username != null && userRepository.existsByUsername(username))
+            throw new BusinessException("Username \"" + username + "\" đã được tài khoản khác sử dụng");
+        if (email != null && !email.isBlank() && userRepository.existsByEmail(email))
+            throw new BusinessException("Email \"" + email + "\" đã được tài khoản khác sử dụng");
+        if (phone != null && !phone.isBlank() && userRepository.existsByPhoneNumber(phone))
+            throw new BusinessException("Số điện thoại \"" + phone + "\" đã được tài khoản khác sử dụng");
+
+        if (username != null) u.setUsername(username);
+        u.setEmail(email);
+        u.setPhoneNumber(phone);
+
+        u.setOriginalUsername(null);
+        u.setOriginalEmail(null);
+        u.setOriginalPhoneNumber(null);
+        u.setDeleted(false);
+        u.setDeletedAt(null);
+        u.setDeletedBy(null);
+        u.setLockAccount(false);
+
+        User saved = userRepository.save(u);
+
+        // Khôi phục tài khoản → mở lại bản ghi driver nếu vẫn còn role Tài xế
+        driverUserSyncService.syncFromUser(saved);
+
+        return toDto(saved);
+    }
+
+    private void revokeAllTokens(User u) {
+        var tokens = tokenRepository.findAllValidTokenByUser(u.getId());
+        if (tokens == null || tokens.isEmpty()) return;
+        tokens.forEach(t -> { t.setExpired(true); t.setRevoked(true); });
+        tokenRepository.saveAll(tokens);
+    }
+
+    private static String truncate(String s, int max) {
+        return (s != null && s.length() > max) ? s.substring(0, max) : s;
     }
 
     @Transactional
@@ -195,9 +394,9 @@ public class UserAdminService {
 
         // warehouse đơn legacy (ưu tiên warehouseId của getAllWarehouses first nếu không có warehouse đơn)
         Long whId = u.getWarehouse() != null ? u.getWarehouse().getId()
-                    : (!warehouseInfos.isEmpty() ? warehouseInfos.get(0).getId() : null);
+                : (!warehouseInfos.isEmpty() ? warehouseInfos.get(0).getId() : null);
         String whName = u.getWarehouse() != null ? u.getWarehouse().getName()
-                    : (!warehouseInfos.isEmpty() ? warehouseInfos.get(0).getName() : null);
+                : (!warehouseInfos.isEmpty() ? warehouseInfos.get(0).getName() : null);
 
         return UserDto.builder()
                 .id(u.getId())
@@ -208,13 +407,25 @@ public class UserAdminService {
                 .role(primaryRole)
                 .roles(roleNames)
                 .isLockAccount(u.isLockAccount())
+                .deleted(u.isDeleted())
+                .deletedAt(u.getDeletedAt())
+                .deletedBy(u.getDeletedBy())
                 .mfaEnabled(u.isMfaEnabled())
                 .timeCreate(u.getTimeCreate())
                 .warehouseId(whId)
                 .warehouseName(whName)
                 .warehouses(warehouseInfos.isEmpty() ? null : warehouseInfos)
                 .department(u.getDepartment())
+                .division(u.getDivision())
                 .position(u.getPosition())
+                .workStartDate(u.getWorkStartDate())
+                .dateOfBirth(u.getDateOfBirth())
+                // Tính sẵn ở server: FE chỉ việc sort/tô màu, không phải tự suy ra
+                // "sinh nhật tháng này" bằng múi giờ của trình duyệt.
+                .daysUntilBirthday(
+                        com.nhatnam.server.utils.AnniversaryUtil.daysUntilNext(u.getDateOfBirth()))
+                .birthdayThisMonth(
+                        com.nhatnam.server.utils.AnniversaryUtil.isUpcomingThisMonth(u.getDateOfBirth()))
                 .build();
     }
 }

@@ -29,10 +29,20 @@ public class DashboardSummaryResponse {
     private BigDecimal totalRevenue;
     private BigDecimal collectedRevenue;
     private BigDecimal uncollectedRevenue;
+    /** Đang xử lý = Σ round(final) của PREPARING + DELIVERING. */
+    private BigDecimal processingAmount;
+    /** Đã hủy = Σ round(final) của CANCELLED + FAILED. */
+    private BigDecimal cancelledAmount;
 
-    // ── Card 3 & 4: Công nợ placeholder ──────────────────────────────────
+    // ── Card 3 & 4: Công nợ ───────────────────────────────────────────────
     private BigDecimal nearingDeadlineAmount;
     private BigDecimal overdueAmount;
+
+    // ── Hàng card mới: phân tuổi nợ (aging) theo ngày kể từ khi tạo đơn ────
+    private BigDecimal aging0to30;
+    private BigDecimal aging31to60;
+    private BigDecimal aging61to90;
+    private BigDecimal aging90plus;
 
     // ── Backward-compat fields ────────────────────────────────────────────
     private long       successOrders;

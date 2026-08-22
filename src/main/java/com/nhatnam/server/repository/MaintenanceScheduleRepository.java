@@ -35,4 +35,18 @@ public interface MaintenanceScheduleRepository extends JpaRepository<Maintenance
     /** Tổng chi phí thực tế của 1 máy */
     @Query("SELECT COALESCE(SUM(m.actualCost), 0) FROM MaintenanceSchedule m WHERE m.machine.id = :machineId")
     BigDecimal sumActualCostByMachine(@Param("machineId") Long machineId);
+
+    /**
+     * Tìm lịch bảo trì/sửa chữa của máy đang active tại thời điểm nowMs
+     * (plannedStart <= nowMs <= plannedEnd và chưa COMPLETED/ADJUSTED).
+     * Dùng để kiểm tra máy có available không trước khi bắt đầu bước sản xuất.
+     */
+    @Query("SELECT m FROM MaintenanceSchedule m JOIN FETCH m.machine " +
+           "WHERE m.machine.id = :machineId " +
+           "AND m.plannedStart <= :nowMs AND m.plannedEnd >= :nowMs " +
+           "AND m.status NOT IN ('COMPLETED', 'ADJUSTED', 'MISSED') " +
+           "ORDER BY m.plannedStart ASC")
+    List<MaintenanceSchedule> findActiveMaintenanceForMachineAt(
+            @Param("machineId") Long machineId,
+            @Param("nowMs") long nowMs);
 }

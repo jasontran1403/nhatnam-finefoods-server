@@ -35,6 +35,7 @@ public class FileStorageServiceImpl implements FileStorageService {
     private static final String EVENT_IMAGE_PATH         = BASE_STORAGE_PATH + "/landingpage-events";
     private static final String PRODUCTION_IMAGE_PATH    = BASE_STORAGE_PATH + "/production-files";
     private static final String CERTIFICATE_FILE_PATH   = BASE_STORAGE_PATH + "/certificate";
+    private static final String CUSTOMER_CONTRACT_PATH  = BASE_STORAGE_PATH + "/customer-contract";
 
     private static final List<String> ALLOWED_EXTENSIONS = Arrays.asList(
             "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"
@@ -58,6 +59,7 @@ public class FileStorageServiceImpl implements FileStorageService {
             Files.createDirectories(Paths.get(EVENT_IMAGE_PATH));
             Files.createDirectories(Paths.get(PRODUCTION_IMAGE_PATH));
             Files.createDirectories(Paths.get(CERTIFICATE_FILE_PATH));
+            Files.createDirectories(Paths.get(CUSTOMER_CONTRACT_PATH));
         } catch (IOException e) {
             throw new RuntimeException("Could not create storage directories", e);
         }
@@ -269,6 +271,48 @@ public class FileStorageServiceImpl implements FileStorageService {
     }
 
     @Override
+    public String saveCustomerContractFile(MultipartFile file) throws IOException {
+        if (file == null || file.isEmpty()) throw new IllegalArgumentException("File không được rỗng");
+
+        String originalFilename = file.getOriginalFilename();
+        if (originalFilename == null || originalFilename.isBlank())
+            throw new IllegalArgumentException("Tên file không hợp lệ");
+
+        int dotIdx = originalFilename.lastIndexOf('.');
+        String ext = dotIdx >= 0 ? originalFilename.substring(dotIdx + 1).toLowerCase() : "";
+        List<String> allowed = Arrays.asList("jpg", "jpeg", "png", "gif", "bmp", "webp", "pdf");
+        if (!allowed.contains(ext))
+            throw new IllegalArgumentException("Định dạng không hỗ trợ: " + ext);
+
+        String filename = String.format("customer-contract_%d_%s.%s",
+                System.currentTimeMillis(), UUID.randomUUID(), ext);
+
+        if ("pdf".equals(ext)) {
+            // PDF ghi thẳng, không đụng vào nội dung.
+            Files.write(Paths.get(CUSTOMER_CONTRACT_PATH, filename), file.getBytes());
+            return "/images/customer-contract/" + filename;
+        }
+
+        // Ảnh: chỉ THU NHỎ GIỮ TỈ LỆ, không crop. Hợp đồng cần đọc được chữ nên
+        // cắt theo khung cố định như ảnh sản phẩm sẽ làm mất nội dung ở rìa.
+        BufferedImage original = readImageSafely(file);
+        if (original == null) {
+            // Không đọc được bằng ImageIO (định dạng lạ) → giữ nguyên bytes gốc,
+            // thà file to còn hơn mất chứng từ.
+            Files.write(Paths.get(CUSTOMER_CONTRACT_PATH, filename), file.getBytes());
+            return "/images/customer-contract/" + filename;
+        }
+
+        BufferedImage resized = resizeKeepRatio(original, 2200);
+        String pngName = filename.substring(0, filename.lastIndexOf('.')) + ".png";
+        Path target = Paths.get(CUSTOMER_CONTRACT_PATH, pngName);
+        if (!ImageIO.write(resized, "png", target.toFile()))
+            throw new IOException("Không ghi được ảnh hợp đồng");
+
+        return "/images/customer-contract/" + pngName;
+    }
+
+    @Override
     public String saveLandingpageImage(MultipartFile file) throws IOException {
         if (file == null || file.isEmpty()) throw new IllegalArgumentException("File is empty");
 
@@ -310,6 +354,7 @@ public class FileStorageServiceImpl implements FileStorageService {
             case "landingpage-events"   -> Paths.get(EVENT_IMAGE_PATH,         filename);
             case "order-receipt"        -> Paths.get(RECEIPT_FILE_PATH,        filename);
             case "certificate"          -> Paths.get(CERTIFICATE_FILE_PATH,    filename);
+            case "customer-contract"    -> Paths.get(CUSTOMER_CONTRACT_PATH,   filename);
             case "production" -> {
                 // Path có thể nested: /images/production/batches/4/.../filename
                 // → resolve từ PRODUCTION_IMAGE_PATH + toàn bộ subpath sau "production/"

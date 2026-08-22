@@ -27,4 +27,25 @@ public interface DriverAttendanceRepository extends JpaRepository<DriverAttendan
 
     @Query("SELECT a FROM DriverAttendance a WHERE a.attendanceDate BETWEEN :from AND :to ORDER BY a.attendanceDate DESC, a.createdAt ASC")
     List<DriverAttendance> findByDateRange(@Param("from") String from, @Param("to") String to);
+
+    /**
+     * SỐ ODO ĐÃ GHI GẦN NHẤT TRƯỚC MỘT NGÀY, của cùng tài xế + cùng loại xe.
+     *
+     * <p>Công-tơ-mét chỉ tăng, không bao giờ quay ngược. Đây là mốc sàn để chặn
+     * việc gõ nhầm một số nhỏ hơn — nếu không, số km của ngày sau sẽ ra âm và
+     * báo cáo bị lệch mà không ai phát hiện ra cho tới cuối tháng.
+     *
+     * <p>{@code attendanceDate} lưu dạng "yyyy-MM-dd" nên so sánh chuỗi cũng
+     * chính là so sánh thời gian.
+     */
+    @Query("""
+           SELECT a FROM DriverAttendance a
+            WHERE a.driver = :driver
+              AND a.vehicleType = :vehicleType
+              AND a.attendanceDate < :date
+            ORDER BY a.attendanceDate DESC, a.odometer DESC
+           """)
+    List<DriverAttendance> findPreviousBefore(@Param("driver") Driver driver,
+                                              @Param("vehicleType") Driver.VehicleType vehicleType,
+                                              @Param("date") String date);
 }

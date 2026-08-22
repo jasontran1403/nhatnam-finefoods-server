@@ -20,7 +20,7 @@ import java.util.Map;
 public class DashboardController {
 
     private final DashboardService  dashboardService;
-    private final OrderRepository   orderRepository;   // ← THÊM
+    private final com.nhatnam.server.service.DebtStatsService debtStatsService;
     private static final ZoneId VN = ZoneId.of("Asia/Ho_Chi_Minh");
 
     @GetMapping("/stats")
@@ -68,39 +68,35 @@ public class DashboardController {
     @GetMapping("/debt-stats")
     public ApiResponse<Map<String, Object>> getDebtStats() {
         try {
-            LocalDate today    = LocalDate.now(VN);
-            long todayMs       = today.atStartOfDay(VN).toInstant().toEpochMilli();
-            long in7DaysMs     = today.plusDays(7).atStartOfDay(VN).toInstant().toEpochMilli();
-
-            List<Order> debtOrders = orderRepository
-                    .findByStatusOrderByCreatedAtDesc(OrderStatus.PENDING_PAYMENT)
-                    .stream()
-                    .filter(o -> "DEBT".equalsIgnoreCase(
-                            o.getPaymentMethod() != null ? o.getPaymentMethod() : ""))
-                    .toList();
-
-            long nearingDeadline = 0, overdueCount = 0;
-            for (Order o : debtOrders) {
-                if (o.getPendingPaymentAt() == null || o.getPendingPaymentAt() <= 0) continue;
-                if (o.getDebtDays() <= 0) continue;
-                LocalDate pendingDate = Instant.ofEpochMilli(o.getPendingPaymentAt())
-                        .atZone(VN).toLocalDate();
-                LocalDate deadline    = pendingDate.plusDays(1).plusDays(o.getDebtDays());
-                long deadlineMs       = deadline.atStartOfDay(VN).toInstant().toEpochMilli();
-                if (deadlineMs < todayMs)         overdueCount++;
-                else if (deadlineMs <= in7DaysMs) nearingDeadline++;
-            }
-
+            var s = debtStatsService.compute();
             Map<String, Object> result = new LinkedHashMap<>();
-            result.put("nearingDeadline", nearingDeadline);
-            result.put("overdueCount",    overdueCount);
-            result.put("totalDebtOrders", debtOrders.size());
+            // Số lượng đơn (giữ lại để tương thích ngược)
+            result.put("nearingDeadline",       s.nearingCount());
+            result.put("overdueCount",          s.overdueCount());
+            result.put("totalDebtOrders",       s.totalDebtOrders());
+            // Tổng TIỀN chưa thu (đã trừ paidAmount, làm tròn từng đơn) — dùng để hiển thị
+            result.put("nearingDeadlineAmount", s.nearingAmount());
+            result.put("overdueAmount",         s.overdueAmount());
+            result.put("totalDebtAmount",       s.totalDebtAmount());
+            // Phân tuổi nợ (aging) theo ngày kể từ khi tạo đơn
+            result.put("aging0to30",            s.aging0to30());
+            result.put("aging31to60",           s.aging31to60());
+            result.put("aging61to90",           s.aging61to90());
+            result.put("aging90plus",           s.aging90plus());
             return ApiResponse.ok(result);
         } catch (Exception e) {
-            return ApiResponse.ok(Map.of(
-                    "nearingDeadline", 0L,
-                    "overdueCount",    0L,
-                    "totalDebtOrders", 0L));
+            Map<String, Object> zero = new LinkedHashMap<>();
+            zero.put("nearingDeadline", 0L);
+            zero.put("overdueCount", 0L);
+            zero.put("totalDebtOrders", 0L);
+            zero.put("nearingDeadlineAmount", java.math.BigDecimal.ZERO);
+            zero.put("overdueAmount", java.math.BigDecimal.ZERO);
+            zero.put("totalDebtAmount", java.math.BigDecimal.ZERO);
+            zero.put("aging0to30", java.math.BigDecimal.ZERO);
+            zero.put("aging31to60", java.math.BigDecimal.ZERO);
+            zero.put("aging61to90", java.math.BigDecimal.ZERO);
+            zero.put("aging90plus", java.math.BigDecimal.ZERO);
+            return ApiResponse.ok(zero);
         }
     }
 

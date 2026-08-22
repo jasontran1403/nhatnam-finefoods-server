@@ -48,7 +48,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     final String path = request.getServletPath();
 
-    if ((path.startsWith("/api/auth") && !path.equals("/api/auth/switch-role") && !path.equals("/api/auth/default-role"))
+    // /api/auth/** là public, TRỪ mấy endpoint cần biết "đang là ai":
+    //   switch-role, default-role  → thao tác trên tài khoản đang đăng nhập
+    //   me                         → nạp lại roles/kho sau khi OWNER đổi phân quyền
+    // Bỏ sót endpoint nào ở đây là Authentication sẽ null và endpoint đó trả 401.
+    if ((path.startsWith("/api/auth")
+            && !path.equals("/api/auth/switch-role")
+            && !path.equals("/api/auth/default-role")
+            && !path.equals("/api/auth/me"))
             || path.startsWith("/ws") || path.startsWith("/api/auth/landingpage") ||
             "OPTIONS".equalsIgnoreCase(request.getMethod())) {
       filterChain.doFilter(request, response);

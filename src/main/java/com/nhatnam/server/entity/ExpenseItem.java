@@ -22,6 +22,14 @@ public class ExpenseItem {
     @Column(nullable = false, length = 300)
     private String itemName;
 
+    /**
+     * FK tới {@link VendorExpenseCategory} — nhãn khoản chi được CHỌN từ danh mục
+     * của NCC (do Owner quản lý). Dùng để tổng hợp chi phí theo mục (VD tiền điện
+     * theo từng tháng) không phụ thuộc chữ hiển thị. Null với phiếu cũ (gõ tự do).
+     */
+    @Column(name = "category_id")
+    private Long categoryId;
+
     @Column(nullable = false, precision = 15, scale = 0)
     private BigDecimal amount;
 

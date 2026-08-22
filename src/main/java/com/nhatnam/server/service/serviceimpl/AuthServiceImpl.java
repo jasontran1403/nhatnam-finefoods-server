@@ -127,12 +127,10 @@ public class AuthServiceImpl implements AuthService {
                     .build();
 
         } catch (BadCredentialsException | UsernameNotFoundException e) {
-            log.warn("Login failed: Invalid credentials for user {}", request.getUsername());
-            throw new RuntimeException("Account invalid");
+            throw new RuntimeException("Tài khoản không hợp lệ, xin vui lòng kiểm tra lại!");
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
-            log.error("Login failed: {}", e.getMessage());
             throw new RuntimeException(e.getMessage());
         }
     }
@@ -169,6 +167,92 @@ public class AuthServiceImpl implements AuthService {
                 .userId(user.getId()).fullName(user.getFullName())
                 .isLock(user.isLockAccount())
                 .role(activeRole.name()).accessToken(jwtToken)
+                .requireRoleSelection(false).availableRoles(roleNames)
+                .warehouseId(user.getWarehouse() != null ? user.getWarehouse().getId() : null)
+                .warehouseName(user.getWarehouse() != null ? user.getWarehouse().getName() : null)
+                .warehouses(warehouseInfos.isEmpty() ? null : warehouseInfos)
+                .build();
+    }
+
+    /**
+     * NẠP LẠI PHIÊN — đọc lại roles/kho từ DB cho tài khoản đang đăng nhập.
+     *
+     * <h3>Vấn đề</h3>
+     * OWNER gán thêm role hoặc đổi role cho nhân viên, nhưng nhân viên phải ĐĂNG
+     * XUẤT rồi đăng nhập lại mới thấy. Nguyên nhân KHÔNG nằm ở backend:
+     * {@code JwtAuthenticationFilter} gọi {@code loadUserByUsername} mỗi request
+     * nên quyền phía server đã tươi sẵn. Thứ bị cũ là bản sao user mà frontend
+     * cache trong localStorage lúc đăng nhập — menu và route guard đọc từ đó.
+     *
+     * <h3>Cách xử lý role đang chọn</h3>
+     * <ul>
+     *   <li><b>Vẫn còn hợp lệ</b> → GIỮ NGUYÊN, và giữ luôn token cũ. Được gán
+     *       thêm role không có nghĩa là muốn nhảy sang role đó ngay; user tự bấm
+     *       "Chuyển vai trò" khi cần. Chỉ danh sách {@code availableRoles} là mới.</li>
+     *   <li><b>Đã bị thu hồi</b> → chọn lại role khác (ưu tiên role mặc định trong
+     *       hồ sơ, không có thì lấy role đầu) và CẤP TOKEN MỚI. Không cấp token
+     *       mới thì filter sẽ rơi về nhánh "gộp toàn bộ quyền trong DB" — rộng hơn
+     *       ý định — trong khi frontend vẫn tưởng đang ở role đã mất.</li>
+     * </ul>
+     *
+     * <p>Tài khoản bị KHOÁ thì ném lỗi để frontend đá ra ngoài ngay lần F5 kế tiếp.
+     */
+    @Override
+    public AuthResponse refreshSession(String username, String currentSelectedRole) throws Exception {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new RuntimeException("User không tồn tại"));
+
+        // BusinessException = "phiên này KHÔNG dùng được nữa" → controller trả
+        // UNAUTHORIZED và frontend đá ra đăng nhập lại. Lỗi khác (DB trục trặc…)
+        // KHÔNG được rơi vào nhánh này, xem catch ở controller.
+        if (user.isLockAccount()) {
+            throw new com.nhatnam.server.common.BusinessException("Tài khoản đã bị khoá");
+        }
+
+        Set<Role> allRoles = user.getAllRoles();
+        if (allRoles.isEmpty()) {
+            throw new com.nhatnam.server.common.BusinessException("Tài khoản chưa được gán vai trò nào");
+        }
+
+        // Role đang chọn còn hợp lệ không?
+        Role activeRole = null;
+        if (currentSelectedRole != null && !currentSelectedRole.isBlank()) {
+            try {
+                Role parsed = Role.valueOf(currentSelectedRole);
+                if (allRoles.contains(parsed)) activeRole = parsed;
+            } catch (IllegalArgumentException ignored) {}
+        }
+
+        boolean needNewToken = false;
+        if (activeRole == null) {
+            // Role cũ đã bị thu hồi → rơi về role mặc định, hoặc role đầu tiên.
+            activeRole = (user.getRole() != null && allRoles.contains(user.getRole()))
+                    ? user.getRole()
+                    : allRoles.iterator().next();
+            needNewToken = true;
+        }
+
+        String accessToken = null;
+        if (needNewToken) {
+            accessToken = jwtService.generateTokenWithRole(user, activeRole);
+            tokenRepository.save(Token.builder()
+                    .user(user).token(accessToken)
+                    .tokenType(TokenType.BEARER).expired(false).revoked(false).build());
+        }
+
+        List<AuthResponse.WarehouseInfo> warehouseInfos = user.getAllWarehouses().stream()
+                .map(w -> new AuthResponse.WarehouseInfo(w.getId(), w.getName()))
+                .collect(Collectors.toList());
+        List<String> roleNames = allRoles.stream()
+                .map(Role::name).sorted().collect(Collectors.toList());
+
+        return AuthResponse.builder()
+                .userId(user.getId()).username(user.getUsername())
+                .fullName(user.getFullName())
+                .isLock(user.isLockAccount())
+                .role(activeRole.name())
+                // null = frontend GIỮ token đang dùng (không cần cấp mới)
+                .accessToken(accessToken)
                 .requireRoleSelection(false).availableRoles(roleNames)
                 .warehouseId(user.getWarehouse() != null ? user.getWarehouse().getId() : null)
                 .warehouseName(user.getWarehouse() != null ? user.getWarehouse().getName() : null)

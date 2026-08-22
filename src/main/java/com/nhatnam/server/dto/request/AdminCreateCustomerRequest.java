@@ -36,4 +36,26 @@ public class AdminCreateCustomerRequest {
     private String companyPhone;
     private String companyAddress;
     private String contactName;
+
+    /**
+     * Tên trên hợp đồng — tuỳ chọn.
+     * Để trống/null → hệ thống dùng tên công ty (COMPANY) hoặc tên khách (RETAIL).
+     */
+    private String contractName;
+
+    // ── Ngày kỷ niệm ─────────────────────────────────────────────────────
+    /**
+     * NGÀY SINH NHẬT (epoch millis) — BẮT BUỘC khi {@code customerType = RETAIL}.
+     *
+     * <p>Ràng buộc kiểm ở service chứ không dùng {@code @NotNull}: cùng một DTO này
+     * phục vụ cả khách công ty (không có sinh nhật) lẫn khách lẻ, nên annotation
+     * tĩnh không diễn đạt được điều kiện "bắt buộc TÙY loại khách".
+     */
+    private Long birthday;
+
+    /** NGÀY KHAI TRƯƠNG CỬA HÀNG MỚI (epoch millis) — chỉ COMPANY, KHÔNG bắt buộc. */
+    private Long storeOpeningDate;
+
+    /** Phân loại khách hàng. Gửi 0 hoặc null để bỏ phân loại. */
+    private Long categoryId;
 }

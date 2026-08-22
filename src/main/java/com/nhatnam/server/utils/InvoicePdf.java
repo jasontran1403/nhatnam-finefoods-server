@@ -1,6 +1,8 @@
 package com.nhatnam.server.utils;
 
 import com.itextpdf.html2pdf.HtmlConverter;
+import com.itextpdf.html2pdf.ConverterProperties;
+import com.itextpdf.io.font.FontProgramFactory;
 import com.itextpdf.io.font.PdfEncodings;
 import com.itextpdf.kernel.colors.ColorConstants;
 import com.itextpdf.kernel.font.PdfFont;
@@ -12,6 +14,7 @@ import com.itextpdf.kernel.pdf.PdfReader;
 import com.itextpdf.kernel.pdf.PdfWriter;
 import com.itextpdf.kernel.pdf.canvas.PdfCanvas;
 import com.itextpdf.kernel.pdf.extgstate.PdfExtGState;
+import com.itextpdf.layout.font.FontProvider;
 import com.nhatnam.server.dto.InvoiceDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
@@ -42,6 +45,31 @@ public class InvoicePdf {
     private static final int    ROWS_PER_PAGE = 14;
     private static final int    TARGET_ROWS   = 14;
 
+    // ── ConverterProperties với FontProvider nhúng font Roboto ────────────────
+    // QUAN TRỌNG: html2pdf không đọc được font qua @font-face base64 trong CSS
+    // (log lỗi "Unable to retrieve font" — DefaultHtmlProcessor không decode được
+    // data URI base64 dài). Phải nạp font TrueType trực tiếp từ file resource
+    // vào FontProvider rồi gắn qua ConverterProperties. Chỉ add đúng font Roboto
+    // — KHÔNG gọi addStandardPdfFonts()/addSystemFonts() vì sẽ làm FontProvider
+    // có nhiều lựa chọn và có thể chọn nhầm font khác cho chữ in đậm/CJK.
+    private ConverterProperties buildConverterProperties() {
+        FontProvider fontProvider = new FontProvider();
+        for (String path : new String[]{"fonts/Roboto-Regular.ttf", "fonts/Roboto-Bold.ttf"}) {
+            try (InputStream is = InvoicePdf.class.getClassLoader().getResourceAsStream(path)) {
+                if (is == null) {
+                    log.warn("Không tìm thấy font resource: {}", path);
+                    continue;
+                }
+                fontProvider.addFont(FontProgramFactory.createFont(is.readAllBytes()));
+            } catch (Exception e) {
+                log.warn("Lỗi khi nạp font {}: {}", path, e.getMessage());
+            }
+        }
+        ConverterProperties props = new ConverterProperties();
+        props.setFontProvider(fontProvider);
+        return props;
+    }
+
     public byte[] GenerateInvoicePdf(InvoiceDTO dto) throws IOException {
         return GenerateInvoicePdf(dto, true);
     }
@@ -51,7 +79,8 @@ public class InvoicePdf {
         ByteArrayOutputStream firstPass = new ByteArrayOutputStream();
         HtmlConverter.convertToPdf(
                 new ByteArrayInputStream(html.getBytes(StandardCharsets.UTF_8)),
-                firstPass);
+                firstPass,
+                buildConverterProperties());
         return addWatermark(firstPass.toByteArray(), "FINE FOODS");
     }
 
@@ -60,7 +89,8 @@ public class InvoicePdf {
         ByteArrayOutputStream firstPass = new ByteArrayOutputStream();
         HtmlConverter.convertToPdf(
                 new ByteArrayInputStream(html.getBytes(StandardCharsets.UTF_8)),
-                firstPass);
+                firstPass,
+                buildConverterProperties());
         return addWatermark(firstPass.toByteArray(), "FINE FOODS");
     }
 
@@ -116,8 +146,10 @@ public class InvoicePdf {
         String html = new String(is.readAllBytes(), StandardCharsets.UTF_8);
 
         String logoSrc = loadLogoBase64();
-        String fontCSS = buildFontFaceCSS();
-        html = html.replace("</style>", fontCSS + "\n</style>");
+        // Không còn chèn @font-face base64 vào CSS nữa — html2pdf không decode
+        // được data URI base64 dài (log "Unable to retrieve font"), font giờ
+        // được nạp trực tiếp qua FontProvider/ConverterProperties (xem
+        // buildConverterProperties()), CSS chỉ cần khai báo font-family: 'Roboto'.
 
         // Lấy giá trị hideAllPrices từ DTO (mặc định false)
         boolean hideAllPrices = dto.getHideAllPrices() != null && dto.getHideAllPrices();
@@ -135,8 +167,9 @@ public class InvoicePdf {
         String custName  = safe(dto.getCustomerName(), "Khách lẻ");
         custName = custName.equalsIgnoreCase("Khách vãng lai") ? "" : custName;
         String custPhone = safe(dto.getCustomerPhone(), "");
-        String custAddr  = safe(dto.getDeliveryAddress() != null
-                ? dto.getDeliveryAddress() : dto.getShippingAddress(), "");
+        String custAddr  = buildFullAddress(
+                dto.getDeliveryAddress() != null ? dto.getDeliveryAddress() : dto.getShippingAddress(),
+                dto.getWardName(), dto.getProvinceName());
         String receiverName = safe(dto.getReceiverName() != null ? dto.getReceiverName() : "", "");
         String orderedBy    = (dto.getOrderedByName() != null && !dto.getOrderedByName().isBlank())
                 ? dto.getOrderedByName() : "";
@@ -543,6 +576,20 @@ public class InvoicePdf {
     }
 
     private static String safe(String v, String fb) { return (v != null && !v.isBlank()) ? v : fb; }
+
+    /**
+     * Ghép địa chỉ giao đầy đủ: "{địa chỉ tự do}, {phường/xã}, {tỉnh/thành}".
+     *
+     * <p>Bỏ qua các phần trống để không sinh ra dấu phẩy thừa (VD chỉ có mỗi địa chỉ,
+     * hoặc trường hợp "Nhận tại kho" không có phường/tỉnh).
+     */
+    private static String buildFullAddress(String base, String ward, String province) {
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        if (base != null && !base.isBlank()) parts.add(base.trim());
+        if (ward != null && !ward.isBlank()) parts.add(ward.trim());
+        if (province != null && !province.isBlank()) parts.add(province.trim());
+        return String.join(", ", parts);
+    }
     private static BigDecimal bd(BigDecimal v)       { return v != null ? v : BigDecimal.ZERO; }
 
     private static String esc(String s) {
@@ -597,28 +644,8 @@ public class InvoicePdf {
     }
 
     // ── Font & Logo ───────────────────────────────────────────────────────────
-    private String buildFontFaceCSS() {
-        String regular = loadFontBase64("fonts/Roboto-Regular.ttf");
-        String bold    = loadFontBase64("fonts/Roboto-Bold.ttf");
-        if (regular == null) return "";
-        StringBuilder sb = new StringBuilder();
-        sb.append("@font-face { font-family: 'Roboto'; font-weight: 400; ")
-                .append("src: url('data:font/truetype;base64,").append(regular)
-                .append("') format('truetype'); }\n");
-        if (bold != null) {
-            sb.append("@font-face { font-family: 'Roboto'; font-weight: 700; ")
-                    .append("src: url('data:font/truetype;base64,").append(bold)
-                    .append("') format('truetype'); }\n");
-        }
-        return sb.toString();
-    }
-
-    private String loadFontBase64(String resourcePath) {
-        try (InputStream is = InvoicePdf.class.getClassLoader().getResourceAsStream(resourcePath)) {
-            if (is == null) return null;
-            return java.util.Base64.getEncoder().encodeToString(is.readAllBytes());
-        } catch (Exception e) { return null; }
-    }
+    // (buildFontFaceCSS/loadFontBase64 đã bỏ — font giờ nạp qua FontProvider,
+    // xem buildConverterProperties() ở đầu file)
 
     private String loadLogoBase64() {
         try (InputStream is = InvoicePdf.class.getClassLoader().getResourceAsStream("logo.png")) {

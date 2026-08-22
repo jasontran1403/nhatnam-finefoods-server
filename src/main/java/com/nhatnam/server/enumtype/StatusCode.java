@@ -28,6 +28,14 @@ public class StatusCode {
     public static final int OTP_EXPIRED = 949;               // OTP hết hạn
     public static final int PRICE_CHANGED = 950;
 
+    // ── Passcode xem lương ──────────────────────────────────────────────────
+    /** Chưa nhập / hết hạn passcode xem lương → FE bật màn hình nhập passcode. */
+    public static final int PAYROLL_PASSCODE_REQUIRED = 951;
+    /** Sai passcode xem lương (kèm data: số lần còn lại). */
+    public static final int PAYROLL_PASSCODE_WRONG = 952;
+    /** Đã bị khoá xem lương do sai quá số lần cho phép → liên hệ admin. */
+    public static final int PAYROLL_PASSCODE_LOCKED = 953;
+
     // ==================== HELPER METHOD ====================
 
     /**

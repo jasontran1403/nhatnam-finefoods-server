@@ -18,4 +18,12 @@ public interface FileStorageService {
     String saveInventoryImage(MultipartFile file) throws IOException;
     String saveReceiptFile(MultipartFile file) throws IOException;
     String saveCertificateFile(MultipartFile file) throws IOException;
+
+    /**
+     * Ảnh/‌file hợp đồng khách hàng.
+     *
+     * <p>Không resize–crop như ảnh sản phẩm: hợp đồng phải đọc được chữ, cắt
+     * theo khung cố định sẽ mất nội dung. Chỉ thu nhỏ giữ tỉ lệ nếu ảnh quá lớn.
+     */
+    String saveCustomerContractFile(MultipartFile file) throws IOException;
 }

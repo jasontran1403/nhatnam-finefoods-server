@@ -26,6 +26,15 @@ public interface IngredientService {
      */
 
     List<IngredientResponse> getAllIngredients();
+
+    /**
+     * Danh mục nguyên liệu ĐÃ ĐƯỢC GÁN cho một kho (bảng ingredient_warehouse).
+     *
+     * <p>Khác {@link #getAllIngredients()} vốn trả về toàn bộ danh mục dùng chung.
+     * Màn Quản lý kho chỉ được thấy nguyên liệu thuộc phạm vi kho đang đứng —
+     * bản ghi tồn kho cũ còn sót lại sau khi gỡ gán không được coi là đã gán.
+     */
+    List<IngredientResponse> getAllIngredientsOfWarehouse(Long warehouseId);
     List<IngredientResponse> getPaginationIngredients(int page, int size);
 
     /**

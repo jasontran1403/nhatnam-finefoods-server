@@ -44,5 +44,11 @@ public class QuotationRequest {
          * Loại VAT: "INCLUSIVE" (trong giá) | "EXCLUSIVE" (ngoài giá)
          */
         private String vatMode;
+
+        /** Giá tùy chỉnh (sửa giá): nếu true thì dùng customUnitPrice thay cho tier/base */
+        private boolean customPrice;
+
+        /** Đơn giá tự nhập khi customPrice = true */
+        private java.math.BigDecimal customUnitPrice;
     }
 }

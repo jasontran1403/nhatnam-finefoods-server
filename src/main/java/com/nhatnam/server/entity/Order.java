@@ -59,6 +59,21 @@ public class Order {
     @Column(name = "delivery_address", columnDefinition = "TEXT")
     private String deliveryAddress;
 
+    /**
+     * TỈNH/THÀNH PHỐ của địa chỉ giao hàng — chọn từ dropdown, luôn khớp {@code data.json}.
+     *
+     * <p>Tách khỏi chuỗi địa chỉ tự do vì quy tắc COD tra theo cặp (tỉnh, phường). Khớp
+     * tên trong một chuỗi tự do từng gây hàng loạt lỗi: "Q1" không khớp, "Nguyễn Huệ"
+     * khớp nhầm thành tỉnh Huế, "Phú Thọ" khớp nhầm phường của Bình Dương.
+     */
+    @Column(name = "province_name", length = 120)
+    private String provinceName;
+
+    /** PHƯỜNG/XÃ/ĐẶC KHU — chọn từ dropdown, đã lọc theo tỉnh đang chọn. */
+    @Column(name = "ward_name", length = 150)
+    private String wardName;
+
+
     @Column(name = "ordered_by_name")
     private String orderedByName;
 
@@ -135,6 +150,17 @@ public class Order {
     @Column(name = "paid_amount", nullable = false, precision = 15, scale = 2)
     private BigDecimal paidAmount = BigDecimal.ZERO;
 
+    /**
+     * SNAPSHOT của {@code Customer.requirePrepayment} tại thời điểm TẠO ĐƠN.
+     *
+     * <p>Dùng snapshot (thay vì đọc live từ Customer) để owner đổi cấu hình khách hàng
+     * KHÔNG làm thay đổi các đơn đã tạo trước đó.
+     *
+     * <p>NULL = đơn cũ (tạo trước tính năng này) → fallback đọc từ Customer.
+     */
+    @Column(name = "require_prepayment")
+    private Boolean requirePrepayment;
+
     @Column(name = "company_address", length = 300)
     private String companyAddress;
 
@@ -184,4 +210,29 @@ public class Order {
 
     @Column(name = "surcharge_detail", columnDefinition = "TEXT")
     private String surchargeDetail; // JSON: [{"name":"Thùng xốp","amount":50000},...]
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // KHÁCH THANH TOÁN DƯ (overpayment)
+    // ══════════════════════════════════════════════════════════════════════════
+    /**
+     * SỐ TIỀN KHÁCH TRẢ DƯ cho đơn này — phần vượt quá số CẦN THU (đã làm tròn).
+     *
+     * <p>Không cộng vào {@code paidAmount} (đơn vẫn chỉ được coi là thu đủ đúng
+     * {@code finalAmount}); đây là một khoản NỢ PHẢI TRẢ LẠI KHÁCH, sinh ra khi
+     * phiếu thu được lập với số tiền lớn hơn số cần thu. Trong phiếu thu nhiều
+     * đơn, phần dư luôn được gán cho ĐƠN CUỐI trong danh sách.
+     *
+     * <p>Kế toán/owner bấm "Tạo phiếu chi hoàn phần dư" để lập phiếu chi hoàn lại
+     * số tiền này cho khách.
+     */
+    @Builder.Default
+    @Column(name = "overpaid_amount", precision = 15, scale = 2)
+    private BigDecimal overpaidAmount = BigDecimal.ZERO;
+
+    /**
+     * Mã phiếu chi đã lập để hoàn phần dư ({@code null} = chưa lập).
+     * Set giá trị này để chặn lập trùng phiếu hoàn cho cùng một đơn.
+     */
+    @Column(name = "overpaid_refund_voucher_code", length = 100)
+    private String overpaidRefundVoucherCode;
 }

@@ -68,4 +68,15 @@ public interface IngredientStockRepository extends JpaRepository<IngredientStock
         WHERE s.warehouse.id = :warehouseId
     """)
     List<IngredientStock> findByWarehouseIdWithIngredient(@Param("warehouseId") Long warehouseId);
+
+    /**
+     * Lấy tồn kho của TẤT CẢ các kho cho các nguyên liệu thuộc 1 trong các category
+     * cho trước (dùng cho dashboard Owner — tổng tồn kho theo loại nguyên liệu).
+     */
+    @Query("""
+        SELECT s FROM IngredientStock s
+        JOIN Ingredient i ON i.id = s.ingredientId
+        WHERE i.categoryId IN :categoryIds
+    """)
+    List<IngredientStock> findAllByIngredientCategoryIds(@Param("categoryIds") List<Long> categoryIds);
 }

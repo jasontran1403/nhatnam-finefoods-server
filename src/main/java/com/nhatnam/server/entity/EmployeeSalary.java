@@ -3,6 +3,20 @@ package com.nhatnam.server.entity;
 import jakarta.persistence.*;
 import lombok.*;
 
+/**
+ * Hồ sơ LƯƠNG của nhân viên — do SUPER_ACCOUNTANT/HR nhập, qua duyệt Owner.
+ *
+ * <p><b>QUAN TRỌNG:</b> {@code baseSalary} là LƯƠNG NET THỰC NHẬN (chưa gồm
+ * phụ cấp, thưởng) — KHÔNG phải lương GROSS. Lương GROSS + breakdown bảo
+ * hiểm/thuế được tính NGƯỢC từ baseSalary qua
+ * {@link com.nhatnam.server.utils.PayrollTaxCalculator#calcGrossFromNet}.
+ * Phụ cấp và thưởng KHÔNG đi qua bảo hiểm/thuế — cộng thẳng vào lương GROSS
+ * suy ngược được để ra tổng lương cuối cùng nhân viên nhận.
+ *
+ * Khác với {@link Payslip} (phiếu lương theo THÁNG, có ngày công thực tế...)
+ * — hồ sơ này chỉ lưu MỘT mức lương duy nhất hiện hành cho mỗi nhân viên, mỗi
+ * lần cập nhật sẽ tạo bản ghi PENDING mới chờ Owner duyệt.
+ */
 @Data
 @Builder
 @NoArgsConstructor
@@ -20,23 +34,45 @@ public class EmployeeSalary {
     @JoinColumn(name = "user_id", nullable = false)
     private User user;
 
-    /** Lương cơ bản (VNĐ/tháng) */
+    /** Lương NET thực nhận (VNĐ/tháng) — chưa gồm phụ cấp/thưởng. GROSS được tính ngược ra từ số này. */
     private Long baseSalary;
 
-    /** Tỷ lệ BHXH người lao động đóng (%, VD: 8.0) */
-    private Double socialInsuranceRate;
+    /**
+     * Mức lương đóng BHXH/BHYT/BHTN & làm căn cứ tính bảo hiểm (VNĐ/tháng).
+     * Bảo hiểm (cả phần NLĐ 10.5% lẫn phần DN 21.5%) tính CỐ ĐỊNH trên mức này,
+     * KHÔNG theo lương GROSS. Nếu để trống (null/0) sẽ mặc định lấy = baseSalary.
+     * Thuế TNCN của người lao động vẫn tính trên lương thực (GROSS suy ngược).
+     */
+    @Builder.Default
+    private Long insuranceSalary = 0L;
 
-    /** Mức lương đóng BHXH (VNĐ/tháng) */
-    private Long socialInsuranceSalary;
+    /** Phụ cấp (ăn trưa, đi lại, …) — VNĐ/tháng. TỔNG các khoản phụ cấp (để tương thích cũ / export). */
+    @Builder.Default
+    private Long allowance = 0L;
 
-    /** Bonus tháng */
-    private Long bonus;
+    /**
+     * Chi tiết từng khoản phụ cấp (nhãn + số tiền + có tính thuế TNCN không).
+     * Bảo hiểm KHÔNG phụ thuộc phụ cấp (bảo hiểm tính cố định trên insuranceSalary).
+     */
+    @OneToMany(mappedBy = "salary", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @Builder.Default
+    private java.util.List<EmployeeSalaryAllowance> allowanceItems = new java.util.ArrayList<>();
 
-    /** Phụ cấp cơm (VNĐ/ngày) */
-    private Long mealAllowance;
+    /** Thưởng cố định hàng tháng — VNĐ/tháng. Cộng thẳng vào lương cuối cùng (được nhân theo KPI khi tính). */
+    @Builder.Default
+    private Long bonus = 0L;
 
-    /** Phụ cấp xăng (VNĐ/tháng) */
-    private Long transportAllowance;
+    /** Thưởng CÓ tính vào thu nhập chịu thuế TNCN hay không. */
+    @Builder.Default
+    private Boolean bonusTaxable = false;
+
+    /**
+     * Số người phụ thuộc — dùng để tính giảm trừ gia cảnh khi tính ngược lương
+     * GROSS từ baseSalary (NET). Mỗi người phụ thuộc giảm trừ thêm 6.200.000đ/tháng
+     * (xem {@link com.nhatnam.server.utils.PayrollTaxCalculator#DEPENDENT_DEDUCTION}).
+     */
+    @Builder.Default
+    private Integer dependents = 0;
 
     /**
      * Trạng thái duyệt: PENDING | APPROVED | REJECTED

@@ -1,44 +1,45 @@
 package com.nhatnam.server.restcontroller;
 
+import com.nhatnam.server.common.BusinessException;
 import com.nhatnam.server.dto.response.ApiResponse;
 import com.nhatnam.server.entity.*;
 import com.nhatnam.server.entity.WarehouseReceipt.CostStatus;
 import com.nhatnam.server.entity.WarehouseReceipt.ReceiptType;
 import com.nhatnam.server.enumtype.StatusCode;
 import com.nhatnam.server.repository.*;
-import com.nhatnam.server.service.serviceimpl.WarehouseService;
-import lombok.Data;
+import com.nhatnam.server.service.WarehouseReceiptCostService;
+import com.nhatnam.server.service.WarehouseReceiptCostService.ConfirmCostRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
-import java.math.BigDecimal;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
  * Endpoints cho SUPER_ACCOUNTANT (và ADMIN/OWNER):
  * - Xem danh sách phiếu nhập kho chờ nhập giá vốn
- * - Nhập giá vốn và xác nhận → cộng tồn kho
+ * - Xem trước (preview) giá vốn tạm tính sau khi phân bổ thuế/phí
+ * - Nhập giá vốn và xác nhận → cập nhật giá vốn cho các lô đã tạo lúc nhập kho
  *
- * ACCOUNTANT thường (không phải SUPER) KHÔNG có quyền truy cập.
+ * LƯU Ý: tồn kho ĐÃ được cộng ngay lúc nhân viên kho tạo phiếu nhập
+ * (lô tạo trước với giá vốn = 0). Bước này chỉ CẬP NHẬT GIÁ VỐN, không cộng tồn nữa.
+ *
+ * Toàn bộ ghi DB nằm trong {@link WarehouseReceiptCostService} (có @Transactional)
+ * để mọi lỗi nghiệp vụ đều rollback sạch — không còn tình trạng cập nhật dở dang.
  */
 @RestController
 @RequestMapping("/api/accountant/warehouse-receipts")
 @RequiredArgsConstructor
 @Log4j2
-@PreAuthorize("hasAnyRole('SUPER_ACCOUNTANT','ADMIN','OWNER')")  // ← bỏ ACCOUNTANT
+@PreAuthorize("hasAnyRole('SUPER_ACCOUNTANT','ADMIN','OWNER')")
 public class AccountantWarehouseController {
 
-    private final WarehouseReceiptRepository     receiptRepository;
-    private final WarehouseReceiptItemRepository receiptItemRepository;
-    private final IngredientStockRepository      stockRepository;
-    private final IngredientExpiryRepository     expiryRepository;
-    private final UserRepository                 userRepository;
+    private final WarehouseReceiptRepository receiptRepository;
+    private final WarehouseReceiptCostService costService;
 
     /** Danh sách phiếu nhập chờ nhập giá vốn */
     @GetMapping("/pending-cost")
@@ -65,106 +66,34 @@ public class AccountantWarehouseController {
                 .orElse(ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, "Không tìm thấy")));
     }
 
-    /** Xác nhận giá vốn và cộng tồn kho */
+    /**
+     * PREVIEW — tính thử giá vốn tạm tính (đã phân bổ thuế/phí), KHÔNG ghi DB.
+     * FE gọi khi bấm nút "Xem trước giá vốn".
+     */
+    @PostMapping("/{id}/preview-cost")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> previewCost(
+            @PathVariable Long id, @RequestBody ConfirmCostRequest req) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(costService.previewCost(id, req), "OK"));
+        } catch (BusinessException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("previewCost error", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /** Xác nhận giá vốn — cập nhật giá vốn của các lô đã tạo lúc nhập kho */
     @PostMapping("/{id}/confirm-cost")
-    @Transactional
     public ResponseEntity<ApiResponse<Map<String, Object>>> confirmCost(
             @PathVariable Long id,
             @RequestBody ConfirmCostRequest req,
             Authentication auth) {
         try {
-            WarehouseReceipt receipt = receiptRepository.findById(id)
-                    .orElseThrow(() -> new RuntimeException("Không tìm thấy phiếu #" + id));
-
-            if (receipt.getReceiptType() != ReceiptType.IMPORT) {
-                return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, "Chỉ áp dụng cho phiếu nhập kho"));
-            }
-            if (receipt.getCostStatus() != CostStatus.PENDING_COST) {
-                return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, "Phiếu đã được xác nhận trước đó"));
-            }
-
-            // Build map: receiptItemId → costPrice
-            Map<Long, BigDecimal> costMap = new HashMap<>();
-            if (req.getItems() != null) {
-                for (ConfirmCostRequest.ItemCost ic : req.getItems()) {
-                    if (ic.getCostPrice() == null || ic.getCostPrice().compareTo(BigDecimal.ZERO) <= 0) {
-                        return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST,
-                                "Tất cả các mặt hàng phải có giá vốn > 0"));
-                    }
-                    costMap.put(ic.getReceiptItemId(), ic.getCostPrice());
-                }
-            }
-
-            long now = System.currentTimeMillis();
-            Warehouse warehouse = receipt.getWarehouse();
-
-            // Cập nhật giá vốn từng item + cộng tồn kho
-            for (WarehouseReceiptItem item : receipt.getItems()) {
-                BigDecimal costPrice = costMap.get(item.getId());
-                if (costPrice == null) {
-                    return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST,
-                            "Thiếu giá vốn cho: " + item.resolvedIngredientName()));
-                }
-
-                item.setCostPrice(costPrice);
-                receiptItemRepository.save(item);
-
-                // Dùng ingredientId plain + snapshot từ WarehouseReceiptItem
-                Long ingId = item.getIngredientId();
-                BigDecimal qty = item.getQuantity();
-
-                // Cộng tồn kho
-                IngredientStock stock = stockRepository
-                        .findByIngredientIdAndWarehouseId(ingId, warehouse.getId())
-                        .orElseGet(() -> {
-                            IngredientStock s = IngredientStock.builder()
-                                    .ingredientId(ingId)
-                                    .ingredientNameSnapshot(item.resolvedIngredientName())
-                                    .ingredientUnitSnapshot(item.resolvedIngredientUnit())
-                                    .warehouse(warehouse)
-                                    .stockQuantity(BigDecimal.ZERO).updatedAt(now).build();
-                            return stockRepository.save(s);
-                        });
-
-                BigDecimal before = stock.getStockQuantity();
-                BigDecimal after  = before.add(qty);
-                stock.setStockQuantity(after);
-                stock.setUpdatedAt(now);
-
-                BigDecimal addedCost = costPrice.multiply(qty);
-                BigDecimal curCost   = stock.getTotalCostValue() != null ? stock.getTotalCostValue() : BigDecimal.ZERO;
-                stock.setTotalCostValue(curCost.add(addedCost));
-                stockRepository.save(stock);
-
-                // Cập nhật snapshot quantityBefore/After
-                item.setQuantityBefore(before);
-                item.setQuantityAfter(after);
-                item.setDifference(qty);
-                receiptItemRepository.save(item);
-
-                addOrUpdateExpiry(warehouse, ingId, qty, item.getExpiryDate(), costPrice, now);
-            }
-
-            // Xác nhận phiếu
-            User actor = null;
-            if (auth != null && auth.getPrincipal() instanceof User u) {
-                actor = userRepository.findById(u.getId()).orElse(null);
-            }
-            receipt.setCostStatus(CostStatus.CONFIRMED);
-            receipt.setCostConfirmedAt(now);
-            if (actor != null) {
-                receipt.setCostConfirmedBy(actor);
-                receipt.setCostConfirmedByName(
-                        actor.getFullName() != null && !actor.getFullName().isBlank()
-                                ? actor.getFullName() : actor.getUsername());
-            }
-            receipt.setUpdatedAt(now);
-            receiptRepository.save(receipt);
-
-            return ResponseEntity.ok(ApiResponse.success(mapReceiptBasic(receipt),
-                    "Đã xác nhận giá vốn và cộng tồn kho"));
-
-        } catch (RuntimeException e) {
+            Long actorId = (auth != null && auth.getPrincipal() instanceof User u) ? u.getId() : null;
+            Map<String, Object> result = costService.confirmCost(id, req, actorId);
+            return ResponseEntity.ok(ApiResponse.success(result, "Đã xác nhận giá vốn"));
+        } catch (BusinessException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
         } catch (Exception e) {
             log.error("confirmCost error", e);
@@ -174,39 +103,18 @@ public class AccountantWarehouseController {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private void addOrUpdateExpiry(Warehouse warehouse, Long ingredientId,
-                                   BigDecimal quantity, java.time.LocalDate expiryDate,
-                                   BigDecimal costPrice, long now) {
-        expiryRepository
-                .findByWarehouseIdAndIngredientId(warehouse.getId(), ingredientId)
-                .stream()
-                .filter(e -> java.util.Objects.equals(e.getExpiryDate(), expiryDate)
-                        && java.util.Objects.equals(e.getCostPrice(), costPrice))
-                .findFirst()
-                .ifPresentOrElse(e -> {
-                    e.setQuantity(e.getQuantity().add(quantity));
-                    e.setUpdatedAt(now);
-                    expiryRepository.save(e);
-                }, () -> expiryRepository.save(
-                        IngredientExpiry.builder()
-                                .warehouse(warehouse).ingredientId(ingredientId)
-                                .expiryDate(expiryDate).quantity(quantity)
-                                .costPrice(costPrice).createdAt(now).updatedAt(now)
-                                .build()));
-    }
-
     private Map<String, Object> mapReceiptBasic(WarehouseReceipt r) {
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id",           r.getId());
-        m.put("receiptCode",  r.getReceiptCode());
-        m.put("warehouseId",  r.getWarehouse().getId());
-        m.put("warehouseName",r.getWarehouse().getName());
-        m.put("referenceCode",r.getReferenceCode());
-        m.put("note",         r.getNote());
-        m.put("costStatus",   r.getCostStatus() != null ? r.getCostStatus().name() : null);
-        m.put("createdByName",r.getCreatedByName());
-        m.put("createdAt",    r.getCreatedAt());
-        m.put("itemCount",    r.getItems().size());
+        m.put("id",            r.getId());
+        m.put("receiptCode",   r.getReceiptCode());
+        m.put("warehouseId",   r.getWarehouse().getId());
+        m.put("warehouseName", r.getWarehouse().getName());
+        m.put("referenceCode", r.getReferenceCode());
+        m.put("note",          r.getNote());
+        m.put("costStatus",    r.getCostStatus() != null ? r.getCostStatus().name() : null);
+        m.put("createdByName", r.getCreatedByName());
+        m.put("createdAt",     r.getCreatedAt());
+        m.put("itemCount",     r.getItems().size());
         return m;
     }
 
@@ -221,23 +129,23 @@ public class AccountantWarehouseController {
             i.put("imageUrl",       item.resolvedIngredientImageUrl());
             i.put("quantity",       item.getQuantity());
             i.put("expiryDate",     item.getExpiryDate());
-            i.put("costPrice",      item.getCostPrice()); // null khi chưa nhập
+            i.put("unitPrice",      item.getUnitPrice());     // null khi chưa nhập
+            i.put("allocatedFee",   item.getAllocatedFee());
+            i.put("costPrice",      item.getCostPrice());     // giá vốn cuối cùng
             return i;
         }).collect(Collectors.toList());
         m.put("items", items);
+
+        m.put("costEntries", r.getCostEntries().stream()
+                .sorted(Comparator.comparingInt(WarehouseReceiptCostEntry::getSortOrder))
+                .map(ce -> {
+                    Map<String, Object> c = new LinkedHashMap<>();
+                    c.put("id", ce.getId());
+                    c.put("label", ce.getLabel());
+                    c.put("amount", ce.getAmount());
+                    c.put("itemIds", costService.deserializeIds(ce.getAppliesToItemIds()));
+                    return c;
+                }).collect(Collectors.toList()));
         return m;
-    }
-
-    // ── Request DTOs ──────────────────────────────────────────────────────────
-
-    @Data
-    public static class ConfirmCostRequest {
-        private List<ItemCost> items;
-
-        @Data
-        public static class ItemCost {
-            private Long       receiptItemId;
-            private BigDecimal costPrice;
-        }
     }
 }

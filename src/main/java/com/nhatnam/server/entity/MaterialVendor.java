@@ -24,6 +24,14 @@ public class MaterialVendor {
     @Column(length = 30)
     private String contactPhone;
 
+    /** Địa chỉ nhà cung cấp — tuỳ chọn */
+    @Column(length = 500)
+    private String address;
+
+    /** Mã số thuế — tuỳ chọn */
+    @Column(name = "tax_code", length = 50)
+    private String taxCode;
+
     /** Loại nhà cung cấp */
     @Enumerated(EnumType.STRING)
     @Column(name = "vendor_type", length = 30)
@@ -35,15 +43,19 @@ public class MaterialVendor {
     private boolean active = true;
 
     public enum VendorType {
-        MATERIAL,    // NCC nguyên liệu
-        MACHINE,     // NCC máy móc
-        REPAIR,      // NCC sửa chữa
-        ELECTRICITY, // Điện
-        WATER,       // Nước
-        GAS,         // Gas
-        LOGISTICS,   // Vận chuyển / logistics
-        SERVICE,     // Dịch vụ khác
-        OTHER        // Khác
+        MATERIAL,          // NCC nguyên liệu
+        MACHINE,           // NCC máy móc
+        REPAIR,            // NCC sửa chữa
+        ELECTRICITY,       // Điện
+        WATER,             // Nước
+        GAS,               // Gas
+        LOGISTICS,         // Vận chuyển / logistics
+        SERVICE,           // Dịch vụ khác
+        OTHER,             // Khác
+        OFFICE_RENTAL,     // Thuê văn phòng
+        OFFICE_SUPPLIER,   // Văn phòng phẩm
+        TRUCKING_SERVICE,  // Dịch vụ xe tải
+        DELIVERY_SERVICE   // Dịch vụ giao nhận
     }
 
     @Column(name = "created_at")

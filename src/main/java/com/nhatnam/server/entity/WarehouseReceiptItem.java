@@ -73,9 +73,36 @@ public class WarehouseReceiptItem {
 
     private String note;
 
-    /** Giá vốn đơn vị tại thời điểm nhập (chỉ dùng cho IMPORT) */
-    @Column(name = "cost_price", precision = 15, scale = 2)
+    /**
+     * ĐƠN GIÁ NHẬP của 1 đơn vị (CHƯA gồm thuế/phí phân bổ) — kế toán trưởng nhập.
+     * Cho phép 3 chữ số thập phân.
+     */
+    @Column(name = "unit_price", precision = 18, scale = 3)
+    private BigDecimal unitPrice;
+
+    /**
+     * Tổng thuế/phí được PHÂN BỔ cho dòng này (theo tỷ trọng giá trị dòng trên tổng phiếu).
+     * Giữ nguyên phần thập phân — không làm tròn ở bước này.
+     */
+    @Column(name = "allocated_fee", precision = 18, scale = 3)
+    private BigDecimal allocatedFee;
+
+    /**
+     * GIÁ VỐN CUỐI CÙNG của 1 đơn vị = unitPrice + allocatedFee / quantity,
+     * làm tròn tới hàng ĐƠN VỊ ĐỒNG (HALF_UP) — chỉ làm tròn ở bước cuối này.
+     */
+    @Column(name = "cost_price", precision = 18, scale = 3)
     private BigDecimal costPrice;
+
+    /**
+     * Lô HSD (IngredientExpiry) được tạo ngay lúc NHẬP KHO cho dòng này.
+     *
+     * <p>Flow mới: nhập kho → cộng tồn + tạo lô ngay (costPrice = 0). Khi kế toán trưởng
+     * nhập giá vốn thật → chỉ CẬP NHẬT LẠI costPrice của đúng lô này, không cộng tồn nữa.
+     * Null với các phiếu cũ (tạo trước khi đổi flow) → fallback về hành vi cũ.
+     */
+    @Column(name = "ingredient_expiry_id")
+    private Long ingredientExpiryId;
 
     public enum AdjustResult {
         SURPLUS, SHORTAGE, MATCH

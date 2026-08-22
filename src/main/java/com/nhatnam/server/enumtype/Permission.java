@@ -76,11 +76,57 @@ public enum Permission {
     FACTORY_WORKER_CREATE("factory_worker:create"),
     FACTORY_WORKER_DELETE("factory_worker:delete"),
 
+    SUPER_FACTORY_WORKER_READ("super_factory_worker:read"),
+    SUPER_FACTORY_WORKER_UPDATE("super_factory_worker:update"),
+    SUPER_FACTORY_WORKER_CREATE("super_factory_worker:create"),
+    SUPER_FACTORY_WORKER_DELETE("super_factory_worker:delete"),
+
+    FACTORY_ACCOUNTANT_READ("factory_accountant:read"),
+    FACTORY_ACCOUNTANT_UPDATE("factory_accountant:update"),
+    FACTORY_ACCOUNTANT_CREATE("factory_accountant:create"),
+    FACTORY_ACCOUNTANT_DELETE("factory_accountant:delete"),
+
     // ── HR (Nhân viên nhân sự) ────────────────────────────────────────
     HR_READ("hr:read"),
     HR_UPDATE("hr:update"),
     HR_CREATE("hr:create"),
     HR_DELETE("hr:delete"),
+
+    // ── Tài xế ────────────────────────────────────────────────────────
+    DRIVER_READ("driver:read"),
+    DRIVER_UPDATE("driver:update"),
+    DRIVER_CREATE("driver:create"),
+    DRIVER_DELETE("driver:delete"),
+
+    // ── Bảo vệ (công ty) ──────────────────────────────────────────────
+    SECURITY_READ("security:read"),
+    SECURITY_UPDATE("security:update"),
+    SECURITY_CREATE("security:create"),
+    SECURITY_DELETE("security:delete"),
+
+    // ── Bảo vệ xưởng ──────────────────────────────────────────────────
+    FACTORY_SECURITY_READ("factory_security:read"),
+    FACTORY_SECURITY_UPDATE("factory_security:update"),
+    FACTORY_SECURITY_CREATE("factory_security:create"),
+    FACTORY_SECURITY_DELETE("factory_security:delete"),
+
+    // ── Trợ lý kho xưởng ──────────────────────────────────────────────
+    FACTORY_STAFF_READ("factory_staff:read"),
+    FACTORY_STAFF_UPDATE("factory_staff:update"),
+    FACTORY_STAFF_CREATE("factory_staff:create"),
+    FACTORY_STAFF_DELETE("factory_staff:delete"),
+
+    // ── Nhân viên sản xuất ────────────────────────────────────────────
+    FACTORY_PRODUCTION_WORKER_READ("factory_production_worker:read"),
+    FACTORY_PRODUCTION_WORKER_UPDATE("factory_production_worker:update"),
+    FACTORY_PRODUCTION_WORKER_CREATE("factory_production_worker:create"),
+    FACTORY_PRODUCTION_WORKER_DELETE("factory_production_worker:delete"),
+
+    // ── Quản lý xưởng ─────────────────────────────────────────────────
+    FACTORY_MANAGER_READ("factory_manager:read"),
+    FACTORY_MANAGER_UPDATE("factory_manager:update"),
+    FACTORY_MANAGER_CREATE("factory_manager:create"),
+    FACTORY_MANAGER_DELETE("factory_manager:delete"),
 
     ;
 

@@ -100,10 +100,26 @@ public class SellerDashboardDTO {
         private String     customerPhone;
         /** Tổng số đơn (không tính CANCELLED) */
         private long       totalOrders;
-        /** Số đơn hoàn thành */
+        /** Số đơn hoàn thành (trạng thái COMPLETED) */
         private long       completedOrders;
+        /**
+         * Số đơn ĐÃ THANH TOÁN ĐỦ (paymentStatus = PAID).
+         *
+         * <p>Khác {@link #completedOrders}: đơn có thể đã thu đủ tiền nhưng chưa
+         * giao xong, hoặc đã giao xong mà còn nợ. Cột "Đơn" trên dashboard hiển
+         * thị tổng/đã thanh toán nên phải dùng con số này.
+         */
+        private long       paidOrders;
         /** Tổng chi tiêu = finalAmount của tất cả đơn không bị hủy */
         private BigDecimal totalSpent;
+        /**
+         * TỔNG TIỀN ĐÃ THU THỰC TẾ, cộng cả phần thu một phần.
+         *
+         * <p>Lấy từ {@code order.paidAmount} chứ không suy ra từ trạng thái: đơn
+         * PARTIAL đã thu 3/10 triệu thì phải cộng đúng 3 triệu, còn nếu chỉ đếm
+         * đơn PAID thì khoản đó biến mất khỏi báo cáo.
+         */
+        private BigDecimal collectedAmount;
     }
 
     // ─────────────────────────────────────────────────────────────────────────

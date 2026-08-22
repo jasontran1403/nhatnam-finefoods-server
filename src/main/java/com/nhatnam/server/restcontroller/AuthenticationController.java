@@ -24,6 +24,8 @@ import java.io.IOException;
 @Log4j2
 public class AuthenticationController {
     private final AuthService authService;
+    /** Đọc claim selected_role từ token hiện tại — role đang chọn không lưu ở DB. */
+    private final com.nhatnam.server.config.JwtService jwtService;
     private final FileStorageService fileStorageService;
     private final AppVersionService appVersionService;
 
@@ -202,6 +204,53 @@ public class AuthenticationController {
     }
 
     /**
+     * NẠP LẠI PHIÊN sau khi OWNER đổi/gán role — user chỉ cần F5, không phải
+     * đăng xuất đăng nhập lại.
+     *
+     * <p>Giống {@code /switch-role}, endpoint này KHÔNG bị bypass bởi
+     * {@code JwtAuthenticationFilter} (xem danh sách loại trừ trong filter), vì
+     * cần {@code Authentication} để biết đang là ai.
+     *
+     * <p>{@code accessToken} trong response có thể {@code null} — nghĩa là token
+     * hiện tại vẫn dùng tốt, frontend giữ nguyên. Chỉ khi role đang chọn bị thu
+     * hồi mới có token mới.
+     */
+    @GetMapping("/me")
+    public ResponseEntity<ApiResponse<AuthResponse>> me(
+            jakarta.servlet.http.HttpServletRequest request,
+            org.springframework.security.core.Authentication authentication) {
+        try {
+            if (authentication == null || !authentication.isAuthenticated())
+                return ResponseEntity.ok(ApiResponse.error(com.nhatnam.server.enumtype.StatusCode.UNAUTHORIZED, "Unauthorized"));
+
+            // Role đang chọn nằm trong JWT, không nằm trong DB
+            String selectedRole = null;
+            String authHeader = request.getHeader("Authorization");
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                try { selectedRole = jwtService.extractSelectedRole(authHeader.substring(7)); }
+                catch (Exception ignored) {}
+            }
+
+            com.nhatnam.server.entity.User user = (com.nhatnam.server.entity.User) authentication.getPrincipal();
+            AuthResponse response = authService.refreshSession(user.getUsername(), selectedRole);
+            return ResponseEntity.ok(ApiResponse.success(com.nhatnam.server.enumtype.StatusCode.SUCCESS, response, "OK"));
+
+        } catch (com.nhatnam.server.common.BusinessException e) {
+            // Phiên thật sự không dùng được nữa (khoá tài khoản, mất hết role)
+            // → 901 khiến frontend đá ra màn hình đăng nhập. Đúng ý.
+            log.warn("Refresh session — phiên không còn hợp lệ: {}", e.getMessage());
+            return ResponseEntity.ok(ApiResponse.error(com.nhatnam.server.enumtype.StatusCode.UNAUTHORIZED, e.getMessage()));
+
+        } catch (Exception e) {
+            // Lỗi ngoài dự kiến → TUYỆT ĐỐI không trả 901. Endpoint này chạy ngầm
+            // mỗi lần mở app; một trục trặc DB thoáng qua mà đá cả công ty ra
+            // đăng nhập lại thì tệ hơn nhiều so với việc dùng tạm role cũ.
+            log.error("Refresh session lỗi: {}", e.getMessage(), e);
+            return ResponseEntity.ok(ApiResponse.error(com.nhatnam.server.enumtype.StatusCode.BAD_REQUEST, "Không nạp lại được phiên"));
+        }
+    }
+
+    /**
      * Set role mặc định — lưu vào DB (user.role field).
      * Lần đăng nhập tiếp theo sẽ tự chọn role này nếu user không chỉ định.
      */
@@ -233,7 +282,8 @@ public class AuthenticationController {
                     "product","pos-product","category","variant","ingredient",
                     "seller-import","inventory-management","landingpage",
                     "expense-voucher","landingpage-events","order-receipt",
-                    "income-voucher","production","certificate"
+                    "income-voucher","production","certificate",
+                    "customer-contract"
             );
             if (!ALLOWED_TYPES.contains(type)) {
                 log.warn("⚠️ Invalid image type requested: {}", type);
@@ -251,9 +301,14 @@ public class AuthenticationController {
                 headers.setContentType(MediaType.parseMediaType("image/webp"));
             else if (lower.endsWith(".gif"))
                 headers.setContentType(MediaType.IMAGE_GIF);
-            else if (lower.endsWith(".pdf"))                                    // ← THÊM: hỗ trợ PDF
+            else if (lower.endsWith(".pdf")) {
                 headers.setContentType(MediaType.APPLICATION_PDF);
-            else
+                // inline: trình duyệt mở luôn trong <iframe> / tab mới thay vì tải
+                // về. Không có header này, xem hợp đồng PDF sẽ thành tải file.
+                headers.setContentDisposition(
+                        org.springframework.http.ContentDisposition.inline()
+                                .filename(filename).build());
+            } else
                 headers.setContentType(MediaType.IMAGE_PNG);
             headers.setCacheControl("max-age=86400");
 

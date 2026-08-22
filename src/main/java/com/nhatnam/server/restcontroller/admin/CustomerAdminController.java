@@ -17,6 +17,7 @@ import com.nhatnam.server.repository.CustomerRepository;
 import com.nhatnam.server.repository.OrderRepository;
 import com.nhatnam.server.repository.UserRepository;
 import com.nhatnam.server.service.admin.CustomerAdminService;
+import com.nhatnam.server.utils.CustomerDebtUtil;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
@@ -28,7 +29,6 @@ import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.*;
 import org.apache.poi.xssf.usermodel.extensions.XSSFCellBorder;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
@@ -99,6 +99,30 @@ public class CustomerAdminController {
         usedExportTokens.put(token, System.currentTimeMillis());
     }
 
+    /**
+     * KHÁCH HÀNG GOM THEO DANH MỤC — không phân trang, phục vụ giao diện collapse.
+     *
+     * <p>Trả về mảng nhóm theo đúng thứ tự {@code sortOrder} của danh mục, để FE mở sẵn
+     * phần tử đầu tiên và gập các phần tử còn lại.
+     */
+    @GetMapping("/grouped")
+    @PreAuthorize("hasAnyRole('ADMIN','OWNER','SUPERADMIN')")
+    public ApiResponse<List<Map<String, Object>>> listGrouped(
+            @RequestParam(required = false) String q,
+            @RequestParam(required = false) String type,
+            @RequestParam(required = false) Boolean isActive,
+            @RequestParam(required = false) Long sellerId) {
+        try {
+            Customer.CustomerType typeEnum = (type == null || type.isBlank())
+                    ? null : Customer.CustomerType.valueOf(type.toUpperCase());
+            return ApiResponse.ok(customerService.listGrouped(
+                    (q == null || q.isBlank()) ? null : q.trim(), typeEnum, isActive, sellerId));
+        } catch (Exception e) {
+            log.error("[Customer] listGrouped error", e);
+            return ApiResponse.error(e.getMessage());
+        }
+    }
+
     @DeleteMapping("/{id}")
     public ApiResponse<?> softDeleteCustomer(
             @PathVariable Long id,
@@ -118,6 +142,17 @@ public class CustomerAdminController {
 
         if (customer.getDeletedAt() != null)
             return ApiResponse.error("Khách hàng này đã bị xóa trước đó");
+
+        // ── RÀNG BUỘC: còn công nợ chưa thanh toán → KHÔNG cho xoá ──────────
+        // Dùng chung công thức với cột "Công nợ" ở màn hình KH và báo cáo công nợ:
+        // đơn PENDING_PAYMENT có paymentStatus ∈ {UNPAID, PARTIAL}.
+        long unpaidDebt = CustomerDebtUtil.unpaidTotal(
+                orderRepository.findByCustomerIdIn(List.of(id)));
+        if (unpaidDebt > 0)
+            return ApiResponse.error(
+                    "Không thể xoá: khách hàng còn công nợ chưa thanh toán "
+                            + String.format("%,d", unpaidDebt).replace(',', '.')
+                            + " đ. Vui lòng thu hồi hoặc tất toán công nợ trước khi xoá.");
 
         String prefix = "SOFTDELETED_" + id + "_";
 
@@ -167,8 +202,9 @@ public class CustomerAdminController {
             @RequestParam(required = false) Customer.CustomerType type,
             @RequestParam(required = false) Boolean isActive,
             @RequestParam(required = false) Long sellerId,
+            @RequestParam(required = false) String debtSort,
             @PageableDefault(size = 20, sort = "id", direction = Sort.Direction.DESC) Pageable pageable) {
-        return ApiResponse.ok(customerService.list(q, type, isActive, sellerId, pageable));
+        return ApiResponse.ok(customerService.list(q, type, isActive, sellerId, pageable, debtSort));
     }
 
     @GetMapping("/{id}")
@@ -291,6 +327,41 @@ public class CustomerAdminController {
         return ApiResponse.ok("Cập nhật trạng thái hàng loạt thành công", Map.of("updated", updated));
     }
 
+    /**
+     * OWNER/ADMIN: bật/tắt "Yêu cầu thanh toán trước khi giao hàng" cho khách hàng.
+     *
+     * <p>Khi bật: nhân viên kho KHÔNG chuyển được đơn của khách này sang "Đang giao"
+     * cho tới khi đơn đã thu đủ tiền.
+     *
+     * <p>Chỉ tác động lên ĐƠN TẠO MỚI (đơn cũ giữ nguyên cấu hình đã snapshot lúc tạo).
+     */
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+    @PutMapping("/{id}/require-prepayment")
+    public ApiResponse<CustomerDto> updateRequirePrepayment(
+            @PathVariable Long id,
+            @RequestBody Map<String, Boolean> body) {
+        Boolean require = body.get("requirePrepayment");
+        return ApiResponse.ok(
+                Boolean.TRUE.equals(require)
+                        ? "Đã bật yêu cầu thanh toán trước khi giao hàng"
+                        : "Đã tắt yêu cầu thanh toán trước khi giao hàng",
+                customerService.updateRequirePrepayment(id, require));
+    }
+
+    /**
+     * Cập nhật nhanh TÊN TRÊN HỢP ĐỒNG (sửa trực tiếp trên bảng danh sách).
+     *
+     * <p>Gửi chuỗi rỗng / null → xoá, quay về tên mặc định (tên công ty với khách COMPANY,
+     * tên khách với khách lẻ).
+     */
+    @PutMapping("/{id}/contract-name")
+    public ApiResponse<CustomerDto> updateContractName(
+            @PathVariable Long id,
+            @RequestBody Map<String, String> body) {
+        return ApiResponse.ok("Đã cập nhật tên trên hợp đồng",
+                customerService.updateContractName(id, body.get("contractName")));
+    }
+
     @PutMapping("/{id}/debt-days")
     public ApiResponse<CustomerDto> updateDebtDays(
             @PathVariable Long id,
@@ -382,7 +453,7 @@ public class CustomerAdminController {
 
     // ── Export Customers to Excel ─────────────────────────────────────────────
     @GetMapping("/export")
-    @PreAuthorize("hasAnyRole('ADMIN','OWNER')")
+    @PreAuthorize("hasAnyRole('ADMIN','OWNER','SUPER_ACCOUNTANT','ACCOUNTANT')")
     public ResponseEntity<?> exportCustomers(
             @RequestParam(required = false) String q,
             @RequestParam(required = false) Customer.CustomerType type,
@@ -463,7 +534,8 @@ public class CustomerAdminController {
 
                         // ── Đọc tất cả các cột ──────────────────────────────────────
                         // 0=ID 1=Mã KH 2=Tên KH/CT 3=Người LH 4=SĐT GH 5=ĐC GH 6=Tên NR
-                        // 7=Email 8=Phân loại 9=Loại giá 10=NV KD 11=CK% 12=CN 13=TT
+                        // 7=Email 8=Phân loại 9=Loại giá 10=NV KD 11=CK% 12=CN(ngày)
+                        // 13=CN chưa thanh toán (READ-ONLY, không import) 14=Trạng thái
                         String nameStr        = _cellStr(row, 2);  // Tên KH / Tên công ty
                         String contactStr     = _cellStr(row, 3);  // Người LH (= tên cá nhân khi export cá nhân)
                         String phoneGhStr     = _cellStr(row, 4);  // SĐT giao hàng (receiverInfo default)
@@ -474,8 +546,9 @@ public class CustomerAdminController {
                         String priceStr       = _cellStr(row, 9);  // Loại giá
                         String sellerStr      = _cellStr(row, 10); // NV KD
                         String discStr        = _cellStr(row, 11); // CK%
-                        String debtStr        = _cellStr(row, 12); // CN
-                        String statusStr      = _cellStr(row, 13); // Trạng thái
+                        String debtStr        = _cellStr(row, 12); // CN (ngày)
+                        // col 13 = "Công nợ (chưa thanh toán)" là giá trị tính tự động, KHÔNG import.
+                        String statusStr      = _cellStr(row, 14); // Trạng thái
 
                         // ── Bước 1: Xử lý đổi loại khách (phải làm trước) ───────────
                         // Xác định loại mới từ file (null = không thay đổi)
@@ -645,8 +718,20 @@ public class CustomerAdminController {
         };
     }
 
+    /** Định dạng tiền VN: 31030 → "31.030đ" (dấu chấm ngăn cách nghìn, hậu tố đ). */
+    private static String _formatDongVN(long v) {
+        return String.format(java.util.Locale.US, "%,d", v).replace(',', '.') + "đ";
+    }
+
     private byte[] _buildCustomerExcel(List<Customer> customers, List<User> sellers) throws Exception {
         String exportToken = _generateExportToken();
+
+        // Tổng công nợ chưa thanh toán theo từng khách (tính theo lô, 1 query đơn hàng).
+        java.util.List<Long> _custIds = customers.stream().map(Customer::getId).toList();
+        java.util.Map<Long, Long> debtMap = _custIds.isEmpty()
+                ? java.util.Collections.emptyMap()
+                : com.nhatnam.server.utils.CustomerDebtUtil.unpaidByCustomer(
+                orderRepository.findByCustomerIdIn(_custIds));
 
         try (org.apache.poi.xssf.usermodel.XSSFWorkbook wb = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
              java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream()) {
@@ -690,6 +775,9 @@ public class CustomerAdminController {
             XSSFCellStyle infoStyle  = mkStyle.apply(C_GRAY, C_SUB);
             XSSFCellStyle dataStyle  = mkStyle.apply(C_WHITE, C_TEXT);
             XSSFCellStyle dataGStyle = mkStyle.apply(C_GRAY,  C_TEXT);
+            // Canh phải cho cột "Công nợ (chưa thanh toán)" (giá trị chuỗi có định dạng VN + đ)
+            XSSFCellStyle dataRStyle  = mkStyle.apply(C_WHITE, C_TEXT); dataRStyle.setAlignment(HorizontalAlignment.RIGHT);
+            XSSFCellStyle dataGRStyle = mkStyle.apply(C_GRAY,  C_TEXT); dataGRStyle.setAlignment(HorizontalAlignment.RIGHT);
             XSSFCellStyle sttStyle   = mkStyle.apply(C_GRAY,  C_SUB); sttStyle.setAlignment(HorizontalAlignment.CENTER);
             XSSFCellStyle sttWStyle  = mkStyle.apply(C_WHITE, C_SUB); sttWStyle.setAlignment(HorizontalAlignment.CENTER);
             XSSFCellStyle idStyle    = mkStyle.apply(new byte[]{(byte)240,(byte)235,(byte)227}, C_ACCENT);
@@ -702,8 +790,8 @@ public class CustomerAdminController {
             String[] headers = {"ID","Mã khách hàng","Tên KH / Công ty","Người liên hệ",
                     "SĐT giao hàng","Địa chỉ giao hàng","Tên người nhận","Email",
                     "Phân loại","Loại giá áp dụng","NV Kinh doanh chăm sóc",
-                    "Chiết khấu (%)","Công nợ (ngày)","Trạng thái"};
-            int[] widths = {10,16,28,22,18,40,22,24,16,20,26,10,10,14};
+                    "Chiết khấu (%)","Công nợ (ngày)","Công nợ (chưa thanh toán)","Trạng thái"};
+            int[] widths = {10,16,28,22,18,40,22,24,16,20,26,10,10,22,14};
             for (int i=0;i<widths.length;i++) ws.setColumnWidth(i, widths[i]*256);
 
             // Sheet ẩn __data cho dropdown
@@ -766,8 +854,8 @@ public class CustomerAdminController {
                 String colLast = sellers.size()<=26 ? String.valueOf((char)('A'+sellers.size()-1)) : "AZ";
                 addDd.accept(10,"__data!$A$1:$"+colLast+"$1");
             }
-            // Col 13: Trạng thái
-            addDd.accept(13,"\"Hoạt động,Đã khóa\"");
+            // Col 14: Trạng thái (đã dịch 1 cột do thêm "Công nợ (chưa thanh toán)" ở col 13)
+            addDd.accept(14,"\"Hoạt động,Đã khóa\"");
 
             // Data rows
             for (int i=0;i<customers.size();i++) {
@@ -820,13 +908,18 @@ public class CustomerAdminController {
                         isWholesale?"Bán sỉ (khung giá)":"Bán lẻ (giá gốc)",              // 9: Loại giá
                         sellerName,                                                         // 10: NV KD
                         (long)(c.getDiscountRate()!=null?c.getDiscountRate():0),            // 11: CK%
-                        (long)(c.getDebtDays()!=null?c.getDebtDays():0),                   // 12: CN
-                        Boolean.TRUE.equals(c.getIsActive())?"Hoạt động":"Đã khóa",        // 13: TT
+                        (long)(c.getDebtDays()!=null?c.getDebtDays():0),                   // 12: CN (ngày)
+                        _formatDongVN(debtMap.getOrDefault(c.getId(), 0L)),                 // 13: CN chưa thanh toán (VD: 31.030đ)
+                        Boolean.TRUE.equals(c.getIsActive())?"Hoạt động":"Đã khóa",        // 14: TT
                 };
 
                 for (int col=0;col<vals.length;col++) {
                     Cell cell=row.createCell(col);
-                    cell.setCellStyle(col==0?idStyle:ds);
+                    // Cột 13 (Công nợ chưa thanh toán): canh phải; các cột khác giữ style thường
+                    XSSFCellStyle cs = col==0 ? idStyle
+                            : col==13 ? (gray?dataGRStyle:dataRStyle)
+                            : ds;
+                    cell.setCellStyle(cs);
                     if (vals[col] instanceof Long) cell.setCellValue((Long)vals[col]);
                     else cell.setCellValue(String.valueOf(vals[col]));
                 }

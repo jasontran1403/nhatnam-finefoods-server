@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nhatnam.server.common.BusinessException;
 import com.nhatnam.server.dto.request.CreateOrderRequest;
 import com.nhatnam.server.dto.request.SuperSellerUpdateOrderRequest;
+import com.nhatnam.server.dto.request.SuperSellerCancelOrderRequest;
 import com.nhatnam.server.dto.response.OrderResponse;
 import com.nhatnam.server.entity.*;
 import com.nhatnam.server.enumtype.OrderStatus;
@@ -44,14 +45,17 @@ public class SuperSellerOrderService {
     private final ProductRepository             productRepository;
     private final UserRepository                userRepository;
     private final CustomerRepository            customerRepository;
+    private final CustomerContractService       customerContractService;
     private final WarehouseRepository           warehouseRepository;
     private final ProductIngredientRepository   productIngredientRepository;
     private final ProductPriceTierRepository    priceTierRepository;
     private final IngredientRepository          ingredientRepository;
     private final IngredientStockRepository     ingredientStockRepository;
+    private final IngredientExpiryRepository    ingredientExpiryRepository;
     private final WarehouseReceiptRepository    warehouseReceiptRepository;
     private final OrderLogRepository            orderLogRepository;
     private final OrderStockDeductionRepository orderStockDeductionRepository;
+    private final IncomeVoucherRepository       incomeVoucherRepository;
     private final FifoDeductService             fifoDeductService;
     private final CartHoldService               cartHoldService;
     private final OrderService                  orderService; // dùng mapToResponse qua getOrderById
@@ -145,10 +149,6 @@ public class SuperSellerOrderService {
                         Collectors.reducing(BigDecimal.ZERO,
                                 OrderStockDeduction::getQuantity, BigDecimal::add)));
 
-        Map<Long, OrderStockDeduction> existingByIngId = existingDeductions.stream()
-                .collect(Collectors.toMap(
-                        d -> d.getIngredientStock().getIngredientId(), d -> d, (a, b) -> a));
-
         // ── 5. Build order items mới ──────────────────────────────────────
         Map<Long, BigDecimal> newUsageMap = new LinkedHashMap<>();
         List<Map<Long, BigDecimal>> itemIngUsage = new ArrayList<>();
@@ -170,7 +170,7 @@ public class SuperSellerOrderService {
         Map<Long, BigDecimal> ingredientUnitCostMap = new LinkedHashMap<>();
         List<WarehouseReceiptItem> receiptItems = new ArrayList<>();
 
-        applyStockDelta(order, warehouse, now, deltaMap, oldUsageMap, existingByIngId,
+        applyStockDelta(order, warehouse, now, deltaMap, oldUsageMap,
                 ingredientUnitCostMap, receiptItems);
 
         // ── 7. Cost per item ──────────────────────────────────────────────
@@ -186,15 +186,15 @@ public class SuperSellerOrderService {
         order.getOrderItems().clear();
         orderRepository.saveAndFlush(order);
 
-        // Xóa deduction của ingredient không còn trong đơn
-        for (Long ingId : existingByIngId.keySet()) {
-            if (!newUsageMap.containsKey(ingId))
-                orderStockDeductionRepository.delete(existingByIngId.get(ingId));
-        }
-
-        // Upsert deduction records
-        upsertDeductions(orderId, warehouseId, now, newUsageMap, existingByIngId,
-                ingredientUnitCostMap);
+        // Ghi lại toàn bộ deduction của đơn: XOÁ SẠCH rồi tạo đúng 1 dòng / nguyên liệu
+        // theo usage mới.
+        //
+        // Không dùng upsert được, vì trong applyStockDelta FifoDeductService.deduct()
+        // đã tự sinh thêm deduction cho phần TĂNG (mỗi lô HSD một dòng). Upsert chỉ
+        // sửa dòng cũ nên các dòng do FIFO sinh ra bị bỏ lại, khiến tổng deduction của
+        // đơn lớn hơn lượng thực dùng. Lần sửa đơn sau, oldUsageMap đọc từ đống dòng
+        // này sẽ bị thổi phồng → delta âm sai → hoàn kho thừa.
+        rewriteDeductions(orderId, warehouseId, now, newUsageMap, ingredientUnitCostMap);
 
         // ── 9. Tính lại giá ──────────────────────────────────────────────
         // Item-level discount
@@ -256,7 +256,8 @@ public class SuperSellerOrderService {
         order.setTotalAmount(afterDiscount);
         order.setSurcharge(surcharge);
         order.setSurchargeDetail(surchargeDetail);
-        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge));
+        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge)
+                .setScale(0, RoundingMode.HALF_UP)); // VND không có lẻ — làm tròn nguyên để khớp số tiền thực thu
 
         // Thông tin người nhận / đơn
         if (req.getOrderedByName() != null)  order.setOrderedByName(req.getOrderedByName());
@@ -272,7 +273,17 @@ public class SuperSellerOrderService {
             order.setHideAllPrices(req.getHideAllPrices());
             if (req.getHideAllPrices()) order.setShowPrices(true);
         }
-        if (req.getPaymentMethod() != null)   order.setPaymentMethod(req.getPaymentMethod());
+        if (req.getPaymentMethod() != null) {
+            // Không cho chuyển sang công nợ khi khách chưa có hợp đồng — cùng quy
+            // tắc với lúc tạo đơn, nếu không thì sửa đơn trở thành đường vòng.
+            // Khách cũ được miễn (xem CustomerContractService.isDebtAllowed).
+            if ("DEBT".equalsIgnoreCase(req.getPaymentMethod().trim())
+                    && !customerContractService.isDebtAllowed(order.getCustomer())) {
+                throw new RuntimeException(
+                        "Khách hàng chưa có hợp đồng nên không được chuyển sang thanh toán công nợ.");
+            }
+            order.setPaymentMethod(req.getPaymentMethod());
+        }
 
         order.setUpdatedAt(now);
         Order saved = orderRepository.save(order);
@@ -346,6 +357,188 @@ public class SuperSellerOrderService {
         notifyOrderUpdated(saved, editorUserId, editedMsg, editedPayload);
 
         return orderService.getOrderById(orderId);
+    }
+
+    // ── Hủy đơn hàng — SUPER_SELLER (mọi trạng thái) ──────────────────────────
+
+    /**
+     * Kiểm tra thông tin trước khi hủy: đơn đã thanh toán chưa, có phiếu thu
+     * liên kết hay không (nếu có, trả về số phiếu thu để FE hiển thị cảnh báo).
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> checkCancelInfo(Long orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
+
+        boolean isPaid = order.getPaymentStatus() == com.nhatnam.server.enumtype.PaymentStatus.PAID
+                || order.getPaymentStatus() == com.nhatnam.server.enumtype.PaymentStatus.PARTIAL;
+
+        List<String> voucherCodes = new ArrayList<>();
+        if (isPaid) {
+            voucherCodes = findLinkedVoucherCodes(order.getOrderCode());
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("orderId", order.getId());
+        result.put("orderCode", order.getOrderCode());
+        result.put("status", order.getStatus().name());
+        result.put("paymentStatus", order.getPaymentStatus() != null ? order.getPaymentStatus().name() : null);
+        result.put("isPaid", isPaid);
+        result.put("hasIncomeVoucher", !voucherCodes.isEmpty());
+        result.put("incomeVoucherCodes", voucherCodes);
+        return result;
+    }
+
+    /** Tìm các phiếu thu (IncomeVoucher) có liên kết tới orderCode truyền vào. */
+    private List<String> findLinkedVoucherCodes(String orderCode) {
+        if (orderCode == null || orderCode.isBlank()) return List.of();
+        List<String> codes = new ArrayList<>();
+        for (IncomeVoucher v : incomeVoucherRepository.findAllWithLinkedOrders()) {
+            List<String> linked = parseLinkedOrderCodes(v.getLinkedOrderCodes());
+            if (linked.contains(orderCode)) codes.add(v.getVoucherCode());
+        }
+        return codes;
+    }
+
+    private List<String> parseLinkedOrderCodes(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try {
+            return objectMapper.readValue(json, List.class);
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    /**
+     * Hủy đơn hàng — SUPER_SELLER có thể hủy ở MỌI trạng thái (kể cả đã thanh
+     * toán / đã giao / đã hoàn thành). Hoàn lại toàn bộ tồn kho đã trừ.
+     * Bắt buộc có requestedBy (người yêu cầu hủy) + cancelReason (lý do).
+     */
+    @Transactional
+    public OrderResponse cancelOrder(Long orderId, Long actorUserId, SuperSellerCancelOrderRequest req) {
+        if (req.getRequestedBy() == null || req.getRequestedBy().isBlank())
+            throw new IllegalArgumentException("Vui lòng chọn người yêu cầu hủy đơn");
+        if (req.getCancelReason() == null || req.getCancelReason().isBlank())
+            throw new IllegalArgumentException("Vui lòng nhập lý do hủy đơn");
+
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
+
+        User actor = userRepository.findById(actorUserId)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy user: " + actorUserId));
+
+        Set<Role> roles = actor.getAllRoles();
+        boolean isSuperSeller = roles.contains(Role.SUPER_SELLER);
+        boolean isOwner = roles.contains(Role.OWNER) || roles.contains(Role.ADMIN) || roles.contains(Role.SUPERADMIN);
+        if (!isSuperSeller && !isOwner)
+            throw new RuntimeException("Chỉ SUPER_SELLER hoặc OWNER mới có thể dùng API này");
+
+        if (order.getStatus() == OrderStatus.CANCELLED) {
+            // Tìm log hủy trước đó để báo rõ ai đã hủy
+            String detail = orderLogRepository.findByOrderIdOrderByCreatedAtAsc(order.getId())
+                    .stream().filter(l -> "CANCELLED".equals(l.getAction())).reduce((a, b) -> b)
+                    .map(l -> " bởi " + l.getActorName() + " (" + l.getActorRole() + ")"
+                            + (l.getNote() != null ? ". " + l.getNote() : ""))
+                    .orElse("");
+            throw new IllegalStateException("Đơn " + order.getOrderCode() + " đã bị hủy trước đó" + detail);
+        }
+
+        long now = System.currentTimeMillis();
+
+        // ── Hoàn tồn kho toàn bộ deduction của đơn này ────────────────────
+        restoreAllStock(orderId, now);
+
+        order.setStatus(OrderStatus.CANCELLED);
+        order.setUpdatedAt(now);
+        Order saved = orderRepository.save(order);
+
+        // ── Order log ──────────────────────────────────────────────────────
+        String actorName = actor.getFullName() != null ? actor.getFullName() : actor.getUsername();
+        String requestedByRole = req.getRequestedByRole() != null && !req.getRequestedByRole().isBlank()
+                ? req.getRequestedByRole().toUpperCase() : "SUPER_SELLER";
+        String note = String.format("Yêu cầu bởi: %s | Lý do: %s | Người thực hiện: %s",
+                req.getRequestedBy(), req.getCancelReason(), actorName);
+        orderLogRepository.save(OrderLog.builder()
+                .order(saved)
+                .action("CANCELLED")
+                .actorName(req.getRequestedBy())
+                .actorRole(requestedByRole)
+                .note(note)
+                .createdAt(now)
+                .build());
+
+        log.info("[SUPER_SELLER_CANCEL] orderId={} actor={} requestedBy={} role={} reason={}",
+                orderId, actorName, req.getRequestedBy(), requestedByRole, req.getCancelReason());
+
+        // ── WS notify cho người yêu cầu hủy ───────────────────────────────
+        String cancelPayload = String.format(
+                "{\"eventType\":\"ORDER_CANCELLED\",\"orderId\":%d,\"referenceId\":\"%d\",\"orderCode\":\"%s\",\"actorName\":\"%s\",\"reason\":\"%s\"}",
+                saved.getId(), saved.getId(), saved.getOrderCode(), actorName,
+                req.getCancelReason().replace("\"", "'"));
+        String cancelMsg = String.format("Đơn %s đã được hủy theo yêu cầu của bạn. Lý do: %s",
+                saved.getOrderCode(), req.getCancelReason());
+
+        if (req.getRequestedById() != null) {
+            userRepository.findById(req.getRequestedById()).ifPresent(requester ->
+                    notificationService.sendToUser(requester, requestedByRole, "ORDER_CANCELLED",
+                            cancelMsg, cancelPayload));
+        }
+
+        // ── Notify chung cho các role liên quan (giống cancelOrder thông thường) ──
+        String broadcastMsg = String.format("%s đã hủy đơn %s. Lý do: %s",
+                actorName, saved.getOrderCode(), req.getCancelReason());
+        notifyOrderUpdated(saved, actorUserId, broadcastMsg, cancelPayload);
+
+        return orderService.getOrderById(orderId);
+    }
+
+    /** Hoàn trả toàn bộ tồn kho đã trừ cho đơn — dùng khi hủy đơn ở mọi trạng thái. */
+    private void restoreAllStock(Long orderId, long now) {
+        List<OrderStockDeduction> deductions = orderStockDeductionRepository.findByOrderId(orderId);
+        if (deductions.isEmpty()) {
+            log.warn("[SUPER_SELLER_CANCEL] Không tìm thấy deduction records cho orderId={}", orderId);
+            return;
+        }
+        for (OrderStockDeduction d : deductions) {
+            IngredientStock stock = d.getIngredientStock();
+            stock.setStockQuantity(stock.getStockQuantity().add(d.getQuantity())
+                    .setScale(3, RoundingMode.HALF_UP));
+            if (d.getCostPrice() != null && d.getCostPrice().compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal costToRestore = d.getCostPrice().multiply(d.getQuantity())
+                        .setScale(2, RoundingMode.HALF_UP);
+                BigDecimal newCost = (stock.getTotalCostValue() != null
+                        ? stock.getTotalCostValue() : BigDecimal.ZERO).add(costToRestore);
+                stock.setTotalCostValue(newCost);
+            }
+            stock.setUpdatedAt(now);
+            ingredientStockRepository.save(stock);
+
+            // Hoàn lô — luôn phải có lô, không nhánh nào được chỉ cộng tồn tổng.
+            // Bỏ sót ở đây là nguồn gốc lệch "có tồn tổng nhưng không lô nào".
+            IngredientExpiry linked = d.getIngredientExpiry() != null
+                    ? ingredientExpiryRepository.findById(d.getIngredientExpiry().getId()).orElse(null)
+                    : null;
+
+            if (linked != null) {
+                linked.setQuantity(linked.getQuantity().add(d.getQuantity()));
+                linked.setUpdatedAt(now);
+                ingredientExpiryRepository.save(linked);
+            } else {
+                ingredientExpiryRepository.save(IngredientExpiry.builder()
+                        .warehouse(stock.getWarehouse())
+                        .ingredientId(stock.getIngredientId())
+                        .expiryDate(d.getExpiryDate())
+                        .costPrice(d.getCostPrice() != null ? d.getCostPrice() : BigDecimal.ZERO)
+                        .quantity(d.getQuantity())
+                        .createdAt(now).updatedAt(now).build());
+            }
+
+            // Broadcast cập nhật tồn kho realtime
+            cartHoldService.broadcastIngredientStockUpdate(
+                    stock.getWarehouse() != null ? stock.getWarehouse().getId() : null,
+                    stock.getIngredientId(), stock.getStockQuantity());
+        }
+        log.info("[SUPER_SELLER_CANCEL] Đã hoàn kho {} deduction records cho orderId={}", deductions.size(), orderId);
     }
 
     private void notifyOrderUpdated(Order order, Long actorUserId,
@@ -462,7 +655,6 @@ public class SuperSellerOrderService {
     private void applyStockDelta(Order order, Warehouse warehouse, long now,
                                  Map<Long, BigDecimal> deltaMap,
                                  Map<Long, BigDecimal> oldUsageMap,
-                                 Map<Long, OrderStockDeduction> existingByIngId,
                                  Map<Long, BigDecimal> costMap,
                                  List<WarehouseReceiptItem> receiptItems) {
         Long warehouseId = warehouse.getId();
@@ -503,7 +695,10 @@ public class SuperSellerOrderService {
                         .quantityAfter(after).difference(delta.negate()).build());
 
             } else {
-                // Giảm usage → hoàn kho
+                // Giảm usage → hoàn kho.
+                // LƯU Ý: chỉ CHỖ NÀY được ghi stockQuantity. restoreStock() bên dưới
+                // chỉ gỡ bản ghi deduction + trả lại lô HSD + hoàn giá vốn — nếu nó
+                // cộng stockQuantity thêm lần nữa thì tồn sẽ tăng GẤP ĐÔI lượng hoàn.
                 BigDecimal restore = delta.abs();
                 BigDecimal after = before.add(restore).setScale(3, RoundingMode.HALF_UP);
                 stock.setStockQuantity(after); stock.setUpdatedAt(now);
@@ -535,6 +730,15 @@ public class SuperSellerOrderService {
         }
     }
 
+    /**
+     * Gỡ phần đã trừ kho của đơn khi số lượng GIẢM: cuốn ngược bản ghi deduction
+     * (mới nhất trước), TRẢ LẠI lô hạn sử dụng và HOÀN giá vốn cho tồn kho.
+     *
+     * <p><b>KHÔNG chạm vào {@code stockQuantity}.</b> Số lượng tồn do
+     * {@link #applyStockDelta} ghi một lần duy nhất theo đúng delta. Trước đây hàm này
+     * cũng cộng {@code stockQuantity}, nên mỗi lần giảm/xoá sản phẩm tồn kho bị cộng
+     * hai lần — giảm 0.5kg thì tồn tăng 1kg.
+     */
     private void restoreStock(Long orderId, Long ingId, BigDecimal restore, long now) {
         List<OrderStockDeduction> deductions = orderStockDeductionRepository.findByOrderId(orderId)
                 .stream()
@@ -543,47 +747,71 @@ public class SuperSellerOrderService {
                 .collect(Collectors.toList());
 
         BigDecimal remaining = restore;
+        BigDecimal costBack  = BigDecimal.ZERO;
+        IngredientStock stock = null;
+
         for (OrderStockDeduction d : deductions) {
             if (remaining.compareTo(BigDecimal.ZERO) <= 0) break;
-            IngredientStock stock = d.getIngredientStock();
+            stock = d.getIngredientStock();
+
             BigDecimal canRestore = remaining.min(d.getQuantity());
             remaining = remaining.subtract(canRestore);
+
+            // Trả lại số lượng cho đúng lô HSD đã trừ, để tổng các lô không lệch tồn kho
+            IngredientExpiry lot = d.getIngredientExpiry();
+            if (lot != null) {
+                lot.setQuantity(lot.getQuantity().add(canRestore).setScale(3, RoundingMode.HALF_UP));
+                lot.setUpdatedAt(now);
+                ingredientExpiryRepository.save(lot);
+            }
+
+            // Hoàn giá vốn tương ứng — FifoDeductService đã trừ totalCostValue lúc xuất
+            if (d.getCostPrice() != null)
+                costBack = costBack.add(d.getCostPrice().multiply(canRestore));
+
             BigDecimal newQty = d.getQuantity().subtract(canRestore);
             if (newQty.compareTo(BigDecimal.ZERO) <= 0)
                 orderStockDeductionRepository.delete(d);
             else { d.setQuantity(newQty); orderStockDeductionRepository.save(d); }
-            stock.setStockQuantity(stock.getStockQuantity().add(canRestore).setScale(3, RoundingMode.HALF_UP));
+        }
+
+        if (stock != null && costBack.compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal base = stock.getTotalCostValue() != null ? stock.getTotalCostValue() : BigDecimal.ZERO;
+            stock.setTotalCostValue(base.add(costBack).setScale(2, RoundingMode.HALF_UP));
             stock.setUpdatedAt(now);
             ingredientStockRepository.save(stock);
         }
     }
 
-    private void upsertDeductions(Long orderId, Long warehouseId, long now,
-                                  Map<Long, BigDecimal> newUsageMap,
-                                  Map<Long, OrderStockDeduction> existingByIngId,
-                                  Map<Long, BigDecimal> costMap) {
+    /**
+     * Ghi lại bảng deduction của đơn cho khớp CHÍNH XÁC lượng nguyên liệu đang dùng:
+     * xoá hết dòng cũ (kể cả dòng do FIFO sinh thêm trong lúc trừ delta) rồi tạo đúng
+     * một dòng cho mỗi nguyên liệu.
+     *
+     * <p>Bảng này là nguồn duy nhất để tính {@code oldUsageMap} ở lần sửa đơn kế tiếp,
+     * nên nó phải bằng đúng lượng thực dùng — sai ở đây là sai dây chuyền cho mọi lần
+     * sửa về sau.
+     */
+    private void rewriteDeductions(Long orderId, Long warehouseId, long now,
+                                   Map<Long, BigDecimal> newUsageMap,
+                                   Map<Long, BigDecimal> costMap) {
+        orderStockDeductionRepository.deleteByOrderId(orderId);
+        orderStockDeductionRepository.flush();
+
         for (Map.Entry<Long, BigDecimal> e : newUsageMap.entrySet()) {
             Long ingId = e.getKey();
             BigDecimal qty = e.getValue();
-            if (qty.compareTo(BigDecimal.ZERO) <= 0) continue;
-            BigDecimal unitCost = costMap.getOrDefault(ingId, BigDecimal.ZERO);
+            if (qty == null || qty.compareTo(BigDecimal.ZERO) <= 0) continue;
 
-            if (existingByIngId.containsKey(ingId)) {
-                OrderStockDeduction existing = orderStockDeductionRepository
-                        .findById(existingByIngId.get(ingId).getId()).orElse(null);
-                if (existing != null) {
-                    existing.setQuantity(qty);
-                    if (unitCost.compareTo(BigDecimal.ZERO) > 0) existing.setCostPrice(unitCost);
-                    orderStockDeductionRepository.save(existing);
-                }
-            } else {
-                IngredientStock st = ingredientStockRepository
-                        .findByIngredientIdAndWarehouseId(ingId, warehouseId)
-                        .orElseThrow(() -> new RuntimeException("Stock not found: " + ingId));
-                orderStockDeductionRepository.save(OrderStockDeduction.builder()
-                        .orderId(orderId).ingredientStock(st)
-                        .quantity(qty).costPrice(unitCost).createdAt(now).build());
-            }
+            IngredientStock st = ingredientStockRepository
+                    .findByIngredientIdAndWarehouseId(ingId, warehouseId)
+                    .orElseThrow(() -> new RuntimeException("Stock not found: " + ingId));
+
+            orderStockDeductionRepository.save(OrderStockDeduction.builder()
+                    .orderId(orderId).ingredientStock(st)
+                    .quantity(qty)
+                    .costPrice(costMap.getOrDefault(ingId, BigDecimal.ZERO))
+                    .createdAt(now).build());
         }
     }
 
@@ -604,13 +832,34 @@ public class SuperSellerOrderService {
             unitPrice = itemReq.getSentUnitPrice();
             priceMode = "MANUAL";
         } else if ("TIER".equals(itemReq.getPriceMode()) && itemReq.getTierId() != null) {
-            ProductPriceTier tier = priceTierRepository.findById(itemReq.getTierId())
-                    .orElseThrow(() -> new RuntimeException("Không tìm thấy tier: " + itemReq.getTierId()));
-            unitPrice = tier.getPrice();
             priceMode = "TIER";
-            tierId = tier.getId();
-            tierName = tier.getTierName();
-            tierPriceSnap = tier.getPrice();
+            ProductPriceTier tier = priceTierRepository.findById(itemReq.getTierId()).orElse(null);
+            if (tier != null) {
+                unitPrice = tier.getPrice();
+                tierId = tier.getId();
+                tierName = tier.getTierName();
+                tierPriceSnap = tier.getPrice();
+            } else {
+                // Tier không còn tồn tại (VD: product đã được sửa lại bảng giá).
+                // Thông tin món đã được snapshot ở order item cũ → dùng lại snapshot đó.
+                OrderItem oldSnap = order.getOrderItems().stream()
+                        .filter(oi -> itemReq.getTierId().equals(oi.getTierId())
+                                && itemReq.getProductId().equals(oi.getProductId()))
+                        .findFirst().orElse(null);
+                if (oldSnap != null && oldSnap.getTierPriceSnapshot() != null) {
+                    unitPrice = oldSnap.getTierPriceSnapshot();
+                    tierId = oldSnap.getTierId();
+                    tierName = oldSnap.getTierName();
+                    tierPriceSnap = oldSnap.getTierPriceSnapshot();
+                } else if (itemReq.getSentUnitPrice() != null) {
+                    // Không có snapshot cũ nhưng client gửi giá → dùng giá client gửi.
+                    unitPrice = itemReq.getSentUnitPrice();
+                    tierId = itemReq.getTierId();
+                    tierPriceSnap = itemReq.getSentUnitPrice();
+                } else {
+                    throw new RuntimeException("Không tìm thấy tier: " + itemReq.getTierId());
+                }
+            }
         } else {
             unitPrice = product.getBasePrice();
             priceMode = "BASE";

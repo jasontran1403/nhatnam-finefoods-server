@@ -20,6 +20,8 @@ public class ProductionModuleDtos {
         private String title;
         private Long factoryProductId;          // sản phẩm chính (backward compat)
         private String productName;             // tên sản phẩm chính
+        private Long productionFactoryId;
+        private String productionFactoryName;
         private String outputUnit;
         private BigDecimal targetQty;
         private Long startDate;
@@ -44,6 +46,7 @@ public class ProductionModuleDtos {
         private String title;
         private Long factoryProductId;          // sản phẩm chính (backward compat)
         private List<Long> factoryProductIds;   // danh sách sản phẩm (ưu tiên nếu có)
+        private Long productionFactoryId;        // xưởng xử lý kế hoạch
         private BigDecimal targetQty;
         private Long startDate;
         private Long endDate;
@@ -90,6 +93,8 @@ public class ProductionModuleDtos {
         // Chế độ hẹn giờ chặt
         private Boolean scheduledMode;
         private Boolean canInputMaterials;   // có thể nhập NVL không (3 ngày trước ngày SX)
+        /** Hao hụt đóng gói — CHỈ có giá trị khi tất cả mẻ đã COMPLETED (xem WorkOrderLossDto) */
+        private WorkOrderLossDto packagingLoss;
     }
 
     @Data @NoArgsConstructor @AllArgsConstructor
@@ -135,8 +140,12 @@ public class ProductionModuleDtos {
     public static class WorkOrderPlanDto {
         private Long id;
         private Long workOrderId;
+        private Long recipeId;
+        private String recipeName;
+        private BigDecimal requestedQty;
         private Integer totalBatches;
         private BigDecimal batchQtyPerRun;
+        private List<BigDecimal> batchQtyPerRunList; // sản lượng từng mẻ, nếu null dùng batchQtyPerRun
         private List<Object> plannedStaff;   // parsed từ JSON
         private List<String> batchSteps;     // parsed từ JSON
         private String notes;
@@ -169,6 +178,64 @@ public class ProductionModuleDtos {
         private List<PlanMaterialRequest> materials;
     }
 
+    // ─── Lập phương án theo Biến thể sản xuất (MỚI) ───────────────────────────
+
+    /** Request preview/submit: chỉ cần chọn biến thể + nhập sản lượng cần sản xuất */
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class SubmitPlanByRecipeRequest {
+        private Long recipeId;
+        private BigDecimal requestedQty;
+        /** Nhân sự (tuỳ chọn, vẫn nhập tay) */
+        private String plannedStaff;
+        private String notes;
+    }
+
+    /** 1 dòng nguyên liệu trong preview/kết quả (đã làm tròn theo loại đơn vị) */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class MaterialLineDto {
+        private Long factoryMaterialId;
+        private String materialName;
+        private String unit;
+        private BigDecimal qty;
+    }
+
+    /** 1 bước trong preview — snapshot từ ProductionRecipeStep */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class RecipeStepPreviewDto {
+        private String stepName;
+        private boolean requiresQc;
+        private String controlType;
+        private Integer durationMinutes;
+        private Long machineId;
+        private String machineName;
+        /** Bước làm chung cả lệnh (true) hay riêng từng mẻ (false) */
+        private boolean shared;
+        /** Công suất tối đa mỗi lần của bước chung (kg) — null = làm chung toàn bộ 1 lần */
+        private BigDecimal capacityPerRun;
+    }
+
+    /** Kế hoạch 1 mẻ trong preview */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BatchPlanPreviewDto {
+        private int batchNumber;
+        private BigDecimal outputQty;
+        private List<MaterialLineDto> materials;
+    }
+
+    /** Toàn bộ preview trả về cho UI trước khi submit phương án */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class PlanPreviewDto {
+        private Long recipeId;
+        private String recipeName;
+        private BigDecimal standardOutputQty;
+        private String outputUnit;
+        private BigDecimal requestedQty;
+        private int totalBatches;
+        private List<BatchPlanPreviewDto> batches;
+        private List<MaterialLineDto> totalMaterials;
+        private List<RecipeStepPreviewDto> steps;
+    }
+
     // ─── ProductionBatch ──────────────────────────────────────────────────────
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
@@ -178,10 +245,17 @@ public class ProductionModuleDtos {
         private String stepName;
         private String status;
         private boolean requiresQc;
+        /** NONE | VISUAL | PHOTO_WEIGHT */
+        private String controlType;
         private Long machineId;
         private String machineName;
+        private Integer durationMinutes;
+        private String startedByName;
+        private Long startedAt;
         private List<String> attachments;
         private String notes;
+        /** Số hư hỏng ghi nhận ở bước này (chỉ bước có kiểm soát); null nếu không áp dụng. */
+        private BigDecimal damagedQty;
         private String completedByName;
         private Long completedAt;
     }
@@ -221,6 +295,14 @@ public class ProductionModuleDtos {
         private String status;
         private String createdByName;
         private Long createdAt;
+        /** Sản lượng lỗi/huỷ (kg) ghi nhận khi hoàn thành mẻ — vào Kho Scrap */
+        private BigDecimal scrapQty;
+        private String scrapReason;
+
+        /** Giá vốn NGUYÊN LIỆU của mẻ (đồng) — không gồm nhân công/điện/khấu hao */
+        private BigDecimal materialCost;
+        /** Giá vốn 1 kg bán thành phẩm của mẻ = materialCost / sản lượng đạt */
+        private BigDecimal unitCost;
         // Steps progress
         private int totalSteps;
         private int completedSteps;
@@ -229,12 +311,20 @@ public class ProductionModuleDtos {
         private BatchCancellationDto cancellation;
         // NVL items (legacy)
         private List<Object> items;
+        /** Nguyên liệu RIÊNG của mẻ này (từ phương án, đã làm tròn theo loại đơn vị) */
+        private List<MaterialLineDto> batchMaterials;
     }
 
     @Data @NoArgsConstructor @AllArgsConstructor
     public static class StartBatchRequest {
         private Long workOrderId;
         private Long recipeId;
+        private String notes;
+    }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class StartStepRequest {
+        // Hiện chưa cần field gì thêm, giữ object rỗng để dễ mở rộng (ví dụ ghi chú khi bắt đầu)
         private String notes;
     }
 
@@ -246,8 +336,17 @@ public class ProductionModuleDtos {
 
     @Data @NoArgsConstructor @AllArgsConstructor
     public static class CompleteBatchRequest {
+        /** Sản lượng ĐẠT chất lượng (kg) — nhập vào Kho bán thành phẩm */
         private BigDecimal actualOutputQty;
         private String notes;
+        /** Ngày sản xuất của lô thành phẩm — bắt buộc nhập khi hoàn thành mẻ (Issue #1) */
+        private Long manufactureDate;
+        /** Hạn sử dụng của lô thành phẩm — bắt buộc nhập khi hoàn thành mẻ (Issue #1) */
+        private Long expiryDate;
+        /** Sản lượng LỖI/huỷ do không đạt chất lượng (kg) — nhập vào Kho Scrap. Nullable/0 nếu không có hàng lỗi. */
+        private BigDecimal scrapQty;
+        /** Lý do lỗi — bắt buộc nhập nếu scrapQty > 0 */
+        private String scrapReason;
     }
 
     @Data @NoArgsConstructor @AllArgsConstructor
@@ -328,6 +427,7 @@ public class ProductionModuleDtos {
         private BigDecimal plannedDowntimeHours;
         private BigDecimal actualDowntimeHours;
         private String vendorName;
+        private String vendorContactPerson;
         private String vendorPhone;
         private BigDecimal estimatedCost;
         private BigDecimal actualCost;
@@ -352,6 +452,7 @@ public class ProductionModuleDtos {
         private Long plannedEnd;
         private BigDecimal plannedDowntimeHours;
         private String vendorName;
+        private String vendorContactPerson;
         private String vendorPhone;
         private Integer recurrenceDay;
         private Integer recurrenceMonthInQuarter;
@@ -411,6 +512,77 @@ public class ProductionModuleDtos {
         private String manufacturer;
         private String serialNumber;
         private Long factoryId;
+        /** Trạng thái (ACTIVE / INACTIVE / UNDER_MAINTENANCE) — cho sửa trực tiếp ở form (Mục 6) */
+        private String status;
+    }
+
+    /** 1 khoảng thời gian máy bị chiếm bởi 1 bước của 1 mẻ/lệnh — dùng để vẽ sọc chéo xanh dương trên Gantt máy */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class MachineOccupancyDto {
+        private Long machineId;
+        private Long stepId;
+        private Long batchId;
+        private String batchCode;
+        private Long workOrderId;
+        private String workOrderCode;
+        private String stepName;
+        private Long startedAt;
+        /** null nếu bước đang chạy (chưa hoàn thành) */
+        private Long completedAt;
+        /** Thời gian dự kiến hoàn thành bước (phút) — snapshot từ lúc lập phương án */
+        private Integer durationMinutes;
+        /**
+         * Thời điểm DỰ KIẾN hoàn thành = startedAt + durationMinutes (phút).
+         * Đây là lịch hoạt động dự kiến của máy, KHÔNG phụ thuộc giờ hiện tại —
+         * dùng để vẽ Gantt ngay cả khi bước chưa hoàn thành và mốc dự kiến nằm
+         * trong tương lai (vd: bắt đầu 9:09, dự kiến xong 10:09).
+         * Nếu bước đã completedAt thì estimatedEndAt = completedAt (thực tế đã xong).
+         * Nếu không có durationMinutes (dữ liệu cũ) → fallback null, FE tự xử lý.
+         */
+        private Long estimatedEndAt;
+    }
+
+    // ─── Machine Metrics (trang quản lý metric máy) ────────────────────────────
+
+    /** 1 điểm dữ liệu theo tháng cho chart thời gian sản xuất / bảo trì */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class MachineMonthlyMetricDto {
+        /** "2026-01" */
+        private String month;
+        private BigDecimal productionHours;
+        private BigDecimal maintenanceHours;
+    }
+
+    /** Tổng quan + lịch sử bảo trì đầy đủ của 1 máy — dùng cho trang quản lý metric máy */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class MachineMetricsDto {
+        private Long machineId;
+        private String machineName;
+        private String status;
+        private String factoryName;
+
+        /** Thời gian mua máy (= ngày tạo nếu không khai báo purchaseDate) */
+        private Long purchaseDate;
+        /** Thời điểm bắt đầu có hoạt động sản xuất đầu tiên */
+        private Long firstProductionAt;
+        /** Thời điểm hoạt động sản xuất gần nhất */
+        private Long lastProductionAt;
+        /** Tổng số giờ máy đã thực sự hoạt động sản xuất (cộng dồn các bước đã hoàn thành/đang chạy đến hiện tại) */
+        private BigDecimal totalProductionHours;
+        /** Tổng số giờ máy hư hỏng/bảo trì (downtime thực tế — nếu chưa hoàn thành, dùng dự kiến đến hiện tại) */
+        private BigDecimal totalMaintenanceHours;
+        /** Tổng chi phí bảo trì/bảo dưỡng ĐÃ HOÀN TẤT (chỉ tính các phiếu COMPLETED) */
+        private BigDecimal totalCompletedMaintenanceCost;
+        /** Số lần bảo trì/sửa chữa đã hoàn tất */
+        private int completedMaintenanceCount;
+        /** Số lần đang xử lý / lên kế hoạch */
+        private int activeMaintenanceCount;
+
+        /** Chart: theo từng tháng — giờ sản xuất vs giờ bảo trì/hư hỏng */
+        private List<MachineMonthlyMetricDto> monthlyChart;
+
+        /** Lịch sử bảo trì/bảo dưỡng đầy đủ — mới nhất trước */
+        private List<MaintenanceDto> maintenanceHistory;
     }
 
     // ─── Dashboard ────────────────────────────────────────────────────────────
@@ -458,6 +630,12 @@ public class ProductionModuleDtos {
         private int completedOrders;
         private int scheduledOrders;        // hẹn giờ chưa đến ngày
         private int pendingPlanOrders;      // chờ lập phương án
+
+        /** TỔNG SẢN LƯỢNG (kg) của tất cả lệnh sản xuất đã COMPLETED. */
+        private java.math.BigDecimal totalCompletedOutput;
+
+        /** Tổng sản lượng hoàn thành trong THÁNG HIỆN TẠI (kg). */
+        private java.math.BigDecimal completedOutputThisMonth;
 
         // === Kế hoạch sản xuất ===
         private List<ProductionPlanDto> recentPlans;
@@ -508,6 +686,85 @@ public class ProductionModuleDtos {
         private int endHour;
     }
 
+    // ─── Hao hụt đóng gói tổng hợp cho 1 lệnh sản xuất (chỉ có khi tất cả mẻ đã xong) ──
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class WorkOrderLossDto {
+        /** Tổng sản lượng thực tế các mẻ đã sản xuất ra (kg, trước đóng gói) */
+        private BigDecimal totalActualOutputQty;
+        /** Tổng kg đã được kế toán kho xác nhận nhận (đã quy đổi tương ứng theo batch) */
+        private BigDecimal totalActualReceivedWeight;
+        /** Tổng số lượng đóng gói thực tế (túi/hộp), quy đổi tương ứng theo batch */
+        private BigDecimal totalPackagedQty;
+        private String packagedUnit;
+        /** Hao hụt (kg) = totalActualOutputQty − totalActualReceivedWeight, chỉ tính nếu > 0 */
+        private BigDecimal lossQty;
+        /** Tỷ lệ hao hụt (%) = lossQty / totalActualOutputQty × 100 */
+        private BigDecimal lossPct;
+        /** Đã đối soát đủ chưa — true nếu mọi batch COMPLETED đều đã được chuyển + xác nhận nhận hết */
+        private boolean fullyReconciled;
+    }
+
+    // ─── Công đoạn cấp lệnh (bước chung / bước riêng) ─────────────────────────
+
+    /** 1 lần chạy của 1 công đoạn (cấp lệnh) */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class WorkOrderStepRunDto {
+        private Long id;
+        private Integer runNumber;
+        private Integer totalRuns;
+        private BigDecimal runQty;
+        private Integer batchNumber;   // null nếu bước chung
+        private String status;         // PENDING | IN_PROGRESS | COMPLETED
+        private boolean canStart;      // đủ điều kiện bắt đầu (công đoạn trước đã xong theo quy tắc)
+        private boolean requiresQc;
+        private String controlType;    // NONE | VISUAL | PHOTO_WEIGHT
+        private Long machineId;
+        private String machineName;
+        private Integer durationMinutes;
+        private String startedByName;
+        private Long startedAt;
+        private List<String> attachments;
+        private String notes;
+        /** Số hư hỏng ghi nhận ở bước này (chỉ bước có kiểm soát). Đơn vị = outputUnit của lệnh. */
+        private BigDecimal damagedQty;
+        private String completedByName;
+        private Long completedAt;
+    }
+
+    /** 1 công đoạn của lệnh (gom các lần chạy) */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class WorkOrderStageDto {
+        private Integer stageSequence;
+        private String stageName;
+        private boolean shared;        // làm chung cả lệnh
+        private String controlType;
+        private Long machineId;
+        private String machineName;
+        private Integer durationMinutes;
+        private int totalRuns;
+        private int completedRuns;
+        private String status;         // PENDING | IN_PROGRESS | COMPLETED
+        private BigDecimal totalQty;   // tổng khối lượng công đoạn xử lý
+        private List<WorkOrderStepRunDto> runs;
+    }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class StartStageRunRequest {
+        private String notes;
+    }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class CompleteStageRunRequest {
+        private List<String> attachments;
+        private String notes;
+        /**
+         * Số hư hỏng tại bước này — chỉ nhận khi bước CÓ kiểm soát (VISUAL / PHOTO_WEIGHT).
+         * Null hoặc 0 nếu không có hư hỏng. Không được âm.
+         */
+        private BigDecimal damagedQty;
+    }
+
     // ─── WorkOrder Detail (cho Gantt mẻ) ─────────────────────────────────────
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
@@ -515,8 +772,18 @@ public class ProductionModuleDtos {
         private WorkOrderDto workOrder;
         private WorkOrderPlanDto plan;
         private List<ProductionBatchDto> batches;   // đã sort theo batchNumber
+        /** Các công đoạn của lệnh (bước chung + bước riêng) — luồng thực thi chính */
+        private List<WorkOrderStageDto> stages;
         private BigDecimal progressPct;
         private int currentBatchNumber;             // mẻ đang làm (IN_PROGRESS)
         private String currentStepName;             // bước đang làm trong mẻ hiện tại
+        /** Còn mẻ kế tiếp chưa bắt đầu không (dùng để FE hỏi "bắt đầu mẻ tiếp theo ngay?") */
+        private boolean hasNextBatch;
+        private Integer nextBatchNumber;
+        /**
+         * Hao hụt đóng gói tổng hợp — CHỈ có giá trị (non-null) khi TẤT CẢ mẻ của lệnh
+         * này đã COMPLETED. Nếu còn mẻ PENDING/IN_PROGRESS, trường này là null.
+         */
+        private WorkOrderLossDto packagingLoss;
     }
 }

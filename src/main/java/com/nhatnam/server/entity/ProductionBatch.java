@@ -41,6 +41,14 @@ public class ProductionBatch {
     @Column(name = "actual_output_qty", precision = 10, scale = 3, nullable = false)
     private BigDecimal actualOutputQty = java.math.BigDecimal.ZERO;
 
+    /** Sản lượng lỗi/huỷ do không đạt chất lượng (kg) — vào Kho Scrap khi hoàn thành mẻ */
+    @Column(name = "scrap_qty", precision = 10, scale = 3)
+    private BigDecimal scrapQty;
+
+    /** Lý do lỗi — bắt buộc nhập nếu scrapQty > 0 */
+    @Column(name = "scrap_reason", columnDefinition = "TEXT")
+    private String scrapReason;
+
     @Column(name = "output_unit", nullable = false, length = 50)
     private String outputUnit;
 
@@ -73,6 +81,23 @@ public class ProductionBatch {
 
     @OneToOne(mappedBy = "batch", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     private BatchCancellation cancellation;
+
+    /**
+     * Giá vốn NGUYÊN LIỆU của mẻ này (đồng) — phần chi phí nguyên liệu của lệnh
+     * được phân bổ cho mẻ theo định lượng trong phương án.
+     * Không gồm nhân công / điện / khấu hao máy.
+     */
+    @Column(name = "material_cost", precision = 15, scale = 2)
+    private BigDecimal materialCost;
+
+    /**
+     * Giá vốn 1 kg BÁN THÀNH PHẨM của mẻ = {@link #materialCost} / {@code actualOutputQty}.
+     * Giữ 6 chữ số thập phân, KHÔNG làm tròn — chỉ làm tròn ở bước cuối khi ghi
+     * vào lô kho thành phẩm, để không bị lệch số khi cộng dồn nhiều mẻ.
+     * Sản lượng lỗi (scrap) không gánh giá vốn: toàn bộ chi phí dồn vào sản lượng đạt.
+     */
+    @Column(name = "unit_cost", precision = 18, scale = 6)
+    private BigDecimal unitCost;
 
     @Column(name = "created_at", nullable = false)
     private Long createdAt;

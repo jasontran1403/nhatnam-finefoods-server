@@ -3,6 +3,7 @@ package com.nhatnam.server.service.admin;
 import com.nhatnam.server.dto.dashboard.*;
 import com.nhatnam.server.entity.ExpenseVoucher;
 import com.nhatnam.server.enumtype.OrderStatus;
+import com.nhatnam.server.enumtype.PaymentStatus;
 import com.nhatnam.server.repository.*;
 import com.nhatnam.server.repository.ExpenseVoucherRepository;
 import lombok.RequiredArgsConstructor;
@@ -25,6 +26,14 @@ public class DashboardService {
     private final UserRepository     userRepository;
     private final CustomerRepository customerRepository;
     private final ExpenseVoucherRepository expenseVoucherRepository;
+    private final CategoryRepository categoryRepository;
+    private final IngredientStockRepository ingredientStockRepository;
+    private final IngredientExpiryRepository ingredientExpiryRepository;
+
+    /** Tên category (không phân biệt hoa thường) cho từng loại tồn kho hiển thị ở dashboard Owner */
+    private static final List<String> CREAM_CATEGORY_NAMES   = List.of("Non-Dairy Creams");
+    private static final List<String> SPICE_CATEGORY_NAMES   = List.of("Herbs , Spices & Condiments");
+    private static final List<String> SAUSAGE_CATEGORY_NAMES = List.of("Small Goods");
 
     private static final ZoneId VN_ZONE    = ZoneId.of("Asia/Ho_Chi_Minh");
     private static final DateTimeFormatter DATE_FMT   = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -38,9 +47,59 @@ public class DashboardService {
     // ─────────────────────────────────────────────────────────────────────────
     public DashboardStatsDto getStats(long from, long to) {
 
-        BigDecimal revenuePeriod = orZero(
-                orderRepository.sumFinalAmountByStatusAndRange(OrderStatus.COMPLETED, from, to));
-        long ordersPeriod    = orderRepository.countByCreatedAtBetween(from, to);
+        // ── Doanh thu kỳ này / Đã thu / Chưa thu ──────────────────────────────────
+        // Làm tròn TỪNG đơn (0 chữ số thập phân, HALF_UP: 0.5→1, 0.4→0) TRƯỚC khi cộng
+        // dồn để tránh lệch vài đồng do cộng số lẻ.
+        //
+        //  • Doanh thu kỳ này  = Σ round(finalAmount) của đơn KHÔNG ở CANCELLED/PREPARING/FAILED.
+        //
+        //  Breakdown ĐẦY ĐỦ (phân hoạch TẤT CẢ đơn trong kỳ theo round(finalAmount)):
+        //  • Đang xử lý (processing) = Σ round(final) của PREPARING + DELIVERING.
+        //  • Đã thu    (collected)   = Σ round(paid) của PENDING_PAYMENT  +  Σ round(final) của COMPLETED
+        //                              (đơn hoàn thành coi như đã thu đủ).
+        //  • Chưa thu  (uncollected) = Σ (UNPAID→round(final), PARTIAL→round(final−paid)) của PENDING_PAYMENT.
+        //  • Đã hủy    (cancelled)   = Σ round(final) của CANCELLED + FAILED.
+        //  → Đang xử lý + Đã thu + Chưa thu + Đã hủy = Σ round(final) của toàn bộ đơn trong kỳ.
+        List<com.nhatnam.server.entity.Order> periodOrders =
+                orderRepository.findByCreatedAtBetween(from, to);
+        BigDecimal revenuePeriod     = BigDecimal.ZERO;
+        BigDecimal processingAmount  = BigDecimal.ZERO;
+        BigDecimal totalPaidAmount   = BigDecimal.ZERO;
+        BigDecimal totalUnpaidAmount = BigDecimal.ZERO;
+        BigDecimal cancelledAmount   = BigDecimal.ZERO;
+        for (com.nhatnam.server.entity.Order o : periodOrders) {
+            if (!isRevenueExcluded(o)) {
+                revenuePeriod = revenuePeriod.add(roundVnd(o.getFinalAmount()));
+            }
+//            revenuePeriod = revenuePeriod.add(roundVnd(o.getFinalAmount()));
+            switch (o.getStatus()) {
+                case PREPARING, DELIVERING ->
+                        processingAmount = processingAmount.add(roundVnd(o.getFinalAmount()));
+                case PENDING_PAYMENT -> {
+                    totalPaidAmount = totalPaidAmount.add(roundVnd(o.getPaidAmount()));
+                    PaymentStatus ps = o.getPaymentStatus();
+                    if (ps == PaymentStatus.UNPAID || ps == PaymentStatus.PARTIAL) {
+                        totalUnpaidAmount = totalUnpaidAmount.add(unpaidOfOrder(o));
+                    }
+                }
+                case COMPLETED ->
+                        totalPaidAmount = totalPaidAmount.add(roundVnd(o.getFinalAmount()));
+                case CANCELLED, FAILED ->
+                        cancelledAmount = cancelledAmount.add(roundVnd(o.getFinalAmount()));
+                default -> { /* PENDING/CONFIRMED/READY (legacy): không đưa vào breakdown */ }
+            }
+        }
+
+        // ── Cộng phần khách thanh toán dư (CHƯA hoàn lại) vào "Đã thu" ──────
+        // Khi khách trả dư nhưng chưa lập phiếu chi hoàn (overpaidRefundVoucherCode = NULL),
+        // số tiền dư đó vẫn đang nằm trong quỹ → cần phản ánh vào tổng đã thu.
+        // Nếu đã lập phiếu chi hoàn → phần dư đã chi ra, không cộng nữa.
+        BigDecimal unrefundedOverpaid = orZero(
+                orderRepository.sumUnrefundedOverpaidBetween(from, to));
+        totalPaidAmount = totalPaidAmount.add(roundVnd(unrefundedOverpaid));
+
+        long ordersPeriod    = periodOrders.stream()
+                .filter(o -> o.getStatus() != OrderStatus.CANCELLED).count();
         long completedPeriod = orderRepository.countByStatusAndCreatedAtBetween(
                 OrderStatus.COMPLETED, from, to);
         long newCustomers    = customerRepository.countByCreatedAtBetween(from, to);
@@ -53,16 +112,24 @@ public class DashboardService {
                 OrderStatus.CANCELLED, from, to);
 
         long len = to - from;
-        BigDecimal revenuePrev = orZero(
-                orderRepository.sumFinalAmountByStatusAndRange(OrderStatus.COMPLETED, from - len, from));
+        // Doanh thu kỳ trước — cùng định nghĩa mới (round từng đơn, loại CANCELLED/FAILED)
+        // để badge % thay đổi so sánh cùng cơ sở.
+        BigDecimal revenuePrev = BigDecimal.ZERO;
+        for (com.nhatnam.server.entity.Order o : orderRepository.findByCreatedAtBetween(from - len, from)) {
+            if (isRevenueExcluded(o)) continue;
+            revenuePrev = revenuePrev.add(roundVnd(o.getFinalAmount()));
+        }
         long ordersPrev = orderRepository.countByCreatedAtBetween(from - len, from);
 
         List<RevenuePointDto>      revenuePoints    = buildRevenuePoints(from, to);
         List<StatusCountDto>       ordersByStatus   = orderRepository.countOrdersByStatusAndRange(from, to);
         List<PaymentMethodStatDto> paymentBreakdown = orderRepository.revenueByPaymentMethod(from, to);
 
-        BigDecimal totalExpenses   = expenseVoucherRepository.sumApprovedExpenses(from, to, ExpenseVoucher.VoucherStatus.APPROVED);
-        BigDecimal totalPaidAmount = orZero(orderRepository.sumPaidAmountByRange(from, to)); // ← THÊM
+        BigDecimal totalExpenses   = sumExpensesInRange(from, to);
+
+        StockTotals creamStock   = sumStockByCategoryNames(CREAM_CATEGORY_NAMES);
+        StockTotals spiceStock   = sumStockByCategoryNames(SPICE_CATEGORY_NAMES);
+        StockTotals sausageStock = sumStockByCategoryNames(SAUSAGE_CATEGORY_NAMES);
 
         return DashboardStatsDto.builder()
                 .revenueToday(revenuePeriod)
@@ -83,7 +150,126 @@ public class DashboardService {
                 .revenueByPaymentMethod(paymentBreakdown)
                 .totalExpenses(totalExpenses)
                 .totalPaidAmount(totalPaidAmount)
+                .totalUnpaidAmount(totalUnpaidAmount)
+                .processingAmount(processingAmount)
+                .cancelledAmount(cancelledAmount)
+                .creamStockQty(creamStock.qty)
+                .creamStockValue(creamStock.value)
+                .spiceStockQty(spiceStock.qty)
+                .spiceStockValue(spiceStock.value)
+                .sausageStockQty(sausageStock.qty)
+                .sausageStockValue(sausageStock.value)
                 .build();
+    }
+
+    /**
+     * Tổng tiền chi (phiếu chi đã duyệt) quy theo KỲ CHI PHÍ (expensePeriod =
+     * "YYYY-MM" — tháng mà khoản chi THUỘC VỀ), không theo ngày tạo/duyệt.
+     *
+     * <p>Quy tắc chọn kỳ theo khoảng thời gian [from, to] đang xem:
+     * <ul>
+     *   <li>Khoảng ≤ ~1 tháng (preset Hôm nay / Tuần này / Tháng này, hoặc nút
+     *       chọn 1 tháng cố định) → lấy TRỌN tháng chứa ngày cuối {@code to}.
+     *       Nhờ vậy phiếu chi nhập cho tháng quá khứ không lẫn vào tháng hiện tại,
+     *       và ngược lại xem đúng tháng quá khứ sẽ thấy phiếu chi của tháng đó.</li>
+     *   <li>Khoảng > 1 tháng (custom dài, hoặc preset Năm nay) → cộng tất cả các
+     *       tháng bị phủ từ tháng {@code from} đến tháng {@code to}.</li>
+     * </ul>
+     */
+    /**
+     * Tổng tiền chi (phiếu chi đã duyệt) rơi vào khoảng [from, to] theo NGÀY TỔNG
+     * HỢP của phiếu ({@code effectiveAt}) — tức ngày đã set (chế độ "Ngày") hoặc
+     * đầu tháng của kỳ (chế độ "Kỳ"). Phiếu cũ chưa có {@code effectiveAt} thì
+     * fallback về {@code createdAt}.
+     *
+     * <p>Nhờ vậy khi lọc dashboard theo 1 ngày cụ thể (VD 01/07), chỉ những phiếu
+     * chi được set đúng ngày đó mới được cộng; chọn ngày khác (02/07, hôm nay...)
+     * sẽ KHÔNG còn tính nhầm sang, thay cho cách gom trọn tháng trước đây.
+     */
+    private BigDecimal sumExpensesInRange(long from, long to) {
+        return orZero(expenseVoucherRepository.sumApprovedInPeriod(
+                from, to, ExpenseVoucher.VoucherStatus.APPROVED));
+    }
+
+    /** Kết quả tính tổng tồn kho (số lượng + giá trị) cho 1 nhóm category. */
+    private static final class StockTotals {
+        final BigDecimal qty;
+        final BigDecimal value;
+        StockTotals(BigDecimal qty, BigDecimal value) { this.qty = qty; this.value = value; }
+    }
+
+    /**
+     * Chuẩn hoá tên category để so khớp không bị lệch bởi khoảng trắng thừa:
+     * gộp mọi chuỗi khoảng trắng liên tiếp (kể cả quanh dấu phẩy) thành đúng
+     * 1 khoảng trắng, và trim 2 đầu. VD: "Herbs , Spices  &  Condiments " →
+     * "Herbs , Spices & Condiments" (đã gộp khoảng trắng kép) — sau đó còn
+     * equalsIgnoreCase nên không phân biệt hoa/thường nữa.
+     */
+    private static String normalizeCategoryName(String name) {
+        if (name == null) return "";
+        return name.trim()
+                .replaceAll("\\s+", " ")   // gộp nhiều khoảng trắng liên tiếp thành 1
+                .replaceAll("\\s*,\\s*", ", "); // chuẩn hoá khoảng trắng quanh dấu phẩy: luôn "X, Y"
+    }
+
+    /**
+     * Tổng tồn kho (số lượng + giá trị) của tất cả nguyên liệu thuộc 1 trong các
+     * category cho trước, cộng dồn trên TẤT CẢ các kho. Giá trị tính theo lô
+     * thực tế (costPrice từng lô FIFO) nếu có, nếu không thì fallback theo
+     * IngredientStock.totalCostValue. Lô không có giá vốn → tính giá 0.
+     */
+    private StockTotals sumStockByCategoryNames(List<String> categoryNames) {
+        // Lấy categoryId theo tên — so khớp linh hoạt: bỏ qua hoa/thường VÀ
+        // chuẩn hoá khoảng trắng thừa (VD: tên thực tế trong DB có thể là
+        // "Herbs , Spices & Condiments" — có dấu cách thừa trước dấu phẩy —
+        // trong khi hằng số khai báo là "Herbs, Spices & Condiments". So khớp
+        // tuyệt đối trước đây khiến không tìm thấy category nào, trả về 0kg/0đ
+        // dù tồn kho thực tế > 0). normalize() gộp mọi khoảng trắng liên tiếp
+        // (kể cả quanh dấu phẩy) thành đúng 1 khoảng trắng trước khi so sánh.
+        List<com.nhatnam.server.entity.Category> allCategories = categoryRepository.findAll();
+        Set<Long> matchedCategoryIds = allCategories.stream()
+                .filter(c -> categoryNames.stream().anyMatch(name -> normalizeCategoryName(name).equalsIgnoreCase(normalizeCategoryName(c.getName()))))
+                .map(com.nhatnam.server.entity.Category::getId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        if (matchedCategoryIds.isEmpty()) return new StockTotals(BigDecimal.ZERO, BigDecimal.ZERO);
+
+        List<com.nhatnam.server.entity.IngredientStock> stocks =
+                ingredientStockRepository.findAllByIngredientCategoryIds(new ArrayList<>(matchedCategoryIds));
+        if (stocks.isEmpty()) return new StockTotals(BigDecimal.ZERO, BigDecimal.ZERO);
+
+        BigDecimal totalQty = stocks.stream()
+                .map(com.nhatnam.server.entity.IngredientStock::getStockQuantity)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        // Giá trị: ưu tiên tính theo lô thực tế (costPrice), fallback theo totalCostValue.
+        // Lô/stock không có giá vốn → coi như giá 0 (không cộng thêm gì).
+        Set<Long> ingredientIds = stocks.stream()
+                .map(com.nhatnam.server.entity.IngredientStock::getIngredientId)
+                .collect(java.util.stream.Collectors.toSet());
+        List<com.nhatnam.server.entity.IngredientExpiry> lots = ingredientExpiryRepository
+                .findAllByIngredientIdInAndQuantityPositive(new ArrayList<>(ingredientIds));
+        Map<Long, BigDecimal> lotValueByIngredientId = new HashMap<>();
+        for (com.nhatnam.server.entity.IngredientExpiry lot : lots) {
+            if (lot.getCostPrice() == null) continue; // không có giá vốn → giá 0, không cộng
+            BigDecimal lotValue = lot.getQuantity().multiply(lot.getCostPrice())
+                    .setScale(2, RoundingMode.HALF_UP);
+            lotValueByIngredientId.merge(lot.getIngredientId(), lotValue, BigDecimal::add);
+        }
+
+        BigDecimal totalValue = BigDecimal.ZERO;
+        for (com.nhatnam.server.entity.IngredientStock s : stocks) {
+            BigDecimal fromLots = lotValueByIngredientId.get(s.getIngredientId());
+            if (fromLots != null && fromLots.compareTo(BigDecimal.ZERO) > 0) {
+                totalValue = totalValue.add(fromLots);
+            } else if (s.getTotalCostValue() != null) {
+                totalValue = totalValue.add(s.getTotalCostValue());
+            }
+            // else: không có giá vốn ở cả lô và stock → giá trị 0, không cộng thêm gì
+        }
+
+        return new StockTotals(totalQty, totalValue);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -320,6 +506,31 @@ public class DashboardService {
     }
 
     private static BigDecimal orZero(BigDecimal v) { return v == null ? BigDecimal.ZERO : v; }
+
+    /** Làm tròn về đồng (0 chữ số thập phân, HALF_UP); null → 0. */
+    private static BigDecimal roundVnd(BigDecimal v) {
+        return v == null ? BigDecimal.ZERO : v.setScale(0, RoundingMode.HALF_UP);
+    }
+
+    /** Đơn KHÔNG tính vào doanh thu: CANCELLED, PREPARING và FAILED. */
+    private static boolean isRevenueExcluded(com.nhatnam.server.entity.Order o) {
+        return o.getStatus() == OrderStatus.CANCELLED
+                || o.getStatus() == OrderStatus.FAILED;
+    }
+
+    /**
+     * Số tiền chưa thu của 1 đơn (đã làm tròn về đồng, HALF_UP, tối thiểu 0):
+     * UNPAID → round(finalAmount); PARTIAL → round(finalAmount − paidAmount).
+     */
+    private static BigDecimal unpaidOfOrder(com.nhatnam.server.entity.Order o) {
+        BigDecimal fin  = o.getFinalAmount() != null ? o.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal paid = o.getPaidAmount()  != null ? o.getPaidAmount()  : BigDecimal.ZERO;
+        BigDecimal base = (o.getPaymentStatus() == PaymentStatus.PARTIAL)
+                ? fin.subtract(paid)
+                : fin;
+        if (base.signum() <= 0) return BigDecimal.ZERO;
+        return base.setScale(0, RoundingMode.HALF_UP);
+    }
 
     private static Long toLong(Object o) {
         if (o == null) return 0L;

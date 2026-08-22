@@ -12,7 +12,10 @@ import java.io.IOException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Xuất phiếu kiểm kho dạng Excel.
@@ -101,82 +104,75 @@ public class WarehouseInventoryExportService {
             hc.setCellStyle(s.headerCell);
         }
 
-        // ── Rows: dữ liệu ────────────────────────────────────────────────────
-        int dataStartRow = rowIdx;
-        int stt = 0; // STT tăng theo nguyên liệu, không theo lô
-        for (int i = 0; i < items.size(); i++) {
-            InventoryItem item = items.get(i);
-            stt++;
+        // ── Rows: dữ liệu — nhóm theo Danh mục cha › Danh mục con ──────────────
+        //
+        // Layout:
+        //   [Danh mục cha]                (dòng merge, in đậm, canh trái)
+        //     [Danh mục con]              (dòng merge, in nghiêng, canh trái) — nếu có
+        //        nguyên liệu thuộc danh mục con ...
+        //     nguyên liệu có danh mục cha nhưng CHƯA gán danh mục con ...
+        //   [Chưa phân loại]              (nguyên liệu không có danh mục cha)
+        //
+        List<InventoryItem> safeItems = (items != null) ? items : List.of();
 
-            // Chuẩn bị danh sách lô — nếu không có lô thì tạo 1 dòng trống
-            List<ExpiryEntry> lots = (item.expiryList() != null && !item.expiryList().isEmpty())
-                    ? item.expiryList()
-                    : List.of(new ExpiryEntry(null, null, null));
+        // Gom theo danh mục cha, giữ thứ tự xuất hiện; nhóm "chưa phân loại" để cuối.
+        LinkedHashMap<Long, List<InventoryItem>> byCategory = new LinkedHashMap<>();
+        List<InventoryItem> noCategory = new ArrayList<>();
+        for (InventoryItem it : safeItems) {
+            if (it.categoryId() == null) noCategory.add(it);
+            else byCategory.computeIfAbsent(it.categoryId(), k -> new ArrayList<>()).add(it);
+        }
 
-            int lotCount = lots.size();
-            int firstRowIdx = rowIdx; // dòng đầu tiên của nguyên liệu này
+        Counter stt = new Counter(); // STT tăng theo nguyên liệu, không theo lô/tiêu đề
 
-            XSSFCellStyle rowBg   = (i % 2 == 0) ? s.dataEven  : s.dataOdd;
-            XSSFCellStyle numBg   = (i % 2 == 0) ? s.numEven   : s.numOdd;
-            XSSFCellStyle wrapBg  = (i % 2 == 0) ? s.wrapEven  : s.wrapOdd;
-            XSSFCellStyle inputBg = (i % 2 == 0) ? s.inputEven : s.inputOdd;
+        // Duyệt từng danh mục cha
+        for (Map.Entry<Long, List<InventoryItem>> catEntry : byCategory.entrySet()) {
+            List<InventoryItem> catItems = catEntry.getValue();
+            String catName = catItems.stream()
+                    .map(InventoryItem::categoryName)
+                    .filter(n -> n != null && !n.isBlank())
+                    .findFirst()
+                    .orElse("Danh mục #" + catEntry.getKey());
 
-            for (int l = 0; l < lotCount; l++) {
-                ExpiryEntry lot = lots.get(l);
-                Row row = sh.createRow(rowIdx++);
-                row.setHeightInPoints(38);
+            // Dòng tiêu đề danh mục cha (in đậm)
+            rowIdx = writeSectionRow(sh, rowIdx, totalCols, catName, s.catHeader, 26);
 
-                // Col 0: STT — chỉ ghi ở dòng đầu, dòng sau để trống (sẽ merge)
-                Cell sttCell = row.createCell(0);
-                if (l == 0) sttCell.setCellValue(stt);
-                else        sttCell.setCellValue("");
-                sttCell.setCellStyle(numBg);
-
-                // Col 1: Tên nguyên liệu — chỉ ghi ở dòng đầu (sẽ merge)
-                Cell nameCell = row.createCell(1);
-                if (l == 0) nameCell.setCellValue(item.ingredientName());
-                else        nameCell.setCellValue("");
-                nameCell.setCellStyle(rowBg);
-
-                // Col 2: ĐVT — chỉ ghi ở dòng đầu (sẽ merge)
-                Cell unitCell = row.createCell(2);
-                if (l == 0) unitCell.setCellValue(item.unit() != null ? item.unit() : "");
-                else        unitCell.setCellValue("");
-                unitCell.setCellStyle(wrapBg);
-
-                // Col 3: SL lô này (không phải tổng tồn)
-                Cell qtyCell = row.createCell(3);
-                if (lot.quantity() != null) {
-                    qtyCell.setCellValue(lot.quantity());
-                } else if (l == 0 && item.stockQuantity() != null) {
-                    // Nếu không có thông tin lô, hiện tổng tồn
-                    qtyCell.setCellValue(item.stockQuantity());
-                } else {
-                    qtyCell.setCellValue("");
-                }
-                qtyCell.setCellStyle(numBg);
-
-                // Col 4: Hạn sử dụng của lô này
-                Cell expiryCell = row.createCell(4);
-                expiryCell.setCellValue(lot.expiryDate() != null ? lot.expiryDate() : "—");
-                expiryCell.setCellStyle(wrapBg);
-
-                // Col 5: SL Thực tế — để trống cho từng lô
-                Cell actualCell = row.createCell(5);
-                actualCell.setCellValue("");
-                actualCell.setCellStyle(inputBg);
+            // Trong danh mục cha: gom theo danh mục con (giữ thứ tự), phần chưa gán để cuối
+            LinkedHashMap<Long, List<InventoryItem>> bySub = new LinkedHashMap<>();
+            List<InventoryItem> noSub = new ArrayList<>();
+            for (InventoryItem it : catItems) {
+                if (it.subCategoryId() == null) noSub.add(it);
+                else bySub.computeIfAbsent(it.subCategoryId(), k -> new ArrayList<>()).add(it);
             }
 
-            // Merge STT, Tên, ĐVT theo chiều dọc nếu có nhiều lô
-            if (lotCount > 1) {
-                int lastRowIdx = rowIdx - 1;
-                sh.addMergedRegion(new CellRangeAddress(firstRowIdx, lastRowIdx, 0, 0)); // STT
-                sh.addMergedRegion(new CellRangeAddress(firstRowIdx, lastRowIdx, 1, 1)); // Tên
-                sh.addMergedRegion(new CellRangeAddress(firstRowIdx, lastRowIdx, 2, 2)); // ĐVT
+            // Các danh mục con + nguyên liệu bên trong
+            for (Map.Entry<Long, List<InventoryItem>> subEntry : bySub.entrySet()) {
+                List<InventoryItem> subItems = subEntry.getValue();
+                String subName = subItems.stream()
+                        .map(InventoryItem::subCategoryName)
+                        .filter(n -> n != null && !n.isBlank())
+                        .findFirst()
+                        .orElse("Danh mục con #" + subEntry.getKey());
 
-                // Set vertical align center cho merged cells
-                sh.getRow(firstRowIdx).getCell(0).getCellStyle();
-                // (style đã có verticalAlignment CENTER từ dataStyle)
+                // Dòng tiêu đề danh mục con (in nghiêng)
+                rowIdx = writeSectionRow(sh, rowIdx, totalCols, "     " + subName, s.subHeader, 22);
+
+                for (InventoryItem it : subItems) {
+                    rowIdx = writeItemRows(sh, s, it, stt, rowIdx);
+                }
+            }
+
+            // Nguyên liệu có danh mục cha nhưng chưa gán danh mục con
+            for (InventoryItem it : noSub) {
+                rowIdx = writeItemRows(sh, s, it, stt, rowIdx);
+            }
+        }
+
+        // Nhóm chưa phân loại (không có danh mục cha) — để cuối cùng
+        if (!noCategory.isEmpty()) {
+            rowIdx = writeSectionRow(sh, rowIdx, totalCols, "Chưa phân loại", s.catHeader, 26);
+            for (InventoryItem it : noCategory) {
+                rowIdx = writeItemRows(sh, s, it, stt, rowIdx);
             }
         }
 
@@ -258,6 +254,114 @@ public class WarehouseInventoryExportService {
         return bos.toByteArray();
     }
 
+    // ─── Helpers render ────────────────────────────────────────────────────────
+
+    /** Bộ đếm STT dùng chung xuyên suốt các nhóm danh mục. */
+    private static final class Counter {
+        int value = 0;
+        int next() { return ++value; }
+    }
+
+    /**
+     * Ghi 1 dòng tiêu đề (danh mục cha / danh mục con): merge toàn bộ chiều ngang,
+     * canh trái. Style quyết định in đậm (danh mục cha) hay in nghiêng (danh mục con).
+     *
+     * @return chỉ số dòng kế tiếp
+     */
+    private int writeSectionRow(XSSFSheet sh, int rowIdx, int totalCols,
+                                String text, XSSFCellStyle style, int heightPt) {
+        Row r = sh.createRow(rowIdx);
+        r.setHeightInPoints(heightPt);
+        // Áp style cho tất cả các ô trong dải merge để viền/nền hiển thị đủ
+        for (int c = 0; c < totalCols; c++) {
+            Cell cell = r.createCell(c);
+            if (c == 0) cell.setCellValue(text != null ? text : "");
+            cell.setCellStyle(style);
+        }
+        sh.addMergedRegion(new CellRangeAddress(rowIdx, rowIdx, 0, totalCols - 1));
+        return rowIdx + 1;
+    }
+
+    /**
+     * Ghi các dòng của 1 nguyên liệu (mỗi lô 1 dòng, merge STT/Tên/ĐVT nếu nhiều lô).
+     *
+     * @return chỉ số dòng kế tiếp
+     */
+    private int writeItemRows(XSSFSheet sh, Styles s, InventoryItem item,
+                              Counter stt, int rowIdx) {
+        int sttValue = stt.next();
+
+        // Danh sách lô — nếu không có lô thì tạo 1 dòng trống
+        List<ExpiryEntry> lots = (item.expiryList() != null && !item.expiryList().isEmpty())
+                ? item.expiryList()
+                : List.of(new ExpiryEntry(null, null, null));
+
+        int lotCount    = lots.size();
+        int firstRowIdx = rowIdx;
+
+        // Kẻ sọc xen kẽ theo nguyên liệu (dựa trên STT) để dễ đọc
+        boolean even = (sttValue % 2 == 1); // STT lẻ = hàng "even" (bắt đầu bằng nền nhạt)
+        XSSFCellStyle rowBg   = even ? s.dataEven  : s.dataOdd;
+        XSSFCellStyle numBg   = even ? s.numEven   : s.numOdd;
+        XSSFCellStyle wrapBg  = even ? s.wrapEven  : s.wrapOdd;
+        XSSFCellStyle inputBg = even ? s.inputEven : s.inputOdd;
+
+        for (int l = 0; l < lotCount; l++) {
+            ExpiryEntry lot = lots.get(l);
+            Row row = sh.createRow(rowIdx++);
+            row.setHeightInPoints(38);
+
+            // Col 0: STT — chỉ ghi ở dòng đầu (sẽ merge nếu nhiều lô)
+            Cell sttCell = row.createCell(0);
+            if (l == 0) sttCell.setCellValue(sttValue);
+            else        sttCell.setCellValue("");
+            sttCell.setCellStyle(numBg);
+
+            // Col 1: Tên nguyên liệu — chỉ ghi ở dòng đầu
+            Cell nameCell = row.createCell(1);
+            if (l == 0) nameCell.setCellValue(item.ingredientName());
+            else        nameCell.setCellValue("");
+            nameCell.setCellStyle(rowBg);
+
+            // Col 2: ĐVT — chỉ ghi ở dòng đầu
+            Cell unitCell = row.createCell(2);
+            if (l == 0) unitCell.setCellValue(item.unit() != null ? item.unit() : "");
+            else        unitCell.setCellValue("");
+            unitCell.setCellStyle(wrapBg);
+
+            // Col 3: SL lô này (không phải tổng tồn)
+            Cell qtyCell = row.createCell(3);
+            if (lot.quantity() != null) {
+                qtyCell.setCellValue(lot.quantity());
+            } else if (l == 0 && item.stockQuantity() != null) {
+                qtyCell.setCellValue(item.stockQuantity());
+            } else {
+                qtyCell.setCellValue("");
+            }
+            qtyCell.setCellStyle(numBg);
+
+            // Col 4: Hạn sử dụng của lô này
+            Cell expiryCell = row.createCell(4);
+            expiryCell.setCellValue(lot.expiryDate() != null ? lot.expiryDate() : "—");
+            expiryCell.setCellStyle(wrapBg);
+
+            // Col 5: SL Thực tế — để trống cho từng lô
+            Cell actualCell = row.createCell(5);
+            actualCell.setCellValue("");
+            actualCell.setCellStyle(inputBg);
+        }
+
+        // Merge STT / Tên / ĐVT theo chiều dọc nếu có nhiều lô
+        if (lotCount > 1) {
+            int lastRowIdx = rowIdx - 1;
+            sh.addMergedRegion(new CellRangeAddress(firstRowIdx, lastRowIdx, 0, 0)); // STT
+            sh.addMergedRegion(new CellRangeAddress(firstRowIdx, lastRowIdx, 1, 1)); // Tên
+            sh.addMergedRegion(new CellRangeAddress(firstRowIdx, lastRowIdx, 2, 2)); // ĐVT
+        }
+
+        return rowIdx;
+    }
+
     // ─── DTOs ────────────────────────────────────────────────────────────────
 
     public record InventoryItem(
@@ -265,8 +369,19 @@ public class WarehouseInventoryExportService {
             String spec,          // quy cách (VD: "Hộp 24 gói")
             String unit,          // đơn vị tính (VD: "Hộp")
             Double stockQuantity,
-            List<ExpiryEntry> expiryList
-    ) {}
+            List<ExpiryEntry> expiryList,
+            Long   categoryId,       // danh mục cha — null nếu chưa phân loại
+            String categoryName,     // tên danh mục cha
+            Long   subCategoryId,    // danh mục con — null nếu chưa gán
+            String subCategoryName   // tên danh mục con
+    ) {
+        // Constructor tương thích ngược (không có danh mục)
+        public InventoryItem(String ingredientName, String spec, String unit,
+                             Double stockQuantity, List<ExpiryEntry> expiryList) {
+            this(ingredientName, spec, unit, stockQuantity, expiryList,
+                    null, null, null, null);
+        }
+    }
 
     public record ExpiryEntry(
             String manufacturingDate,  // "hh:mm dd/MM/yyyy" hoặc null
@@ -281,6 +396,8 @@ public class WarehouseInventoryExportService {
         // Header
         final XSSFCellStyle title, metaLeft;
         final XSSFCellStyle headerCell;
+        // Tiêu đề nhóm (danh mục cha / danh mục con)
+        final XSSFCellStyle catHeader, subHeader;
         // Data — even / odd
         final XSSFCellStyle dataEven, dataOdd;
         final XSSFCellStyle numEven,  numOdd;
@@ -339,6 +456,28 @@ public class WarehouseInventoryExportService {
             headerCell.setVerticalAlignment(VerticalAlignment.CENTER);
             headerCell.setWrapText(true);
             border(headerCell, BorderStyle.MEDIUM, C_BLUE);
+
+            // ── Tiêu đề danh mục cha (in đậm, canh trái, dải nền xanh đậm) ──
+            XSSFFont fCat = fnt(wb, 15, true, C_WHITE, false);
+            catHeader = wb.createCellStyle();
+            catHeader.setFont(fCat);
+            catHeader.setAlignment(HorizontalAlignment.LEFT);
+            catHeader.setVerticalAlignment(VerticalAlignment.CENTER);
+            catHeader.setFillForegroundColor(new XSSFColor(hex(C_NAVY), null));
+            catHeader.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            catHeader.setIndention((short) 1);
+            border(catHeader, BorderStyle.MEDIUM, C_NAVY);
+
+            // ── Tiêu đề danh mục con (in nghiêng, canh trái, dải nền xanh nhạt) ──
+            XSSFFont fSub = fnt(wb, 14, true, C_NAVY, true); // bold + italic cho nổi
+            subHeader = wb.createCellStyle();
+            subHeader.setFont(fSub);
+            subHeader.setAlignment(HorizontalAlignment.LEFT);
+            subHeader.setVerticalAlignment(VerticalAlignment.CENTER);
+            subHeader.setFillForegroundColor(new XSSFColor(hex(C_ACCENT), null));
+            subHeader.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            subHeader.setIndention((short) 2);
+            border(subHeader, BorderStyle.THIN, C_BLUE);
 
             // ── Data rows ────────────────────────────────────────────────
             dataEven = dataStyle(wb, fData, C_ACCENT, false, false);

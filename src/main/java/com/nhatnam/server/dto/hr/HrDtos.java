@@ -7,32 +7,80 @@ import java.util.List;
 public class HrDtos {
 
     // ── Salary ────────────────────────────────────────────────────────────────
+    // Lương gồm 3 thành phần cố định hàng tháng: lương trước thuế (GROSS cơ bản),
+    // phụ cấp, thưởng. Ngày công thực tế/người phụ thuộc thay đổi theo từng tháng
+    // nên không lưu ở đây — nhập lại mỗi lần tính lương (xem PayrollDtos).
 
     @Data
     public static class SalaryRequest {
         private Long userId;
+        /** Lương NET thực nhận/tháng (KHÔNG gồm phụ cấp, thưởng) — GROSS sẽ được tính ngược ra */
         private Long baseSalary;
-        private Double socialInsuranceRate;
-        private Long socialInsuranceSalary;
+        /** Mức lương đóng thuế/bảo hiểm — bảo hiểm (NLĐ & DN) tính cố định trên mức này. Trống → = baseSalary. */
+        private Long insuranceSalary;
+        /** Tổng phụ cấp (tương thích cũ) — nếu có {@code allowances} thì bỏ qua field này. */
+        private Long allowance;
+        /** Chi tiết từng khoản phụ cấp (nhãn + số tiền + có tính thuế TNCN không). */
+        private List<AllowanceItemDto> allowances;
         private Long bonus;
-        private Long mealAllowance;
-        private Long transportAllowance;
+        /** Thưởng có tính vào thu nhập chịu thuế TNCN không. */
+        private Boolean bonusTaxable;
+        /** Số người phụ thuộc — dùng tính giảm trừ gia cảnh khi suy ngược GROSS */
+        private Integer dependents;
+        /** Kỳ lương — nếu có, HR sẽ nạp thêm phụ cấp/thưởng import từ MonthlyAdjustment. */
+        private Integer month;
+        private Integer year;
+    }
+
+    /** Một khoản phụ cấp: nhãn + số tiền + có tính thuế TNCN không. */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class AllowanceItemDto {
+        private String label;
+        private Long amount;
+        /** true = tính vào thu nhập chịu thuế TNCN. Bảo hiểm KHÔNG phụ thuộc phụ cấp. */
+        private boolean taxable;
+    }
+
+    /** Nhãn phụ cấp trong danh mục (để chọn lại). */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class AllowanceLabelDto {
+        private Long id;
+        private String name;
+        private boolean system;
+    }
+
+    @Data
+    public static class AllowanceLabelCreateRequest {
+        private String name;
     }
 
     @Data
     public static class BatchSalaryRequest {
         private List<Long> userIds;
+        /** Lương NET thực nhận/tháng (KHÔNG gồm phụ cấp, thưởng) — GROSS sẽ được tính ngược ra */
         private Long baseSalary;
-        private Double socialInsuranceRate;
-        private Long socialInsuranceSalary;
+        /** Mức lương đóng thuế/bảo hiểm — áp dụng chung cho cả batch. Trống → = baseSalary. */
+        private Long insuranceSalary;
+        private Long allowance;
         private Long bonus;
-        private Long mealAllowance;
-        private Long transportAllowance;
+        /** Số người phụ thuộc — áp dụng chung cho tất cả nhân viên trong batch */
+        private Integer dependents;
     }
 
     @Data
     public static class ApproveSalaryRequest {
         // no body needed; approved by current user
+    }
+
+    @Data
+    public static class BulkApproveSalaryRequest {
+        private List<Long> salaryIds;
     }
 
     @Data
@@ -49,13 +97,16 @@ public class HrDtos {
         private Long userId;
         private String userFullName;
         private String department;
+        private String division;
         private String position;
         private Long baseSalary;
-        private Double socialInsuranceRate;
-        private Long socialInsuranceSalary;
+        private Long insuranceSalary;
+        private Boolean insuranceExempt;
+        private Long allowance;
+        private List<AllowanceItemDto> allowances;
         private Long bonus;
-        private Long mealAllowance;
-        private Long transportAllowance;
+        private Boolean bonusTaxable;
+        private Integer dependents;
         private String status;
         private String rejectReason;
         private Long createdAt;
@@ -64,12 +115,222 @@ public class HrDtos {
         private String approvedByName;
     }
 
+    /**
+     * LƯƠNG HIỆN HÀNH + PHIẾU LƯƠNG MỚI ĐANG CHỜ DUYỆT của một nhân viên.
+     *
+     * <p>Trang "Nhân viên" của OWNER cần cả hai để dựng màn hình so sánh
+     * (card lương cũ bên trái, card lương mới bên phải). Gộp vào một lượt gọi
+     * thay vì bắt FE gọi hai API rồi tự ghép — hai lần gọi có thể rơi vào hai
+     * thời điểm khác nhau và hiển thị lệch nhau.
+     *
+     * <ul>
+     *   <li>{@code current} — bản ghi APPROVED mới nhất; null nếu chưa từng
+     *       được duyệt lương lần nào.</li>
+     *   <li>{@code pending} — bản ghi PENDING mới nhất; null nếu không có
+     *       phiếu nào đang chờ.</li>
+     * </ul>
+     */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SalaryOverviewDto {
+        private Long userId;
+        private String userFullName;
+        private SalaryDto current;
+        private SalaryDto pending;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SalaryBreakdownDto {
+        private Long userId;
+        private String userFullName;
+        private String department;
+        private String division;
+        private String position;
+        private String status;            // PENDING | APPROVED | REJECTED — trạng thái bản ghi lương hiện hành
+
+        // ── Lương đã nhập (SUPER_ACCOUNTANT nhập NET thực nhận, không gồm phụ cấp/thưởng) ──
+        private Long baseSalary;          // Lương NET thực nhận DÙNG ĐỂ TÍNH (đã prorate theo giờ nếu là Xưởng)
+        private Long standardBaseSalary;  // Lương NET chuẩn đã nhập khi đủ công (trước khi prorate theo giờ)
+        private Long allowance;           // TỔNG phụ cấp
+        private List<AllowanceItemDto> allowances; // Chi tiết từng khoản phụ cấp (nhãn + tiền + taxable)
+        private Long bonus;               // Thưởng GỐC đã nhập (trước khi nhân KPI)
+        private Long effectiveBonus;      // Thưởng THỰC LĨNH = bonus × KPI%
+        private Boolean bonusTaxable;     // Thưởng có tính vào thu nhập chịu thuế không
+        private Integer dependents;       // Số người phụ thuộc dùng để tính giảm trừ gia cảnh
+
+        /**
+         * LƯƠNG KHOÁN THEO HỢP ĐỒNG BÊN THỨ BA (hiện chỉ Bảo vệ xưởng).
+         *
+         * <p>TRUE nghĩa là mọi con số bảo hiểm / thuế / phụ cấp trong DTO này đều
+         * bằng 0 một cách CÓ CHỦ ĐÍCH, không phải do thiếu dữ liệu. FE dựa vào cờ
+         * này để ẩn hẳn các dòng đó thay vì hiển thị "0đ" gây hiểu nhầm là chưa
+         * khai báo hồ sơ bảo hiểm.
+         */
+        private Boolean flatContract;
+
+        // ── THÂM NIÊN ─────────────────────────────────────────────────────────
+        //   seniorityAllowance ĐÃ nằm trong `allowance`/`allowances` (một dòng
+        //   phụ cấp như mọi khoản khác). Ba field dưới đây tách ra để FE hiện
+        //   được "6 năm — 7%" mà không phải parse ngược từ nhãn.
+        /** Ngày vào làm việc (epoch millis) — null nếu chưa khai báo. */
+        private Long workStartDate;
+        /** Mốc chốt thâm niên = ngày hoàn tất chấm công của kỳ (epoch millis). */
+        private Long seniorityReferenceDate;
+        /** Số năm thâm niên TRÒN tại kỳ lương này. */
+        private Integer seniorityYears;
+        /** % phụ cấp thâm niên (0, hoặc 2..10). */
+        private Integer seniorityPercent;
+        /** Tiền phụ cấp thâm niên = lương cơ bản chuẩn × %. */
+        private Long seniorityAllowance;
+
+        // ── Phân loại phần chịu thuế / không chịu thuế (phụ cấp + thưởng) ──────
+        private Long taxableAdditions;    // Tổng phụ cấp/thưởng CÓ tính thuế TNCN
+        private Long nonTaxableAdditions; // Tổng phụ cấp/thưởng KHÔNG tính thuế (cộng thẳng)
+
+        // ── KPI & công thực tế ────────────────────────────────────────────────
+        private Double kpiPercent;        // Tỷ lệ KPI đạt được (thang 100) — dùng nhân vào thưởng
+        private Boolean hourlyBased;      // true nếu lương tính theo giờ (nhân viên Xưởng/Sản xuất)
+        private Double standardWorkHours; // Số giờ công chuẩn trong tháng (208) — chỉ dùng khi hourlyBased
+        private Double actualWorkHours;   // Số giờ công thực tế trong tháng — chỉ dùng khi hourlyBased
+
+        // ── Lương chia theo NGÀY CÔNG (bộ phận Xưởng sản xuất) ────────────────
+        private Boolean attendanceProrated; // true nếu lương đã chia theo ngày công thực tế
+        private Double standardWorkdays;    // Công chuẩn 1 tháng (26)
+        private Double actualWorkdays;      // Công thực tế lấy từ bảng chấm công (VD 22.64)
+        private Long dailyRate;             // Đơn giá 1 ngày công = lương chuẩn / 26 (đã làm tròn về đồng)
+        private Integer payrollMonth;       // Kỳ lương dùng để lấy công thực tế
+        private Integer payrollYear;
+
+        // ── GROSS ──────────────────────────────────────────────────────────────
+        private Long grossSalary;         // Lương GROSS TỔNG (gồm mọi khoản, đã gross-up phần chịu thuế)
+        // Mức lương đóng thuế/bảo hiểm đã nhập (căn cứ đóng BH — bảo hiểm tính cố định trên mức này)
+        private Long insuranceSalary;
+
+        private boolean insuranceExempt;
+
+        // ── Bảo hiểm NGƯỜI LAO ĐỘNG đóng (10.5% trên insuranceSalary) — breakdown ──
+        private Long employeeSocialInsurance;       // BHXH 8%
+        private Long employeeHealthInsurance;       // BHYT 1.5%
+        private Long employeeUnemploymentInsurance; // BHTN 1%
+        private Long employeeInsuranceTotal;        // 10.5%
+
+        // ── Bảo hiểm DOANH NGHIỆP đóng (21.5% trên insuranceSalary) — breakdown ──
+        private Long employerSocialInsurance;       // BHXH 17%
+        private Long employerAccidentInsurance;     // BH TNLĐ-BNN 0.5%
+        private Long employerHealthInsurance;       // BHYT 3%
+        private Long employerUnemploymentInsurance; // BHTN 1%
+        private Long employerInsuranceTotal;        // 21.5%
+
+        // ── Thuế TNCN ──────────────────────────────────────────────────────────
+        private Long preTaxIncome;        // Thu nhập trước thuế = GROSS - bảo hiểm NLĐ
+        private Long personalDeduction;   // Giảm trừ bản thân (15.5tr)
+        private Long dependentDeduction;  // Giảm trừ người phụ thuộc (6.2tr × n)
+        private Long taxableIncome;       // Thu nhập chịu thuế
+        private Long personalIncomeTax;   // Tổng thuế TNCN
+        private List<PitBracketDto> pitBrackets; // Chi tiết thuế theo từng bậc
+
+        // ── Tổng hợp ─────────────────────────────────────────────────────────
+        private Long netSalary;           // Lương thực nhận CUỐI CÙNG, ĐÃ làm tròn hàng nghìn
+        private Long netSalaryExact;      // Số TẠM TÍNH trước khi làm tròn (còn lẻ tới đồng)
+        private Long totalCost;           // Tổng chi phí doanh nghiệp = GROSS + BH doanh nghiệp đóng
+
+        /**
+         * TÀI XẾ — Thưởng theo đơn hàng (motorbike + truck) đã cộng vào {@code bonus}.
+         * FE tách ra hiển thị dòng "Thưởng đơn hàng" trước dòng "Thưởng KPI" cho tài xế.
+         */
+        private Long driverOrderBonus;
+
+        /** Chi tiết thưởng đơn hàng tách theo loại xe — dùng cho FE render 3 dòng. */
+        private DriverOrderBonusDto driverOrderBonusDetail;
+
+        /**
+         * Chi tiết các khoản thưởng IMPORT từ Excel "Thưởng theo tháng" — mỗi khoản
+         * là 1 nhãn riêng (VD "Chuyên cần", "Tháng 13"…) để FE render THÀNH TỪNG DÒNG
+         * thay vì gộp chung vào "Thưởng KPI". {@code bonusItemsTotal} = tổng số tiền
+         * của các dòng này (đã KHÔNG nhân KPI% — thưởng chuyên cần không phụ thuộc KPI).
+         */
+        private java.util.List<BonusItemDto> bonusItems;
+        private Long bonusItemsTotal;
+
+        /**
+         * Phần thưởng KPI thuần (bonusInput × kpiPercent), tách khỏi imported bonus.
+         * FE render dòng "Thưởng KPI — đạt X%" dựa trên trường này, không dùng
+         * {@code effectiveBonus} nữa (vì {@code effectiveBonus} đang gộp cả imported
+         * để tương thích ngược).
+         */
+        private Long effectiveBonusKpiOnly;
+    }
+
+    /** Một khoản thưởng import theo tháng — có label riêng để render 1 dòng. */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BonusItemDto {
+        private String label;
+        private Long amount;
+    }
+
+    /** Chi tiết thưởng đơn hàng của tài xế — tách theo loại xe (moto/truck). */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class DriverOrderBonusDto {
+        /** Số lượt xe máy trong tháng. */
+        private Integer motorbikeTrips;
+        /** Thưởng xe máy = motorbikeTrips × đơn giá thưởng xe máy. */
+        private Long motorbikeAmount;
+        /** Số lượt xe tải trong tháng. */
+        private Integer truckTrips;
+        /** Thưởng xe tải = truckTrips × đơn giá thưởng xe tải. */
+        private Long truckAmount;
+        /** Tổng = motorbikeAmount + truckAmount. */
+        private Long totalAmount;
+    }
+
+    /** Chi tiết thuế TNCN của một bậc lũy tiến. */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class PitBracketDto {
+        private Integer ratePercent;      // 5, 10, 20, 30, 35
+        private Long incomeInBracket;     // phần thu nhập tính thuế rơi vào bậc này
+        private Long taxInBracket;        // tiền thuế của riêng bậc này
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SalaryBreakdownSummaryDto {
+        private List<SalaryBreakdownDto> rows;
+        // ── Tổng cộng tất cả nhân viên ───────────────────────────────────────
+        private Long totalBaseSalary;
+        private Long totalAllowance;
+        private Long totalBonus;
+        private Long totalEmployerInsurance;
+        private Long totalEmployeeInsurance;
+        private Long totalPersonalIncomeTax;
+        private Long totalNetSalary;
+        private Long totalCost;
+    }
+
     // ── Employee Info ─────────────────────────────────────────────────────────
 
     @Data
     public static class UpdateEmployeeInfoRequest {
         private String department;
+        private String division;
         private String position;
+
+        /**
+         * NGÀY VÀO LÀM VIỆC (epoch millis) — căn cứ tính thâm niên.
+         *
+         * <p>{@code null} = KHÔNG ĐỔI (giữ nguyên giá trị đang có), khớp với cách
+         * xử lý của 3 field trên. Muốn XOÁ ngày vào làm thì gửi {@code 0}.
+         */
+        private Long workStartDate;
     }
 
     // ── Leave ─────────────────────────────────────────────────────────────────
@@ -144,48 +405,5 @@ public class HrDtos {
         private String fullName;
         private String department;
         private String position;
-    }
-
-    // ── Payslip ───────────────────────────────────────────────────────────────
-
-    @Data
-    @Builder
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class PayslipDto {
-        private Long userId;
-        private String userFullName;
-        private String department;
-        private String position;
-        private int month;
-        private int year;
-        private Long periodStart;
-        private Long periodEnd;
-
-        // Lương cơ bản & phụ cấp
-        private Long baseSalary;
-        private Long mealAllowance;
-        private Long transportAllowance;
-        private Long bonus;
-
-        // Công
-        private Double standardWorkdays;   // công chuẩn (T2-T6=1, T7=0.5)
-        private Double actualWorkdays;     // công thực tế (trừ nghỉ ko phép)
-        private Double unpaidLeaveDays;    // ngày nghỉ không lương
-        private Double paidLeaveDays;      // ngày nghỉ có lương
-
-        // OT
-        private Double otHours;            // tổng giờ OT
-        private Long otPay;               // tiền OT (150% lương giờ)
-
-        // BHXH
-        private Double socialInsuranceRate;
-        private Long socialInsuranceSalary;
-        private Long socialInsuranceAmount; // = socialInsuranceSalary * rate / 100
-
-        // Tổng
-        private Long grossSalary;          // lương gộp trước khấu trừ
-        private Long totalDeductions;      // tổng khấu trừ (BHXH)
-        private Long netSalary;            // thực nhận
     }
 }

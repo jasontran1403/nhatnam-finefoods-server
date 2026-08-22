@@ -1,6 +1,7 @@
 package com.nhatnam.server.restcontroller.admin;
 
 import com.nhatnam.server.dto.response.ApiResponse;
+import com.nhatnam.server.entity.Order;
 import com.nhatnam.server.enumtype.OrderStatus;
 import com.nhatnam.server.enumtype.PaymentStatus;
 import com.nhatnam.server.enumtype.StatusCode;
@@ -98,11 +99,16 @@ public class SaleKpiController {
                     .map(o -> nvl(o.getFinalAmount()))
                     .reduce(BigDecimal.ZERO, BigDecimal::add);
 
+            // Đơn đang xử lý còn phải thu — GỒM CẢ đơn đã thu một phần.
+            // Trước đây chỉ lọc UNPAID nên đơn PARTIAL rơi ra ngoài: không nằm ở
+            // "Đã thu", cũng không ở "Đang xử lý" hay "Còn nợ" — biến mất khỏi
+            // mọi card, khiến tổng không bao giờ khớp với bảng doanh số.
             BigDecimal processing = kpiOrders.stream()
                     .filter(o -> o.getStatus() != OrderStatus.COMPLETED
                             && o.getStatus() != OrderStatus.CANCELLED
                             && o.getStatus() != OrderStatus.FAILED
-                            && o.getPaymentStatus() == PaymentStatus.UNPAID)
+                            && (o.getPaymentStatus() == PaymentStatus.UNPAID
+                            || o.getPaymentStatus() == PaymentStatus.PARTIAL))
                     .map(o -> nvl(o.getFinalAmount()))
                     .reduce(BigDecimal.ZERO, BigDecimal::add);
 
@@ -132,7 +138,7 @@ public class SaleKpiController {
             // Lấy trước tên các user có kpiUserId > 0 để tránh N+1
             Set<Long> sellerIds = allOrders.stream()
                     .filter(o -> o.getKpiUserId() != null && o.getKpiUserId() > 0L)
-                    .map(o -> o.getKpiUserId())
+                    .map(Order::getKpiUserId)
                     .collect(Collectors.toSet());
 
             Map<Long, String> sellerNameMap = new HashMap<>();
@@ -179,7 +185,9 @@ public class SaleKpiController {
                     }
                 } else if (st != OrderStatus.CANCELLED && st != OrderStatus.FAILED) {
                     row.put("inProgress",  add(row, "inProgress",  amount));
-                    if (ps == PaymentStatus.UNPAID) {
+                    // Đơn thu MỘT PHẦN vẫn là tiền chưa thu xong — phải tính vào,
+                    // giống card "Đang xử lý" ở trên.
+                    if (ps == PaymentStatus.UNPAID || ps == PaymentStatus.PARTIAL) {
                         row.put("uncollected", add(row, "uncollected", amount));
                     }
                 }

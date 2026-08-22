@@ -19,6 +19,10 @@ public class DraftOrderResponse {
     private String customerEmail;
     private String shippingAddress;
 
+    /** Tỉnh/thành + phường/xã của địa chỉ giao — dùng khi tạo đơn thật từ nháp/hẹn giờ. */
+    private String provinceName;
+    private String wardName;
+
     // ── Người nhận ─────────────────────────────────────────────────────────
     private String receiverName;
     private String receiverPhone;

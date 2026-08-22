@@ -54,6 +54,19 @@ public class IngredientStockRowDto {
     // Meta
     private Long updatedAt;
 
+    /**
+     * MÀU TÌNH TRẠNG LÔ — mức ưu tiên hiển thị, gắt nhất thắng:
+     * <pre>
+     *   EXPIRED_OR_CRITICAL  (đỏ cam) — có lô đã hết hạn HOẶC sắp hết hạn &lt; 7 ngày
+     *   NEAR_EXPIRY          (vàng)   — có lô sắp hết hạn trong vòng 1 tháng
+     *   NEWLY_STOCKED        (xanh dương nhạt) — có lô mới nhập &lt; 1 tháng
+     *   NONE                 (trắng)  — không lô nào dính điều kiện
+     * </pre>
+     * Khác {@link #expiryBadge} (chỉ xét hết hạn): trường này gộp cả "mới nhập"
+     * và tách riêng mức "đã/sắp hết hạn gắt" để tô màu theo yêu cầu quản lý kho.
+     */
+    private String freshnessBadge;
+
     @Data
     @Builder
     @NoArgsConstructor
@@ -63,5 +76,6 @@ public class IngredientStockRowDto {
         private BigDecimal quantity;    // số lượng còn lại của lô
         private BigDecimal costPrice;   // giá vốn đơn vị (null = không theo dõi)
         private BigDecimal totalCost;   // quantity * costPrice
+        private Long importedAt;        // thời điểm nhập lô (createdAt) — để biết "mới nhập"
     }
 }

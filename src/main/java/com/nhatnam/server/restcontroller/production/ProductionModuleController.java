@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.util.*;
 import com.nhatnam.server.entity.MaterialVendor;
 import com.nhatnam.server.repository.MaterialVendorRepository;
@@ -149,6 +150,16 @@ public class ProductionModuleController {
         return ApiResponse.ok(service.listMaintenance(y, machineId));
     }
 
+    /**
+     * Khoảng thời gian các máy đang/đã bị chiếm bởi bước sản xuất (WorkOrder/Batch)
+     * trong khoảng [fromMs, toMs) — dùng để vẽ sọc chéo xanh dương trên Gantt máy.
+     */
+    @GetMapping("/api/owner/production/machine-occupancy")
+    public ApiResponse<List<MachineOccupancyDto>> listMachineOccupancy(
+            @RequestParam long fromMs, @RequestParam long toMs) {
+        return ApiResponse.ok(service.listMachineOccupancy(fromMs, toMs));
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // FACTORY WORKER ENDPOINTS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -176,11 +187,26 @@ public class ProductionModuleController {
 
     // ── Lập phương án ─────────────────────────────────────────────────────────
 
-    @PostMapping("/api/factory/work-orders/{id}/plan")
-    public ApiResponse<WorkOrderPlanDto> submitPlan(@PathVariable Long id,
-                                                    @RequestBody CreateWorkOrderPlanRequest req,
-                                                    Authentication auth) {
-        return ApiResponse.ok(service.submitPlan(id, req, auth.getName()));
+    /**
+     * Preview phương án theo biến thể sản xuất — KHÔNG lưu, chỉ tính toán để hiển thị
+     * nguyên liệu từng mẻ/tổng + các bước trước khi nhân viên quyết định submit.
+     */
+    @GetMapping("/api/factory/work-orders/{id}/plan-preview")
+    public ApiResponse<PlanPreviewDto> previewPlanByRecipe(@PathVariable Long id,
+                                                            @RequestParam Long recipeId,
+                                                            @RequestParam BigDecimal requestedQty) {
+        return ApiResponse.ok(service.previewPlanByRecipe(id, recipeId, requestedQty));
+    }
+
+    /**
+     * Lập phương án theo biến thể sản xuất (THAY THẾ cách nhập tay cũ).
+     * Chỉ cần chọn 1 biến thể (đúng FactoryProduct của lệnh) + nhập sản lượng cần sản xuất.
+     */
+    @PostMapping("/api/factory/work-orders/{id}/plan-by-recipe")
+    public ApiResponse<WorkOrderPlanDto> submitPlanByRecipe(@PathVariable Long id,
+                                                             @RequestBody SubmitPlanByRecipeRequest req,
+                                                             Authentication auth) {
+        return ApiResponse.ok(service.submitPlanByRecipe(id, req, auth.getName()));
     }
 
     // ── Bắt đầu lệnh ─────────────────────────────────────────────────────────
@@ -198,6 +224,14 @@ public class ProductionModuleController {
         return ApiResponse.ok(service.startBatch(req, auth.getName()));
     }
 
+    @PostMapping("/api/factory/batches/{batchId}/steps/{stepSeq}/start")
+    public ApiResponse<BatchStepDto> startStep(@PathVariable Long batchId,
+                                               @PathVariable int stepSeq,
+                                               @RequestBody(required = false) StartStepRequest req,
+                                               Authentication auth) {
+        return ApiResponse.ok(service.startStep(batchId, stepSeq, req, auth.getName()));
+    }
+
     @PostMapping("/api/factory/batches/{batchId}/steps/{stepSeq}/complete")
     public ApiResponse<BatchStepDto> completeStep(@PathVariable Long batchId,
                                                   @PathVariable int stepSeq,
@@ -211,6 +245,22 @@ public class ProductionModuleController {
                                                          @RequestBody CompleteBatchRequest req,
                                                          Authentication auth) {
         return ApiResponse.ok(service.completeBatch(batchId, req, auth.getName()));
+    }
+
+    // ── Công đoạn cấp lệnh (bước chung / bước riêng) ─────────────────────────
+
+    @PostMapping("/api/factory/work-order-steps/{stepId}/start")
+    public ApiResponse<WorkOrderStepRunDto> startStageRun(@PathVariable Long stepId,
+                                                          @RequestBody(required = false) StartStageRunRequest req,
+                                                          Authentication auth) {
+        return ApiResponse.ok(service.startStageRun(stepId, req, auth.getName()));
+    }
+
+    @PostMapping("/api/factory/work-order-steps/{stepId}/complete")
+    public ApiResponse<WorkOrderStepRunDto> completeStageRun(@PathVariable Long stepId,
+                                                             @RequestBody CompleteStageRunRequest req,
+                                                             Authentication auth) {
+        return ApiResponse.ok(service.completeStageRun(stepId, req, auth.getName()));
     }
 
     @PostMapping("/api/factory/batches/{batchId}/cancel")
@@ -267,6 +317,11 @@ public class ProductionModuleController {
         return ApiResponse.ok(service.saveMachine(null, req));
     }
 
+    @GetMapping("/api/factory/machines/{id}/metrics")
+    public ApiResponse<MachineMetricsDto> getMachineMetrics(@PathVariable Long id) {
+        return ApiResponse.ok(service.getMachineMetrics(id));
+    }
+
     // ── Maintenance (Factory) ─────────────────────────────────────────────────
 
     @GetMapping("/api/factory/maintenance")
@@ -309,6 +364,18 @@ public class ProductionModuleController {
             @RequestParam("files") List<MultipartFile> files) {
         return ApiResponse.ok(uploadMultiple(files, f -> {
             try { return fileStorage.saveBatchStepImage(batchId, stepSeq, f); }
+            catch (IOException e) { throw new RuntimeException(e); }
+        }));
+    }
+
+    /** Upload ảnh xác nhận 1 lần chạy công đoạn (bước chung/riêng) */
+    @PostMapping(value = "/api/upload/production/work-order-step",
+            consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ApiResponse<List<String>> uploadWorkOrderStepImages(
+            @RequestParam Long stepId,
+            @RequestParam("files") List<MultipartFile> files) {
+        return ApiResponse.ok(uploadMultiple(files, f -> {
+            try { return fileStorage.saveWorkOrderStepImage(stepId, f); }
             catch (IOException e) { throw new RuntimeException(e); }
         }));
     }
@@ -404,9 +471,12 @@ public class ProductionModuleController {
             List<MaterialVendor.VendorType> typeList = java.util.Arrays.stream(types.split(","))
                     .map(t -> MaterialVendor.VendorType.valueOf(t.trim()))
                     .collect(java.util.stream.Collectors.toList());
+            // Coi vendorType = NULL như MATERIAL (NCC cũ chưa có loại) → chỉ gộp khi
+            // đang lọc bao gồm MATERIAL, tránh lẫn sang MACHINE/REPAIR.
+            boolean includeNull = typeList.contains(MaterialVendor.VendorType.MATERIAL);
             vendors = q.isBlank()
-                    ? materialVendorRepository.findByVendorTypeInAndActiveTrueOrderByNameAsc(typeList)
-                    : materialVendorRepository.findByNameContainingIgnoreCaseAndVendorTypeInAndActiveTrue(q, typeList);
+                    ? materialVendorRepository.findActiveByTypesOrNull(typeList, includeNull)
+                    : materialVendorRepository.findActiveByNameAndTypesOrNull(q, typeList, includeNull);
         } else {
             vendors = q.isBlank()
                     ? materialVendorRepository.findByActiveTrueOrderByNameAsc()
@@ -419,6 +489,8 @@ public class ProductionModuleController {
             m.put("name", v.getName());
             m.put("contactPerson", v.getContactPerson());
             m.put("contactPhone", v.getContactPhone());
+            m.put("address", v.getAddress());
+            m.put("taxCode", v.getTaxCode());
             m.put("vendorType", v.getVendorType() != null ? v.getVendorType().name() : "MATERIAL");
             result.add(m);
         }
@@ -437,11 +509,14 @@ public class ProductionModuleController {
                 .name(name)
                 .contactPerson(body.getOrDefault("contactPerson", ""))
                 .contactPhone(body.getOrDefault("contactPhone", ""))
+                .address(body.getOrDefault("address", ""))
+                .taxCode(body.getOrDefault("taxCode", ""))
                 .vendorType(vtype)
                 .active(true).build());
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", v.getId()); m.put("name", v.getName());
         m.put("contactPerson", v.getContactPerson()); m.put("contactPhone", v.getContactPhone());
+        m.put("address", v.getAddress()); m.put("taxCode", v.getTaxCode());
         m.put("vendorType", v.getVendorType().name());
         return ApiResponse.ok(m);
     }
@@ -456,10 +531,13 @@ public class ProductionModuleController {
         if (!name.isBlank()) v.setName(name);
         v.setContactPerson(body.getOrDefault("contactPerson", v.getContactPerson()));
         v.setContactPhone(body.getOrDefault("contactPhone", v.getContactPhone()));
+        v.setAddress(body.getOrDefault("address", v.getAddress()));
+        v.setTaxCode(body.getOrDefault("taxCode", v.getTaxCode()));
         materialVendorRepository.save(v);
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", v.getId()); m.put("name", v.getName());
         m.put("contactPerson", v.getContactPerson()); m.put("contactPhone", v.getContactPhone());
+        m.put("address", v.getAddress()); m.put("taxCode", v.getTaxCode());
         return ApiResponse.ok(m);
     }
 

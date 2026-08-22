@@ -55,6 +55,8 @@ public class WarehouseDTO {
     @Data public static class TransferRequest {
         private Long fromWarehouseId;
         private Long toWarehouseId;
+        private Long toProductionFactoryId;   // ← chuyển sang kho NGUYÊN LIỆU xưởng; nếu set thì bỏ qua toWarehouseId
+        private Long toFinishedGoodsFactoryId; // ← chuyển sang kho THÀNH PHẨM xưởng (Mục 1); ưu tiên sau toProductionFactoryId
         private String note;
         private List<String> imageUrls;
         private List<TransferItemRequest> items;
@@ -76,7 +78,26 @@ public class WarehouseDTO {
 
     @Data public static class AdjustItemRequest {
         private Long ingredientId;
+
+        /**
+         * CHẾ ĐỘ CŨ (tương thích ngược): điều chỉnh theo TỔNG số thực tế.
+         * Chỉ dùng khi {@link #lots} rỗng/null.
+         */
         private BigDecimal physicalQty;
+
+        /**
+         * CHẾ ĐỘ MỚI: điều chỉnh theo từng LÔ. Tổng tồn của nguyên liệu sẽ được
+         * tính lại = tổng số lượng các lô sau khi điều chỉnh.
+         */
+        private List<AdjustLotRequest> lots;
+    }
+
+    /** Một dòng lô trong phiếu điều chỉnh. {@code lotId == null} ⇒ TẠO LÔ MỚI. */
+    @Data public static class AdjustLotRequest {
+        /** null = lô mới; có giá trị = sửa lô đang có. */
+        private Long lotId;
+        private BigDecimal quantity;
+        private LocalDate expiryDate;
     }
 
     // ── Response ────────────────────────────────────────────────────────────
@@ -95,12 +116,22 @@ public class WarehouseDTO {
         private String imageUrl;
         private BigDecimal stockQuantity;
         private List<ExpiryInfo> expiryList;
+        /** Màu tình trạng lô: EXPIRED_OR_CRITICAL / NEAR_EXPIRY / NEWLY_STOCKED / NONE. */
+        private String freshnessBadge;
     }
 
     @Data public static class ExpiryInfo {
         private Long id;
         private LocalDate expiryDate;
         private BigDecimal quantity;
+        /** Thời điểm nhập lô (epoch ms) — null nếu là dòng tồn chưa gắn lô. */
+        private Long importedAt;
+        /** Đơn giá vốn của lô. */
+        private BigDecimal costPrice;
+        /** Giá vốn cả lô = quantity × costPrice. */
+        private BigDecimal lotCost;
+        /** false = dòng bù phần tồn chưa gắn lô (hiển thị "không rõ"). */
+        private Boolean tracked;
     }
 
     @Data public static class ReceiptResponse {

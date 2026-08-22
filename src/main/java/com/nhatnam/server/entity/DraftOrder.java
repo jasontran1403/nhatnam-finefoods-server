@@ -49,6 +49,14 @@ public class DraftOrder {
     @Column(name = "shipping_address", columnDefinition = "TEXT")
     private String shippingAddress;
 
+    /** TỈNH/THÀNH của địa chỉ giao — chọn từ danh mục, giữ để tạo đơn thật + phiếu đặt hàng. */
+    @Column(name = "province_name", length = 120)
+    private String provinceName;
+
+    /** PHƯỜNG/XÃ/ĐẶC KHU của địa chỉ giao — chọn từ danh mục. */
+    @Column(name = "ward_name", length = 150)
+    private String wardName;
+
     @Column(name = "notes", columnDefinition = "TEXT")
     private String notes;
 

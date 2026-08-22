@@ -85,7 +85,17 @@ public class FifoDeductService {
                 deductionRepository.save(OrderStockDeduction.builder()
                         .orderId(orderId)
                         .ingredientStock(stock)
-                        .ingredientExpiry(lot.getQuantity().compareTo(BigDecimal.ZERO) > 0 ? lot : null)
+                        // LUÔN gắn lô, kể cả khi lô vừa bị trừ về 0.
+                        //
+                        //   Bản cũ ghi null cho lô hết hàng. Hậu quả: lúc huỷ đơn,
+                        //   restoreStock() thấy ingredientExpiry == null nên chỉ
+                        //   cộng lại TỒN TỔNG mà không cộng lại LÔ ⇒ tồn tổng nhiều
+                        //   hơn tổng lô, và phần chênh đó vĩnh viễn không xuất được
+                        //   vì FIFO trừ theo lô.
+                        //
+                        //   Lô hết hàng KHÔNG bị xoá (giữ quantity = 0 vì FK từ
+                        //   OrderStockDeduction), nên tham chiếu tới nó vẫn hợp lệ.
+                        .ingredientExpiry(lot)
                         .expiryDate(lot.getExpiryDate())
                         .costPrice(lot.getCostPrice())
                         .quantity(take)
@@ -96,9 +106,19 @@ public class FifoDeductService {
         }
 
         if (remaining.compareTo(BigDecimal.ZERO) > 0) {
-            log.warn("[FIFO] {} còn {} chưa khớp lô HSD tại kho {}",
+            // LỆCH SỐ LIỆU: tồn tổng cho phép trừ nhiều hơn số thực có trong các lô.
+            //
+            //   Người gọi đã (hoặc sắp) trừ TỒN TỔNG đủ `needed`, nhưng các lô chỉ
+            //   gánh được tới đây. Bỏ qua phần thiếu ⇒ tổng lô còn nhiều hơn tồn
+            //   tổng, và mỗi lần xuất kho lại nới rộng khoảng lệch.
+            //
+            //   Dùng ERROR chứ không WARN: đây là hỏng dữ liệu tồn kho, không phải
+            //   tình huống vận hành bình thường, phải nổi lên trong cảnh báo log.
+            log.error("[FIFO] LỆCH TỒN KHO — '{}' tại kho '{}': cần trừ {} nhưng các lô "
+                            + "chỉ còn {}. Tồn tổng đang LỚN HƠN tổng lô. "
+                            + "Cần kiểm kê và tạo lô bù cho phần chênh.",
                     ingredientName != null ? ingredientName : "ingId=" + ingredientId,
-                    remaining, warehouse.getName());
+                    warehouse.getName(), needed, needed.subtract(remaining));
             if (avgCost.compareTo(BigDecimal.ZERO) > 0)
                 costDeducted = costDeducted.add(
                         remaining.multiply(avgCost).setScale(2, RoundingMode.HALF_UP));

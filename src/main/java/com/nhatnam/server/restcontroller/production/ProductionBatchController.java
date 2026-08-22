@@ -50,11 +50,35 @@ public class ProductionBatchController {
         return ApiResponse.ok(productionService.listBatches(page, size, userId));
     }
 
-    // ── Factory Worker: read-only data ───────────────────────────────────────
+    // ── Factory Worker: quản lý biến thể sản xuất (tạo/sửa/xem) ──────────────
     @GetMapping("/api/factory/recipes")
     public ApiResponse<List<ProductionRecipeDto>> listRecipesForWorker(
             @RequestParam(required = false) Long productId) {
         return ApiResponse.ok(productionService.listRecipes(productId));
+    }
+
+    @GetMapping("/api/factory/recipes/{id}")
+    public ApiResponse<ProductionRecipeDto> getRecipeForWorker(@PathVariable Long id) {
+        return ApiResponse.ok(productionService.getRecipe(id));
+    }
+
+    @PostMapping("/api/factory/recipes")
+    public ApiResponse<ProductionRecipeDto> createRecipe(@RequestBody SaveRecipeRequest req,
+                                                           Authentication auth) {
+        return ApiResponse.ok(productionService.saveRecipe(null, req, auth.getName()));
+    }
+
+    @PutMapping("/api/factory/recipes/{id}")
+    public ApiResponse<ProductionRecipeDto> updateRecipe(@PathVariable Long id,
+                                                           @RequestBody SaveRecipeRequest req,
+                                                           Authentication auth) {
+        return ApiResponse.ok(productionService.saveRecipe(id, req, auth.getName()));
+    }
+
+    @PatchMapping("/api/factory/recipes/{id}/toggle")
+    public ApiResponse<Void> toggleRecipeForWorker(@PathVariable Long id, @RequestParam boolean active) {
+        productionService.toggleRecipe(id, active);
+        return ApiResponse.ok(null);
     }
 
     @GetMapping("/api/factory/products")
@@ -65,6 +89,11 @@ public class ProductionBatchController {
     @GetMapping("/api/factory/materials")
     public ApiResponse<List<FactoryMaterialDto>> listMaterialsForWorker() {
         return ApiResponse.ok(productionService.listMaterials(true));
+    }
+
+    @PostMapping("/api/factory/materials")
+    public ApiResponse<FactoryMaterialDto> createMaterialsForWorker(@RequestBody SaveFactoryMaterialRequest request, Authentication auth) {
+        return ApiResponse.ok(productionService.createMaterial(request));
     }
 
     private Long getUserId(Authentication auth) {

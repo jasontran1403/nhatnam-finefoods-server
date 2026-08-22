@@ -14,6 +14,10 @@ public class SaveDraftRequest {
     private String customerEmail;
     private String shippingAddress;
 
+    /** Tỉnh/thành + phường/xã của địa chỉ giao — chọn từ danh mục (giữ để tạo đơn thật). */
+    private String provinceName;
+    private String wardName;
+
     // ── Người nhận ─────────────────────────────────────────────────────────
     private String receiverName;
     private String receiverPhone;

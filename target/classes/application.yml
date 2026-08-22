@@ -25,3 +25,7 @@ application:
       expiration: 604800000
       refresh-token:
         expiration: 604800000
+
+app:
+  attendance:
+    upload-dir: ~/Desktop/nhatnam-finefoods-storage/attendance

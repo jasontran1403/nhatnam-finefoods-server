@@ -35,6 +35,14 @@ public class ProductionPlan {
     @Column(name = "product_name", nullable = false, length = 200)
     private String productName;
 
+    /** Xưởng xử lý kế hoạch (nullable để tương thích dữ liệu cũ; backfill về Q9). */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "production_factory_id")
+    private ProductionFactory productionFactory;
+
+    @Column(name = "production_factory_name", length = 200)
+    private String productionFactoryName;
+
     /** Sản lượng mục tiêu */
     @Column(name = "target_qty", nullable = false, precision = 12, scale = 2)
     private BigDecimal targetQty;

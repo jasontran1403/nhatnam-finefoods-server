@@ -27,6 +27,9 @@ public class CreateUserRequest {
 
     private String phoneNumber;
 
+    /** Ngày tháng năm sinh (epoch millis, 00:00 giờ VN). Tuỳ chọn. */
+    private Long dateOfBirth;
+
     /**
      * Role chính (legacy — vẫn giữ để tương thích).
      * Nếu roles không null/rỗng thì roles sẽ được dùng thay thế.

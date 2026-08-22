@@ -49,6 +49,15 @@ public class InvoiceDTO {
     private String companyAddress;
     private String receiverName;
 
+    /**
+     * TỈNH/THÀNH và PHƯỜNG/XÃ của địa chỉ giao — chọn từ danh mục.
+     *
+     * <p>Dùng để ghép địa chỉ hiển thị đầy đủ trên phiếu: "{địa chỉ}, {phường}, {tỉnh}".
+     * Có thể null với đơn/nháp cũ hoặc trường hợp "Nhận tại kho".
+     */
+    private String provinceName;
+    private String wardName;
+
     /** ==================== FIELD MỚI ==================== */
     private Long deliveryDatetime;        // Timestamp ngày giờ giao hàng
 

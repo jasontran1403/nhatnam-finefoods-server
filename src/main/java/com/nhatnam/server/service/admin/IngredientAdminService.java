@@ -39,6 +39,11 @@ public class IngredientAdminService {
     private static final int DAYS_DANGER  = 30;
     private static final int DAYS_WARNING = 90;
 
+    /** Dưới 7 ngày tới hạn = cực gấp (đỏ cam). */
+    private static final int DAYS_CRITICAL = 7;
+    /** Nhập trong vòng 30 ngày = hàng mới (xanh dương nhạt). */
+    private static final int DAYS_NEWLY_STOCKED = 30;
+
     @Transactional(readOnly = true)
     public List<IngredientStockRowDto> getStockRows(Long warehouseId, String q) {
         LocalDate today            = LocalDate.now();
@@ -120,8 +125,16 @@ public class IngredientAdminService {
                         .quantity(e.getQuantity())
                         .costPrice(e.getCostPrice())
                         .totalCost(lotCost)
+                        .importedAt(e.getCreatedAt())
                         .build();
             }).collect(Collectors.toList());
+
+            // --- Màu tình trạng lô, ưu tiên gắt nhất trước ---
+            //   Chỉ xét các lô CÒN HÀNG (đã lọc quantity > 0 ở trên). Khi lô đỏ
+            //   xuất hết thì vòng sau nó không còn trong danh sách nữa, badge tự
+            //   rớt xuống mức thấp hơn — đúng như mô tả "xuất hết lô 1 thì thành
+            //   vàng, xuất hết lô 2 thì thành xanh".
+            String freshnessBadge = computeFreshnessBadge(lots, today);
 
             Ingredient _ing = ingMap.get(s.getIngredientId());
             Long catId    = _ing != null ? _ing.getCategoryId() : null;
@@ -141,12 +154,52 @@ public class IngredientAdminService {
                     .nearExpiryQuantity(nearQty)
                     .daysUntilExpiry(daysUntil)
                     .expiryBadge(badge)
+                    .freshnessBadge(freshnessBadge)
                     .totalCostValue(totalCostValue)
                     .lots(lotDtos)
                     .updatedAt(s.getUpdatedAt())
                     .build());
         }
         return result;
+    }
+
+    /**
+     * MÀU TÌNH TRẠNG của một nguyên liệu, xét trên các lô CÒN HÀNG.
+     *
+     * <p>Ưu tiên gắt nhất thắng — một nguyên liệu vừa có lô hết hạn vừa có lô mới
+     * nhập thì hiện đỏ cam, vì rủi ro hết hạn cần xử lý trước. Khi lô gắt được
+     * xuất hết, lần tải sau nó không còn trong danh sách và badge tự rớt xuống
+     * mức nhẹ hơn.
+     *
+     * @param lots  các lô còn hàng (quantity &gt; 0) của nguyên liệu
+     * @param today mốc so sánh
+     */
+    private String computeFreshnessBadge(List<IngredientExpiry> lots, LocalDate today) {
+        boolean hasCritical = false;   // đã hết hạn hoặc < 7 ngày
+        boolean hasNear     = false;   // < 1 tháng
+        boolean hasNew      = false;   // mới nhập < 1 tháng
+
+        long newlyStockedFloorMs = today.minusDays(DAYS_NEWLY_STOCKED)
+                .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+
+        for (IngredientExpiry lot : lots) {
+            LocalDate exp = lot.getExpiryDate();
+            if (exp != null) {
+                long days = ChronoUnit.DAYS.between(today, exp);
+                // days < 0 = đã hết hạn; 0..6 = cực gấp. Cả hai vào mức đỏ cam.
+                if (days < DAYS_CRITICAL) hasCritical = true;
+                else if (days <= DAYS_DANGER) hasNear = true;
+            }
+            // "Mới nhập" xét theo thời điểm nhập lô, độc lập với hạn dùng.
+            if (lot.getCreatedAt() != null && lot.getCreatedAt() >= newlyStockedFloorMs) {
+                hasNew = true;
+            }
+        }
+
+        if (hasCritical) return "EXPIRED_OR_CRITICAL";
+        if (hasNear)     return "NEAR_EXPIRY";
+        if (hasNew)      return "NEWLY_STOCKED";
+        return "NONE";
     }
 
     public Long getDefaultWarehouseId() {

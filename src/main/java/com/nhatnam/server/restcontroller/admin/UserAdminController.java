@@ -347,8 +347,10 @@ public class UserAdminController {
             @RequestParam(required = false) String q,
             @RequestParam(required = false) Role role,
             @RequestParam(required = false) Boolean locked,
+            @RequestParam(defaultValue = "false") boolean includeDeleted,
+            @RequestParam(defaultValue = "false") boolean birthdaySort,
             @PageableDefault(size = 20, sort = "id", direction = Sort.Direction.DESC) Pageable pageable) {
-        return ApiResponse.ok(userService.list(q, role, locked, pageable));
+        return ApiResponse.ok(userService.list(q, role, locked, includeDeleted, birthdaySort, pageable));
     }
 
     @GetMapping("/{id}")
@@ -373,6 +375,37 @@ public class UserAdminController {
                                           @RequestParam boolean value) {
         String msg = value ? "Khóa user thành công" : "Mở khóa user thành công";
         return ApiResponse.ok(msg, userService.setLocked(id, value));
+    }
+
+    /**
+     * XOÁ MỀM nhân viên.
+     *
+     * <p>Không xoá cứng (user còn được tham chiếu ở đơn hàng, phiếu kho, log…).
+     * Thay vào đó: {@code deleted = true}, khoá tài khoản, thu hồi token, và gắn tiền tố
+     * {@code SOFT_DELETED_{id}_} vào username/email/SĐT → GIẢI PHÓNG các giá trị unique
+     * để có thể tạo lại nhân viên mới với đúng thông tin cũ.
+     */
+    @PreAuthorize("hasAnyRole('ADMIN','OWNER','SUPERADMIN','HR')")
+    @DeleteMapping("/{id}")
+    public ApiResponse<UserDto> softDelete(@PathVariable Long id, Authentication auth) {
+        String actor = auth != null ? auth.getName() : "system";
+        return ApiResponse.ok("Đã xoá nhân viên", userService.softDelete(id, actor));
+    }
+
+    /** Khôi phục nhân viên đã xoá mềm (nếu username/email/SĐT cũ chưa bị ai dùng mất) */
+    @PreAuthorize("hasAnyRole('ADMIN','OWNER','SUPERADMIN','HR')")
+    @PutMapping("/{id}/restore")
+    public ApiResponse<UserDto> restore(@PathVariable Long id) {
+        return ApiResponse.ok("Đã khôi phục nhân viên", userService.restore(id));
+    }
+
+    /** Danh sách nhân viên ĐÃ XOÁ */
+    @GetMapping("/deleted")
+    public ApiResponse<PageResponse<UserDto>> listDeleted(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        return ApiResponse.ok(userService.listDeleted(
+                org.springframework.data.domain.PageRequest.of(page, size)));
     }
 
     @PutMapping("/{id}/reset-password")

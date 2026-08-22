@@ -2,6 +2,7 @@ package com.nhatnam.server.service.serviceimpl;
 
 import com.nhatnam.server.dto.request.CreateIngredientRequest;
 import com.nhatnam.server.dto.response.IngredientResponse;
+import com.nhatnam.server.entity.FactoryProduct;
 import com.nhatnam.server.entity.Ingredient;
 import com.nhatnam.server.entity.IngredientStock;
 import com.nhatnam.server.entity.Warehouse;
@@ -18,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
@@ -29,6 +31,9 @@ public class IngredientServiceImpl implements IngredientService {
     private final IngredientRepository          ingredientRepository;
     private final IngredientStockRepository     ingredientStockRepository;
     private final WarehouseRepository           warehouseRepository;
+    // Cầu nối Ingredient → FactoryProduct: đồng bộ tên/đơn vị khi Ingredient đổi
+    // (xem comment ở FactoryProduct.ingredientId để biết lý do thêm liên kết này)
+    private final FactoryProductRepository      factoryProductRepository;
 
     // ── CREATE ──────────────────────────────────────────────────────
 
@@ -53,7 +58,7 @@ public class IngredientServiceImpl implements IngredientService {
                         .ingredientNameSnapshot(saved.getName())       // ← snapshot
                         .ingredientUnitSnapshot(saved.getUnit())       // ← snapshot
                         .warehouse(w)
-                        .stockQuantity(BigDecimal.valueOf(500000))
+                        .stockQuantity(BigDecimal.valueOf(0))
                         .updatedAt(now)
                         .build())
                 .collect(Collectors.toList());
@@ -87,6 +92,17 @@ public class IngredientServiceImpl implements IngredientService {
             s.setUpdatedAt(System.currentTimeMillis());
         }
         if (!stocks.isEmpty()) ingredientStockRepository.saveAll(stocks);
+
+        // Đồng bộ tên/đơn vị xuống mọi FactoryProduct (sản phẩm xưởng) đang liên kết
+        // tới Ingredient này — Ingredient là nguồn sự thật, FactoryProduct.name/unit
+        // chỉ là snapshot hiển thị (xem comment ở FactoryProduct.ingredientId).
+        List<FactoryProduct> linkedProducts = factoryProductRepository.findByIngredientId(id);
+        for (FactoryProduct fp : linkedProducts) {
+            fp.setName(saved.getName());
+            fp.setUnit(saved.getUnit());
+            fp.setUpdatedAt(System.currentTimeMillis());
+        }
+        if (!linkedProducts.isEmpty()) factoryProductRepository.saveAll(linkedProducts);
 
         return mapToResponse(saved);
     }
@@ -130,6 +146,22 @@ public class IngredientServiceImpl implements IngredientService {
     @Override
     public List<IngredientResponse> getAllIngredients() {
         return ingredientRepository.findByIsActiveTrue().stream()
+                .map(this::mapToResponseWithAllStock)
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    public List<IngredientResponse> getAllIngredientsOfWarehouse(Long warehouseId) {
+        if (warehouseId == null) return getAllIngredients();
+
+        // Nguồn sự thật là bảng GÁN KHO, không phải bảng tồn kho: một nguyên liệu
+        // bị gỡ khỏi kho vẫn còn dòng IngredientStock (tồn 0 hoặc số cũ do chuyển
+        // kho), nên lọc theo tồn kho sẽ vẫn lọt.
+        Set<Long> assignedIds = new java.util.HashSet<>(
+                ingredientWarehouseRepo.findIngredientIdsByWarehouseId(warehouseId));
+
+        return ingredientRepository.findByIsActiveTrue().stream()
+                .filter(i -> assignedIds.contains(i.getId()))
                 .map(this::mapToResponseWithAllStock)
                 .collect(Collectors.toList());
     }

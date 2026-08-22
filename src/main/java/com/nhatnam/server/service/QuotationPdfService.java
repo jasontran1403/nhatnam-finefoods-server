@@ -442,7 +442,10 @@ public class QuotationPdfService {
 
             // Giá được chọn
             BigDecimal price;
-            if (req.getTierId() != null) {
+            if (req.isCustomPrice() && req.getCustomUnitPrice() != null) {
+                // Sửa giá: dùng giá tự nhập
+                price = req.getCustomUnitPrice();
+            } else if (req.getTierId() != null) {
                 price = p.getPriceTiers().stream()
                         .filter(t -> t.getId().equals(req.getTierId()))
                         .findFirst()

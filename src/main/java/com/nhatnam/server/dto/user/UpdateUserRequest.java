@@ -15,6 +15,9 @@ public class UpdateUserRequest {
 
     private String phoneNumber;
 
+    /** Ngày tháng năm sinh (epoch millis). null = giữ nguyên giá trị cũ. */
+    private Long dateOfBirth;
+
     /** Role chính (legacy). Nếu roles không rỗng thì roles được dùng. */
     private Role role;
 

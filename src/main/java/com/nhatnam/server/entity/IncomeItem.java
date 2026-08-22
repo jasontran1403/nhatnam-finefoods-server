@@ -16,7 +16,7 @@ public class IncomeItem {
     @JoinColumn(name = "voucher_id", nullable = false)
     private IncomeVoucher voucher;
 
-    @Column(name = "item_name", nullable = false, length = 300)
+    @Column(name = "item_name", nullable = false, columnDefinition = "TEXT")
     private String itemName;
 
     @Column(nullable = false, precision = 15, scale = 2)

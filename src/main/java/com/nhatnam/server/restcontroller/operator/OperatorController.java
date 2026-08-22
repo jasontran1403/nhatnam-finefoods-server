@@ -244,6 +244,7 @@ public class OperatorController {
     @PostMapping("/ingredients/{id}/warehouses/{warehouseId}")
     public ResponseEntity<ApiResponse<Object>> addIngredientToWarehouse(
             @PathVariable Long id,
+
             @PathVariable Long warehouseId) {
         try {
             ingredientWarehouseService.addWarehouse(id, warehouseId);

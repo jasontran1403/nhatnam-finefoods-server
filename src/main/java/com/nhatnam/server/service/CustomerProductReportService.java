@@ -35,12 +35,35 @@ public class CustomerProductReportService {
     private final OrderRepository orderRepository;
     private final CustomerRepository customerRepository;
     private final ProductCategoryResolver categoryResolver;
+    private final com.nhatnam.server.repository.ProductRepository productRepository;
+    private final com.nhatnam.server.repository.CategoryRepository categoryRepository;
 
     // ─────────────────────────────────────────────────────────────────────────
     // PUBLIC API
     // ─────────────────────────────────────────────────────────────────────────
 
     public byte[] generateReport(LocalDate from, LocalDate to, Long sellerId) throws IOException {
+        return generateReport(from, to, sellerId, null);
+    }
+
+    /**
+     * @param categoryId nếu != null → chỉ tính sản phẩm thuộc danh mục này;
+     *                   nếu null → dùng danh mục mặc định (ProductCategoryResolver).
+     */
+    public byte[] generateReport(LocalDate from, LocalDate to, Long sellerId, Long categoryId) throws IOException {
+        // Nhãn danh mục + tập sản phẩm cho phép
+        String categoryLabel = "Mặc định (Non-Dairy Creams, Non-Food)";
+        java.util.Set<Long> allowed = null;
+        if (categoryId != null) {
+            String catName = categoryRepository.findById(categoryId)
+                    .map(com.nhatnam.server.entity.Category::getName).orElse(null);
+            categoryLabel = catName != null ? catName : ("Danh mục #" + categoryId);
+            // Khớp theo ID hoặc theo TÊN (sản phẩm có thể chỉ lưu tên danh mục)
+            allowed = new java.util.HashSet<>(
+                    productRepository.findIdsByCategoryIdOrName(categoryId, catName != null ? catName : ""));
+        }
+        final java.util.Set<Long> allowedProductIds = allowed;
+        final String catLabel = categoryLabel;
         long fromMs = from.atStartOfDay(VN).toInstant().toEpochMilli();
         long toMs   = to.plusDays(1).atStartOfDay(VN).toInstant().toEpochMilli() - 1;
 
@@ -58,15 +81,16 @@ public class CustomerProductReportService {
                 .filter(o -> sellerId == null || (o.getUser() != null && sellerId.equals(o.getUser().getId())))
                 .collect(Collectors.toList());
 
-        ReportData data = aggregate(orders, customerDeletedAtMap);
-        return renderExcel(data, from, to);
+        ReportData data = aggregate(orders, customerDeletedAtMap, allowedProductIds);
+        return renderExcel(data, from, to, catLabel);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // AGGREGATION
     // ─────────────────────────────────────────────────────────────────────────
 
-    private ReportData aggregate(List<Order> orders, Map<Long, Long> customerDeletedAtMap) {
+    private ReportData aggregate(List<Order> orders, Map<Long, Long> customerDeletedAtMap,
+                                 java.util.Set<Long> allowedProductIds) {
 
         // productId -> productName (giữ thứ tự xuất hiện đầu tiên)
         LinkedHashMap<Long, String> productNames = new LinkedHashMap<>();
@@ -94,7 +118,7 @@ public class CustomerProductReportService {
             for (OrderItem item : order.getOrderItems()) {
 
                 // ── Kiểm tra danh mục cho phép ──
-                if (!isAllowedProduct(item)) continue;
+                if (!isAllowedProduct(item, allowedProductIds)) continue;
 
                 Long   pid   = item.getProductId();
                 String pname = item.getProductName();
@@ -121,7 +145,7 @@ public class CustomerProductReportService {
     // EXCEL RENDERING
     // ─────────────────────────────────────────────────────────────────────────
 
-    private byte[] renderExcel(ReportData data, LocalDate from, LocalDate to) throws IOException {
+    private byte[] renderExcel(ReportData data, LocalDate from, LocalDate to, String categoryLabel) throws IOException {
 
         XSSFWorkbook wb = new XSSFWorkbook();
         XSSFSheet    sh = wb.createSheet("Báo cáo KH × SP");
@@ -150,7 +174,7 @@ public class CustomerProductReportService {
         subRow.setHeight((short) 500);
         Cell subCell = subRow.createCell(0);
         subCell.setCellValue("Từ ngày: " + from + "   →   Đến ngày: " + to
-                + "     |     Danh mục: Non-Dairy Creams, Non-Food");
+                + "     |     Danh mục: " + categoryLabel);
         subCell.setCellStyle(s.subtitle);
         sh.addMergedRegion(new CellRangeAddress(1, 1, 0, totalCols - 1));
 
@@ -231,18 +255,23 @@ public class CustomerProductReportService {
         sumLabel.setCellValue("TỔNG CỘNG");
         sumLabel.setCellStyle(s.totalLabel);
 
+        boolean hasRows = !data.rows.isEmpty();
+        int firstDataRow = dataStartRow + 1;      // 1-based
+        int lastDataRow  = totalRowIdx;           // 1-based (dataStartRow + n)
+
         // Tổng SL
-        sumRow.createCell(1).setCellFormula(
-                "SUM(B" + (dataStartRow + 1) + ":B" + totalRowIdx + ")");
-        sumRow.getCell(1).setCellStyle(s.totalNum);
+        Cell sumQty = sumRow.createCell(1);
+        if (hasRows) sumQty.setCellFormula("SUM(B" + firstDataRow + ":B" + lastDataRow + ")");
+        else sumQty.setCellValue(0);
+        sumQty.setCellStyle(s.totalNum);
 
         // Tổng từng sản phẩm
         for (int i = 0; i < productIds.size(); i++) {
             int col = 2 + i;
             String colLetter = getCellColumnLetter(col);
             Cell sc = sumRow.createCell(col);
-            sc.setCellFormula("SUM(" + colLetter + (dataStartRow + 1)
-                    + ":" + colLetter + totalRowIdx + ")");
+            if (hasRows) sc.setCellFormula("SUM(" + colLetter + firstDataRow + ":" + colLetter + lastDataRow + ")");
+            else sc.setCellValue(0);
             sc.setCellStyle(s.totalNum);
         }
 
@@ -250,8 +279,8 @@ public class CustomerProductReportService {
         int    lastCol       = 2 + productIds.size();
         String lastColLetter = getCellColumnLetter(lastCol);
         Cell sumAmt = sumRow.createCell(lastCol);
-        sumAmt.setCellFormula("SUM(" + lastColLetter + (dataStartRow + 1)
-                + ":" + lastColLetter + totalRowIdx + ")");
+        if (hasRows) sumAmt.setCellFormula("SUM(" + lastColLetter + firstDataRow + ":" + lastColLetter + lastDataRow + ")");
+        else sumAmt.setCellValue(0);
         sumAmt.setCellStyle(s.totalMoney);
 
         // ── Column widths ──
@@ -295,7 +324,8 @@ public class CustomerProductReportService {
         return "(Không rõ)";
     }
 
-    private boolean isAllowedProduct(OrderItem item) {
+    private boolean isAllowedProduct(OrderItem item, java.util.Set<Long> allowedProductIds) {
+        if (allowedProductIds != null) return allowedProductIds.contains(item.getProductId());
         return categoryResolver.isAllowed(item.getProductId());
     }
 

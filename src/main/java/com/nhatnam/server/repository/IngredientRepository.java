@@ -19,4 +19,7 @@ public interface IngredientRepository extends JpaRepository<Ingredient, Long> {
     Optional<Ingredient> findByIdAndIsActiveTrue(Long id);
     List<Ingredient> findByIsActiveTrue(Pageable pageable);
 
+    /** Tìm ingredient theo tên (không phân biệt hoa thường) — dùng khi chuyển kho thành phẩm sang kho bán hàng */
+    Optional<Ingredient> findFirstByNameIgnoreCase(String name);
+
 }

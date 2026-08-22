@@ -37,6 +37,21 @@ public class CustomerReceiverInfo {
     @Column(name = "is_default", nullable = false)
     private Boolean isDefault = false;
 
+    /**
+     * TỈNH/THÀNH PHỐ của địa chỉ nhận — chọn từ dropdown, luôn khớp {@code data.json}.
+     *
+     * <p>Tách khỏi chuỗi địa chỉ tự do vì quy tắc COD tra theo cặp (tỉnh, phường). Khớp
+     * tên trong một chuỗi tự do từng gây hàng loạt lỗi: "Q1" không khớp, "Nguyễn Huệ"
+     * khớp nhầm thành tỉnh Huế, "Phú Thọ" khớp nhầm phường của Bình Dương.
+     */
+    @Column(name = "province_name", length = 120)
+    private String provinceName;
+
+    /** PHƯỜNG/XÃ/ĐẶC KHU — chọn từ dropdown, đã lọc theo tỉnh đang chọn. */
+    @Column(name = "ward_name", length = 150)
+    private String wardName;
+
+
     @Column(name = "created_at", nullable = false)
     private Long createdAt;
 

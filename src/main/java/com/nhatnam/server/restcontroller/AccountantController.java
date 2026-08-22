@@ -12,11 +12,13 @@ import com.nhatnam.server.dto.response.OrderResponse;
 import com.nhatnam.server.entity.*;
 import com.nhatnam.server.enumtype.OrderStatus;
 import com.nhatnam.server.enumtype.PaymentStatus;
+import com.nhatnam.server.enumtype.Role;
 import com.nhatnam.server.enumtype.StatusCode;
 import com.nhatnam.server.repository.CustomerRepository;
 import com.nhatnam.server.repository.OrderRepository;
 import com.nhatnam.server.service.DashboardService;
 import com.nhatnam.server.service.OrderService;
+import com.nhatnam.server.utils.AuthRoleUtil;
 import com.nhatnam.server.utils.InvoicePdf;
 import com.nhatnam.server.utils.OrderExcelExporter;
 import lombok.RequiredArgsConstructor;
@@ -30,13 +32,18 @@ import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
+import com.nhatnam.server.entity.IncomeVoucher;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.multipart.MultipartFile;
 import com.nhatnam.server.service.FileStorageService;
 import com.nhatnam.server.repository.OrderLogRepository;
+import com.nhatnam.server.repository.IncomeVoucherRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 @RestController
 @RequestMapping("/api/accountant")
@@ -48,18 +55,54 @@ public class AccountantController {
     private final DashboardService   dashboardService;
     private final OrderRepository    orderRepository;
     private final OrderService       orderService;
+    /** Quy tắc thu tiền trước nằm ở impl, không có trên interface OrderService. */
+    private final com.nhatnam.server.service.serviceimpl.OrderServiceImpl orderServiceImpl;
     private final CustomerRepository customerRepository;
     private final OrderExcelExporter exporter;
     private final InvoicePdf         invoicePdf;
     private final OrderLogRepository  orderLogRepository;
     private final FileStorageService   fileStorageService;
+    private final IncomeVoucherRepository incomeVoucherRepository;
+    private final ObjectMapper objectMapper;
+    private final com.nhatnam.server.service.DebtStatsService debtStatsService;
 
     private static final ZoneId VN = ZoneId.of("Asia/Ho_Chi_Minh");
+
+    @GetMapping("/orders/{id}")
+    public ResponseEntity<ApiResponse<OrderResponse>> getOrder(@PathVariable Long id) {
+        try {
+            OrderResponse order = orderService.getOrderById(id);
+            order.setReceiptNumbers(buildReceiptNumbersByOrderCode(Set.of(order.getOrderCode()))
+                    .getOrDefault(order.getOrderCode(), List.of()));
+            return ResponseEntity.ok(ApiResponse.success(order, "OK"));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, e.getMessage()));
+        }
+    }
 
     @GetMapping("/orders/{id}/detail")
     public ResponseEntity<ApiResponse<OrderResponse>> getOrderDetail(@PathVariable Long id) {
         try {
-            return ResponseEntity.ok(ApiResponse.success(orderService.getOrderById(id), "OK"));
+            OrderResponse order = orderService.getOrderById(id);
+            order.setReceiptNumbers(buildReceiptNumbersByOrderCode(Set.of(order.getOrderCode()))
+                    .getOrDefault(order.getOrderCode(), List.of()));
+            return ResponseEntity.ok(ApiResponse.success(order, "OK"));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, e.getMessage()));
+        }
+    }
+
+    /**
+     * Tra đơn theo MÃ — dùng khi SỬA phiếu thu để nạp lại các đơn đã liên kết.
+     * Phiếu chỉ lưu mã đơn, không lưu id, nên cần đường tra theo mã.
+     */
+    @GetMapping("/orders/by-code/{code}")
+    public ResponseEntity<ApiResponse<OrderResponse>> getOrderByCode(@PathVariable String code) {
+        try {
+            OrderResponse order = orderService.getOrderByCode(code);
+            order.setReceiptNumbers(buildReceiptNumbersByOrderCode(Set.of(order.getOrderCode()))
+                    .getOrDefault(order.getOrderCode(), List.of()));
+            return ResponseEntity.ok(ApiResponse.success(order, "OK"));
         } catch (Exception e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, e.getMessage()));
         }
@@ -122,6 +165,8 @@ public class AccountantController {
                     .contactName(order.getContactName())
                     .hideAllPrices(order.getHideAllPrices())
                     .deliveryAddress(order.getDeliveryAddress())
+                    .provinceName(order.getProvinceName())
+                    .wardName(order.getWardName())
                     .vatBreakdownInclusive(vatBreakdownInclusive)   // ← thay thế vatBreakdown cũ
                     .vatBreakdownExclusive(vatBreakdownExclusive)   // ← thêm mới
                     .items(order.getItems().stream()
@@ -189,17 +234,36 @@ public class AccountantController {
             @RequestParam(defaultValue = "0")  int page,
             @RequestParam(defaultValue = "20") int size) {
         try {
+            // Đơn CHỜ THANH TOÁN (đã giao, còn nợ)
             List<Order> orders = new java.util.ArrayList<>(
                     orderRepository.findByStatusOrderByCreatedAtDesc(OrderStatus.PENDING_PAYMENT)
             );
 
+            // ── THÊM: đơn THU TRƯỚC KHI GIAO ─────────────────────────────────
+            // Khách bị owner yêu cầu "thanh toán trước" → kế toán phải tạo được phiếu thu
+            // NGAY KHI đơn còn đang chuẩn bị (kho chưa được phép giao cho tới khi thu đủ).
+            for (OrderStatus st : new OrderStatus[]{
+                    OrderStatus.PENDING, OrderStatus.CONFIRMED,
+                    OrderStatus.PREPARING, OrderStatus.READY}) {
+                orderRepository.findByStatusOrderByCreatedAtDesc(st).stream()
+                        // Lambda thay cho method reference: isPrepaymentRequired giờ là method
+                        // của bean (cần AddressCatalogService), không còn static để tham chiếu.
+                        .filter(o -> orderServiceImpl.isPrepaymentRequired(o))
+                        .filter(o -> o.getPaymentStatus() != com.nhatnam.server.enumtype.PaymentStatus.PAID)
+                        .filter(o -> o.getFinalAmount() != null
+                                && o.getFinalAmount().compareTo(BigDecimal.ZERO) > 0)
+                        .forEach(orders::add);
+            }
+
             // Filter search (accent-insensitive)
             if (search != null && !search.isBlank()) {
                 String kw = removeAccents(search.toLowerCase().trim());
+                final BigDecimal amountKw = parseAmountKeyword(search);
                 orders = orders.stream()
                         .filter(o -> matchesKeyword(o.getOrderCode(),    kw)
                                 || matchesKeyword(o.getCustomerName(), kw)
-                                || matchesKeyword(o.getCustomerPhone(),kw))
+                                || matchesKeyword(o.getCustomerPhone(),kw)
+                                || matchesAmount(o.getFinalAmount(), amountKw))
                         .toList();
             }
 
@@ -234,14 +298,15 @@ public class AccountantController {
             boolean hasKeyword = keyword != null && !keyword.isBlank();
 
             List<Order> orders;
-            if (hasKeyword) {
-                // Search toàn bộ, không filter ngày
-                orders = new java.util.ArrayList<>(
-                        orderRepository.findAll(Sort.by("createdAt").descending())
-                );
-            } else if (from != null && to != null) {
+            if (from != null && to != null) {
+                // Đã chọn khoảng ngày → luôn filter theo ngày, kể cả có keyword
                 orders = new java.util.ArrayList<>(
                         orderRepository.findByCreatedAtBetween(from, to)
+                );
+            } else if (hasKeyword) {
+                // Chưa chọn ngày + có keyword → search toàn bộ, không filter ngày
+                orders = new java.util.ArrayList<>(
+                        orderRepository.findAll(Sort.by("createdAt").descending())
                 );
             } else {
                 orders = new java.util.ArrayList<>(
@@ -258,6 +323,8 @@ public class AccountantController {
             // Filter keyword — dùng lại logic accent-insensitive đã có
             if (hasKeyword) {
                 String kw = removeAccents(keyword.toLowerCase().trim());
+                // Tìm theo SỐ TIỀN — giữ ĐỒNG BỘ với danh sách trên màn hình
+                final BigDecimal amountKw = parseAmountKeyword(keyword);
                 orders = orders.stream()
                         .filter(o ->
                                 matchesKeyword(o.getOrderCode(),     kw)
@@ -267,6 +334,7 @@ public class AccountantController {
                                         || (o.getUser() != null && (
                                         matchesKeyword(o.getUser().getFullName(), kw)
                                                 || matchesKeyword(o.getUser().getUsername(), kw)))
+                                        || matchesAmount(o.getFinalAmount(), amountKw)
                         )
                         .collect(Collectors.toList());
             }
@@ -359,33 +427,18 @@ public class AccountantController {
             @RequestParam(required = false) Long from,
             @RequestParam(required = false) Long to) {
         try {
-            LocalDate today    = LocalDate.now(VN);
-            long todayMs       = today.atStartOfDay(VN).toInstant().toEpochMilli();
-            long in7DaysMs     = today.plusDays(7).atStartOfDay(VN).toInstant().toEpochMilli();
-
-            List<Order> debtOrders = orderRepository
-                    .findByStatusOrderByCreatedAtDesc(OrderStatus.PENDING_PAYMENT)
-                    .stream()
-                    .filter(o -> "DEBT".equalsIgnoreCase(
-                            o.getPaymentMethod() != null ? o.getPaymentMethod() : ""))
-                    .toList();
-
-            long nearingDeadline = 0, overdueCount = 0;
-            for (Order o : debtOrders) {
-                if (o.getPendingPaymentAt() == null || o.getPendingPaymentAt() <= 0) continue;
-                if (o.getDebtDays() <= 0) continue;
-                LocalDate pendingDate = Instant.ofEpochMilli(o.getPendingPaymentAt())
-                        .atZone(VN).toLocalDate();
-                LocalDate deadline    = pendingDate.plusDays(1).plusDays(o.getDebtDays());
-                long deadlineMs       = deadline.atStartOfDay(VN).toInstant().toEpochMilli();
-                if (deadlineMs < todayMs)          overdueCount++;
-                else if (deadlineMs <= in7DaysMs)  nearingDeadline++;
-            }
-
+            var s = debtStatsService.compute();
             Map<String, Object> result = new LinkedHashMap<>();
-            result.put("nearingDeadline", nearingDeadline);
-            result.put("overdueCount",    overdueCount);
-            result.put("totalDebtOrders", debtOrders.size());
+            result.put("nearingDeadline",       s.nearingCount());
+            result.put("overdueCount",          s.overdueCount());
+            result.put("totalDebtOrders",       s.totalDebtOrders());
+            result.put("nearingDeadlineAmount", s.nearingAmount());
+            result.put("overdueAmount",         s.overdueAmount());
+            result.put("totalDebtAmount",       s.totalDebtAmount());
+            result.put("aging0to30",            s.aging0to30());
+            result.put("aging31to60",           s.aging31to60());
+            result.put("aging61to90",           s.aging61to90());
+            result.put("aging90plus",           s.aging90plus());
             return ResponseEntity.ok(ApiResponse.success(result, "OK"));
         } catch (Exception e) {
             log.error("[ACCOUNTANT] getDebtStats error", e);
@@ -405,21 +458,26 @@ public class AccountantController {
             @RequestParam(required = false) Long customerId,
             @RequestParam(required = false) Long productId,
             @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) String receiptNumber,
             @RequestParam(defaultValue = "0")  int page,
             @RequestParam(defaultValue = "20") int size) {
         try {
             boolean hasKeyword = keyword != null && !keyword.isBlank();
+            boolean hasReceiptNumber = receiptNumber != null && !receiptNumber.isBlank();
 
-            // Khi có keyword → bỏ filter ngày, lấy toàn bộ
-            // Khi không có keyword → filter theo ngày (mặc định hôm nay nếu không truyền)
+// Nếu có from/to (người dùng đã chọn khoảng ngày) → luôn filter theo ngày,
+// kể cả khi có keyword.
+// Nếu không có from/to:
+//   - có keyword hoặc receiptNumber → tìm toàn bộ, không filter ngày
+//   - không có gì → mặc định hôm nay
             List<Order> orders;
-            if (hasKeyword) {
-                orders = new java.util.ArrayList<>(
-                        orderRepository.findAll(Sort.by("createdAt").descending())
-                );
-            } else if (from != null && to != null) {
+            if (from != null && to != null) {
                 orders = new java.util.ArrayList<>(
                         orderRepository.findByCreatedAtBetween(from, to)
+                );
+            } else if (hasKeyword || hasReceiptNumber) {
+                orders = new java.util.ArrayList<>(
+                        orderRepository.findAll(Sort.by("createdAt").descending())
                 );
             } else {
                 // Default: hôm nay theo timezone VN
@@ -455,9 +513,31 @@ public class AccountantController {
                         .collect(Collectors.toList());
             }
 
+            // Filter theo số phiếu thu — tìm các phiếu thu có receiptNumber khớp,
+            // rồi chỉ giữ lại các đơn nằm trong linkedOrderCodes của các phiếu đó
+            // (dùng để "tìm các đơn có cùng phiếu thu").
+            if (hasReceiptNumber) {
+                Set<String> orderCodesWithReceipt = incomeVoucherRepository
+                        .findByReceiptNumberContainingWithLinkedOrders(receiptNumber.trim())
+                        .stream()
+                        .flatMap(v -> parseOrderCodes(v.getLinkedOrderCodes()).stream())
+                        .collect(Collectors.toSet());
+                orders = orders.stream()
+                        .filter(o -> orderCodesWithReceipt.contains(o.getOrderCode()))
+                        .collect(Collectors.toList());
+            }
+
+            // Map orderCode -> receiptNumbers, tính 1 lần dùng cho cả lọc keyword và enrich kết quả trả về
+            Map<String, List<String>> allReceiptsByOrderCode = (hasKeyword)
+                    ? buildReceiptNumbersByOrderCode(orders.stream().map(Order::getOrderCode).collect(Collectors.toSet()))
+                    : null;
+
             // Filter keyword — accent-insensitive (gõ không dấu vẫn ra)
+            // Cũng khớp theo số phiếu thu liên kết với đơn.
             if (hasKeyword) {
                 String kw = removeAccents(keyword.toLowerCase().trim());
+                // Tìm theo SỐ TIỀN đơn hàng (final_amount) — null nếu keyword không phải số
+                final BigDecimal amountKw = parseAmountKeyword(keyword);
                 orders = orders.stream()
                         .filter(o ->
                                 matchesKeyword(o.getOrderCode(),     kw)
@@ -467,6 +547,9 @@ public class AccountantController {
                                         || (o.getUser() != null && (
                                         matchesKeyword(o.getUser().getFullName(), kw)
                                                 || matchesKeyword(o.getUser().getUsername(), kw)))
+                                        || allReceiptsByOrderCode.getOrDefault(o.getOrderCode(), List.of())
+                                        .stream().anyMatch(rn -> matchesKeyword(rn, kw))
+                                        || matchesAmount(o.getFinalAmount(), amountKw)
                         )
                         .collect(Collectors.toList());
             }
@@ -475,7 +558,16 @@ public class AccountantController {
             int start = page * size;
             int end   = Math.min(start + size, total);
             List<Order> paged = start >= total ? List.of() : orders.subList(start, end);
-            List<Map<String, Object>> content = paged.stream().map(this::_toOrderMap).toList();
+
+            Set<String> pageOrderCodes = paged.stream().map(Order::getOrderCode).collect(Collectors.toSet());
+            Map<String, List<String>> receiptsForPage = (allReceiptsByOrderCode != null)
+                    ? allReceiptsByOrderCode.entrySet().stream()
+                    .filter(e -> pageOrderCodes.contains(e.getKey()))
+                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))
+                    : buildReceiptNumbersByOrderCode(pageOrderCodes);
+            List<Map<String, Object>> content = paged.stream()
+                    .map(o -> _toOrderMap(o, receiptsForPage.getOrDefault(o.getOrderCode(), List.of())))
+                    .toList();
 
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("content",     content);
@@ -487,6 +579,36 @@ public class AccountantController {
             log.error("[ACCOUNTANT] getOrders error", e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
+    }
+
+    // ── Receipt number helpers (liên kết đơn hàng ↔ phiếu thu) ─────────────────
+    @SuppressWarnings("unchecked")
+    private List<String> parseOrderCodes(String linkedOrderCodesJson) {
+        if (linkedOrderCodesJson == null || linkedOrderCodesJson.isBlank()) return List.of();
+        try {
+            return objectMapper.readValue(linkedOrderCodesJson, List.class);
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    /**
+     * Với 1 tập orderCode, trả về map orderCode -> danh sách receiptNumber của
+     * các phiếu thu có liên kết tới đơn đó (1 đơn có thể được thu nhiều lần →
+     * nhiều phiếu thu).
+     */
+    private Map<String, List<String>> buildReceiptNumbersByOrderCode(Set<String> orderCodes) {
+        if (orderCodes == null || orderCodes.isEmpty()) return Map.of();
+        Map<String, List<String>> result = new HashMap<>();
+        for (IncomeVoucher v : incomeVoucherRepository.findAllWithLinkedOrders()) {
+            if (v.getReceiptNumber() == null || v.getReceiptNumber().isBlank()) continue;
+            for (String code : parseOrderCodes(v.getLinkedOrderCodes())) {
+                if (orderCodes.contains(code)) {
+                    result.computeIfAbsent(code, k -> new ArrayList<>()).add(v.getReceiptNumber());
+                }
+            }
+        }
+        return result;
     }
 
     // ── Helpers accent-insensitive ────────────────────────────────────────────────
@@ -501,6 +623,119 @@ public class AccountantController {
     private static boolean matchesKeyword(String field, String kwNoAccent) {
         if (field == null || field.isBlank()) return false;
         return removeAccents(field.toLowerCase()).contains(kwNoAccent);
+    }
+
+    /**
+     * TÁCH SỐ TIỀN từ ô tìm kiếm — hỗ trợ định dạng người dùng thật sự gõ.
+     *
+     * <pre>
+     *   "1.972.000"      → 1972000    (dấu chấm = phân cách nghìn, chuẩn VN)
+     *   "1.972.000 đ"    → 1972000    (bỏ ký hiệu tiền tệ)
+     *   "1972000"        → 1972000
+     *   "1972000.40"     → 1972000    (nhóm cuối 1–2 số ⇒ dấu chấm là thập phân)
+     *   "1.972.000,40"   → 1972000    (dấu phẩy = thập phân, chuẩn VN)
+     *   "NCC-2024"       → null       (có chữ ⇒ không phải số tiền)
+     * </pre>
+     *
+     * <p>Quy tắc phân biệt dấu chấm là NGHÌN hay THẬP PHÂN: nhìn nhóm chữ số
+     * cuối cùng — đúng 3 chữ số thì coi là phân cách nghìn, 1–2 chữ số thì coi
+     * là phần thập phân. Đây là cách duy nhất đoán đúng cả "1.972.000" lẫn
+     * "1972000.40" khi hệ thống nhận cả 2 kiểu gõ.
+     *
+     * @return phần ĐỒNG của số tiền, hoặc {@code null} nếu keyword không phải số
+     */
+    private static BigDecimal parseAmountKeyword(String raw) {
+        if (raw == null) return null;
+
+        String s = raw.trim().toLowerCase();
+        s = s.replaceAll("\\s*(vnđ|vnd|₫|đ)\\s*$", "");   // bỏ hậu tố tiền tệ
+        s = s.replaceAll("\\s+", "");                     // bỏ mọi khoảng trắng
+        if (s.isEmpty()) return null;
+
+        // Chỉ chấp nhận chuỗi gồm chữ số và dấu phân cách, và phải có ít nhất 1 chữ số
+        if (!s.matches("[0-9.,]+") || !s.matches(".*[0-9].*")) return null;
+
+        String intPart;
+        int comma = s.indexOf(',');
+        if (comma >= 0) {
+            intPart = s.substring(0, comma);            // dấu phẩy = thập phân
+        } else {
+            int lastDot = s.lastIndexOf('.');
+            if (lastDot < 0) {
+                intPart = s;
+            } else {
+                String tail = s.substring(lastDot + 1);
+                // 3 chữ số ⇒ phân cách nghìn (giữ cả chuỗi); 1–2 chữ số ⇒ thập phân
+                intPart = (tail.length() == 3) ? s : s.substring(0, lastDot);
+            }
+        }
+        intPart = intPart.replace(".", "").replace(",", "");
+        if (intPart.isEmpty()) return null;
+
+        try {
+            return new BigDecimal(intPart);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * SO KHỚP SỐ TIỀN ĐƠN HÀNG theo phần ĐỒNG, bỏ qua số lẻ thập phân.
+     *
+     * <p>Tìm {@code 1.972.000} sẽ khớp cả đơn có {@code finalAmount = 1972000}
+     * lẫn {@code 1972000.40} — đúng như số tiền hiển thị trên màn hình (giao
+     * diện luôn làm tròn về đồng).
+     *
+     * <p>Chấp nhận cả FLOOR và HALF_UP để không bỏ sót trường hợp biên: đơn
+     * {@code 1971999.60} hiển thị là 1.972.000đ nên tìm 1.972.000 vẫn ra.
+     */
+    private static boolean matchesAmount(BigDecimal amount, BigDecimal target) {
+        if (amount == null || target == null) return false;
+        return amount.setScale(0, RoundingMode.FLOOR).compareTo(target) == 0
+                || amount.setScale(0, RoundingMode.HALF_UP).compareTo(target) == 0;
+    }
+
+    /**
+     * THU TIỀN TRƯỚC KHI GIAO — đơn còn ở PENDING/CONFIRMED/PREPARING/READY.
+     *
+     * <p>Khác {@code /partial-payment}: KHÔNG đổi trạng thái đơn. Đơn vẫn ở "Đang chuẩn
+     * bị" để kho tiếp tục soạn hàng; chỉ {@code paymentStatus} chuyển sang PAID, và đó
+     * là điều kiện để kho được bấm "Bắt đầu giao".
+     *
+     * <p>Bắt buộc thu ĐỦ trong một lần. Khách trả thiếu do làm tròn thì gửi
+     * {@code waiveRemainder = true} (trần 50.000đ, kiểm ở service).
+     *
+     * <p>Chỉ kế toán được gọi — kể cả OWNER/ADMIN cũng không, theo phân công hiện tại:
+     * phiếu thu là chứng từ của kế toán, mở rộng cho vai trò khác sẽ làm mất dấu ai là
+     * người chịu trách nhiệm đối soát.
+     */
+    @PatchMapping("/orders/{id}/prepayment")
+    @PreAuthorize("hasAnyRole('ACCOUNTANT','SUPER_ACCOUNTANT')")
+    public ResponseEntity<ApiResponse<Object>> recordPrepayment(
+            @PathVariable Long id,
+            @RequestBody Map<String, Object> body,
+            Authentication auth) {
+        try {
+            Object amtRaw = body.get("paidAmount");
+            if (amtRaw == null)
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, "Thiếu trường paidAmount"));
+
+            BigDecimal paidAmount = new BigDecimal(amtRaw.toString());
+            boolean waiveRemainder = Boolean.TRUE.equals(body.get("waiveRemainder"));
+            String paymentMethod = body.get("paymentMethod") instanceof String s ? s : null;
+            String bankName      = body.get("bankName") instanceof String s ? s : null;
+            String txRef         = body.get("transactionRef") instanceof String s ? s : null;
+
+            User actor = (User) auth.getPrincipal();
+            orderService.recordPrepayment(id, paidAmount, waiveRemainder, getActorName(auth),
+                    paymentMethod, bankName, txRef, actor.getId());
+            return ResponseEntity.ok(ApiResponse.success(null, "Đã ghi nhận thu tiền trước — kho có thể giao hàng"));
+        } catch (RuntimeException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[ACCOUNTANT] recordPrepayment error", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
     }
 
     @PatchMapping("/orders/{id}/partial-payment")
@@ -554,7 +789,7 @@ public class AccountantController {
                         "Vui lòng nhập lý do hủy đơn"));
             User user = (User) auth.getPrincipal();
             orderService.cancelOrder(id, user.getId(), getActorName(auth),
-                    user.getRole().name(), reason);
+                    getActorRole(auth, user), reason);
             return ResponseEntity.ok(ApiResponse.success(null, "Đã hủy đơn hàng"));
         } catch (IllegalStateException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
@@ -621,11 +856,23 @@ public class AccountantController {
     @GetMapping("/customers")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getCustomers(
             @RequestParam(required = false) String q,
+            @RequestParam(required = false) String status,   // ACTIVE | LOCKED (null = tất cả)
+            @RequestParam(required = false) String sort,      // "debtAsc" = công nợ tăng dần
             @RequestParam(defaultValue = "0")  int page,
             @RequestParam(defaultValue = "20") int size) {
         try {
+            // LẤY CẢ KHÁCH ĐÃ KHOÁ, chỉ loại khách ĐÃ XOÁ.
+            //
+            //   Kế toán vẫn phải tra cứu và thu hồi công nợ của khách bị khoá —
+            //   khoá là ngừng BÁN HÀNG, không phải xoá khỏi sổ. Lọc theo
+            //   isActive = true khiến tìm "The Hill" không ra gì trong khi
+            //   OWNER/SELLER vẫn thấy, và công nợ của họ biến mất khỏi màn hình.
+            //
+            //   Đổi sang mốc deletedAt còn VÁ một lỗ rò có sẵn: softDelete chỉ set
+            //   deletedAt chứ KHÔNG set isActive = false, nên
+            //   findByIsActiveTrue... trước đây vẫn trả về khách đã xoá mềm.
             List<Customer> all = customerRepository
-                    .findByIsActiveTrueOrderByCustomerCodeAscNameAsc();
+                    .findAllByDeletedAtIsNullOrderByCustomerCodeAscNameAsc();
 
             if (q != null && !q.isBlank()) {
                 String lower = q.toLowerCase();
@@ -636,6 +883,56 @@ public class AccountantController {
                                 (c.getCustomerCode() != null && c.getCustomerCode().toLowerCase().contains(lower))
                 ).toList();
             }
+
+            // ── Lọc theo trạng thái khoá/hoạt động ──────────────────────────────
+            //   LOCKED = đang khoá (isActive == false)
+            //   ACTIVE = đang hoạt động (isActive khác false, coi null như đang hoạt động)
+            //   null/blank = tất cả
+            if (status != null && !status.isBlank()) {
+                String st = status.trim().toUpperCase();
+                if ("LOCKED".equals(st)) {
+                    all = all.stream()
+                            .filter(c -> Boolean.FALSE.equals(c.getIsActive()))
+                            .toList();
+                } else if ("ACTIVE".equals(st)) {
+                    all = all.stream()
+                            .filter(c -> !Boolean.FALSE.equals(c.getIsActive()))
+                            .toList();
+                }
+            }
+
+            // ── Công nợ + số ngày công nợ đơn cũ nhất — tính theo lô (1 query đơn) ──
+            // Công nợ = đơn PENDING_PAYMENT có paymentStatus ∈ {UNPAID, PARTIAL}.
+            //   UNPAID  → finalAmount ; PARTIAL → finalAmount − paidAmount.
+            //   Làm tròn LÊN từng đơn TRƯỚC khi cộng.
+            List<Long> custIds = all.stream().map(Customer::getId).toList();
+            List<Order> debtOrders = custIds.isEmpty()
+                    ? List.of()
+                    : orderRepository.findByCustomerIdIn(custIds);
+
+            Map<Long, Long> debtMap   = new HashMap<>(); // customerId → tổng công nợ
+            Map<Long, Long> oldestMap = new HashMap<>(); // customerId → createdAt đơn công nợ cũ nhất
+
+            for (Order o : debtOrders) {
+                if (o.getCustomer() == null || o.getCustomer().getId() == null) continue;
+
+                // Chỉ tính đơn PENDING_PAYMENT với UNPAID hoặc PARTIAL
+                if (o.getStatus() == OrderStatus.PENDING_PAYMENT) {
+                    PaymentStatus ps = o.getPaymentStatus();
+                    if (ps == PaymentStatus.UNPAID || ps == PaymentStatus.PARTIAL) {
+                        long v = unpaidDebtOf(o);
+                        if (v > 0) {
+                            Long cid = o.getCustomer().getId();
+                            debtMap.merge(cid, v, Long::sum);
+                            if (o.getCreatedAt() != null) {
+                                oldestMap.merge(cid, o.getCreatedAt(), Math::min);
+                            }
+                        }
+                    }
+                }
+            }
+
+            LocalDate today = LocalDate.now(VN);
 
             List<Map<String, Object>> content = all.stream().map(c -> {
                 Map<String, Object> m = new LinkedHashMap<>();
@@ -649,22 +946,30 @@ public class AccountantController {
                 m.put("debtDays",     c.getDebtDays());
                 m.put("isActive",     c.getIsActive());
 
-                Long nearest = null;
-                if (c.getDebtDays() != null && c.getDebtDays() > 0) {
-                    List<Order> pending = orderRepository
-                            .findByCustomerIdAndStatus(c.getId(), OrderStatus.PENDING_PAYMENT);
-                    for (Order o : pending) {
-                        if (o.getPendingPaymentAt() == null) continue;
-                        LocalDate base     = Instant.ofEpochMilli(o.getPendingPaymentAt())
-                                .atZone(VN).toLocalDate();
-                        LocalDate deadline = base.plusDays(1).plusDays(c.getDebtDays());
-                        long ms            = deadline.atStartOfDay(VN).toInstant().toEpochMilli();
-                        if (nearest == null || ms < nearest) nearest = ms;
-                    }
+                // Cột "Công nợ": tổng công nợ chưa thanh toán (đã làm tròn)
+                m.put("unpaidDebt", debtMap.getOrDefault(c.getId(), 0L));
+
+                // Cột "Note": số ngày công nợ của đơn công nợ cũ nhất (tới hôm nay)
+                Long oldest = oldestMap.get(c.getId());
+                Integer oldestDebtDays = null;
+                if (oldest != null) {
+                    LocalDate created = Instant.ofEpochMilli(oldest).atZone(VN).toLocalDate();
+                    oldestDebtDays = (int) Math.max(0, ChronoUnit.DAYS.between(created, today));
                 }
-                m.put("nearestDeadlineMillis", nearest);
+                m.put("oldestDebtDays", oldestDebtDays);
                 return m;
             }).toList();
+
+            // ── Sắp xếp theo công nợ tăng dần (nếu yêu cầu) ─────────────────────
+            //   Vẫn giữ nguyên trạng thái đang lọc ở trên (status), vì sort chỉ
+            //   sắp xếp lại danh sách ĐÃ lọc chứ không đụng tới bộ lọc.
+            if (sort != null && ("debtAsc".equalsIgnoreCase(sort.trim())
+                    || "debt_asc".equalsIgnoreCase(sort.trim()))) {
+                content = content.stream()
+                        .sorted(java.util.Comparator.comparingLong(
+                                m -> toLongSafe(m.get("unpaidDebt"))))
+                        .toList();
+            }
 
             int total = content.size();
             int start = page * size;
@@ -689,20 +994,31 @@ public class AccountantController {
             Customer customer = customerRepository.findById(customerId)
                     .orElseThrow(() -> new RuntimeException("Không tìm thấy khách hàng: " + customerId));
 
-            List<Order> orders       = orderRepository.findByCustomerIdOrderByCreatedAtDesc(customerId);
-            long totalOrders         = orders.size();
-            long completedOrders     = orders.stream().filter(o -> o.getStatus() == OrderStatus.COMPLETED).count();
-            long activeOrders        = orders.stream().filter(o ->
+            List<Order> orders = orderRepository.findByCustomerIdOrderByCreatedAtDesc(customerId);
+
+            // ── Thống kê ──────────────────────────────────────────────────────────
+            long totalOrders = orders.size();
+
+            // Đơn hoàn thành: status = COMPLETED VÀ paymentStatus = PAID
+            long completedOrders = orders.stream()
+                    .filter(o -> o.getStatus() == OrderStatus.COMPLETED
+                            && o.getPaymentStatus() == PaymentStatus.PAID)
+                    .count();
+
+            long activeOrders = orders.stream().filter(o ->
                     o.getStatus() != OrderStatus.COMPLETED &&
                             o.getStatus() != OrderStatus.CANCELLED &&
                             o.getStatus() != OrderStatus.FAILED).count();
 
             BigDecimal totalAmount = orders.stream().map(Order::getFinalAmount)
                     .filter(Objects::nonNull).reduce(BigDecimal.ZERO, BigDecimal::add);
+
             BigDecimal completedAmount = orders.stream()
-                    .filter(o -> o.getStatus() == OrderStatus.COMPLETED)
+                    .filter(o -> o.getStatus() == OrderStatus.COMPLETED
+                            && o.getPaymentStatus() == PaymentStatus.PAID)
                     .map(Order::getFinalAmount).filter(Objects::nonNull)
                     .reduce(BigDecimal.ZERO, BigDecimal::add);
+
             BigDecimal pendingPaymentAmount = orders.stream()
                     .filter(o -> o.getStatus() == OrderStatus.PENDING_PAYMENT)
                     .map(Order::getFinalAmount).filter(Objects::nonNull)
@@ -717,13 +1033,28 @@ public class AccountantController {
                 m.put("paymentStatus", o.getPaymentStatus());
                 m.put("paymentMethod", o.getPaymentMethod());
                 m.put("finalAmount",   o.getFinalAmount());
+                m.put("paidAmount",    o.getPaidAmount() != null ? o.getPaidAmount() : BigDecimal.ZERO);
                 m.put("orderedByName", o.getOrderedByName());
                 m.put("createdAt",     o.getCreatedAt());
+
+                // ── Lấy danh sách phiếu thu ──────────────────────────────────────
+                // Sử dụng method receiptNumbersOf đã có
+                List<String> receiptNumbers = receiptNumbersOf(o);
+                m.put("receiptNumbers", receiptNumbers);
+
+                // Nếu có receiptNumbers thì lấy paymentStatus để biết màu
+                if (!receiptNumbers.isEmpty()) {
+                    m.put("receiptPaymentStatus", o.getPaymentStatus().name());
+                } else {
+                    m.put("receiptPaymentStatus", null);
+                }
+
+                // ── Hạn thanh toán ───────────────────────────────────────────────
                 int debtDays = o.getDebtDays();
                 if (debtDays > 0 && "DEBT".equals(o.getPaymentMethod())
                         && o.getStatus() == OrderStatus.PENDING_PAYMENT
                         && o.getPendingPaymentAt() != null) {
-                    LocalDate base     = Instant.ofEpochMilli(o.getPendingPaymentAt())
+                    LocalDate base = Instant.ofEpochMilli(o.getPendingPaymentAt())
                             .atZone(VN).toLocalDate();
                     LocalDate deadline = base.plusDays(1).plusDays(debtDays);
                     m.put("paymentDeadline",       deadline.format(fmt));
@@ -784,6 +1115,50 @@ public class AccountantController {
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
+
+    /**
+     * Công nợ chưa thanh toán của 1 đơn (đã làm tròn LÊN tới đồng).
+     * Chỉ tính đơn ĐÃ GIAO chờ thu: status == PENDING_PAYMENT và
+     * paymentStatus ∈ {UNPAID, PARTIAL}. UNPAID → finalAmount ;
+     * PARTIAL → finalAmount − paidAmount.
+     */
+    private static long unpaidDebtOf(Order o) {
+        if (o == null || o.getStatus() != OrderStatus.PENDING_PAYMENT) return 0L;
+        PaymentStatus ps = o.getPaymentStatus();
+        if (ps != PaymentStatus.UNPAID && ps != PaymentStatus.PARTIAL) return 0L;
+
+        BigDecimal fin  = o.getFinalAmount() != null ? o.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal paid = o.getPaidAmount()  != null ? o.getPaidAmount()  : BigDecimal.ZERO;
+        BigDecimal amt  = (ps == PaymentStatus.PARTIAL) ? fin.subtract(paid) : fin;
+
+        if (amt.signum() <= 0) return 0L;
+        return amt.setScale(0, RoundingMode.CEILING).longValueExact();
+    }
+
+    /** Đọc an toàn 1 giá trị số (Long/Integer/BigDecimal...) về long; null → 0. */
+    private static long toLongSafe(Object v) {
+        if (v == null) return 0L;
+        if (v instanceof Number n) return n.longValue();
+        try { return Long.parseLong(v.toString()); }
+        catch (NumberFormatException e) { return 0L; }
+    }
+
+    /**
+     * Số phiếu thu (receiptNumber) của các IncomeVoucher liên kết tới đơn hàng.
+     * Chỉ trả khi đơn PAID hoặc PARTIAL; frontend tô màu theo paymentStatus
+     * (PAID → xanh lá, PARTIAL → xanh dương).
+     */
+    private List<String> receiptNumbersOf(Order o) {
+        PaymentStatus ps = o.getPaymentStatus();
+        if (ps != PaymentStatus.PAID && ps != PaymentStatus.PARTIAL) return List.of();
+        if (o.getOrderCode() == null || o.getOrderCode().isBlank()) return List.of();
+        return incomeVoucherRepository.findByLinkedOrderCode(o.getOrderCode()).stream()
+                .map(IncomeVoucher::getReceiptNumber)
+                .filter(rn -> rn != null && !rn.isBlank())
+                .distinct()
+                .sorted()
+                .toList();
+    }
     private Map<String, Object> _toOrderResponseMap(Order o) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",            o.getId());
@@ -808,6 +1183,13 @@ public class AccountantController {
         m.put("paidAmount",      paidAmt);
         m.put("remainingAmount", remainingAmt);   // <-- field mới
 
+        // Phần khách trả dư + phiếu chi hoàn (nếu đã lập) — cho FE hiện nút hoàn dư.
+        BigDecimal overpaid = o.getOverpaidAmount() != null
+                ? o.getOverpaidAmount().setScale(0, RoundingMode.HALF_UP)
+                : BigDecimal.ZERO;
+        m.put("overpaidAmount",             overpaid);
+        m.put("overpaidRefundVoucherCode",  o.getOverpaidRefundVoucherCode());
+
         m.put("discountAmount",    o.getDiscountAmount());
         m.put("vatAmount",         o.getVatAmount());
         m.put("surcharge",         o.getSurcharge());
@@ -819,10 +1201,21 @@ public class AccountantController {
         m.put("pendingPaymentAt",  o.getPendingPaymentAt());
         m.put("receiptFileUrl",    o.getReceiptFileUrl());
         m.put("invoiceNumber",     o.getInvoiceNumber());
+
+        // Cờ cho FE: đơn này bắt buộc thu tiền TRƯỚC khi giao?
+        boolean prepay = orderServiceImpl.isPrepaymentRequired(o);
+        boolean preDelivery = com.nhatnam.server.service.serviceimpl.OrderServiceImpl.isPreDelivery(o);
+        m.put("requirePrepayment", prepay);
+        // true → phiếu thu chỉ ghi nhận ĐÃ THU, KHÔNG chuyển đơn sang Hoàn thành
+        m.put("prepaymentOrder",   prepay && preDelivery);
         return m;
     }
 
     private Map<String, Object> _toOrderMap(Order o) {
+        return _toOrderMap(o, buildReceiptNumbersByOrderCode(Set.of(o.getOrderCode())).getOrDefault(o.getOrderCode(), List.of()));
+    }
+
+    private Map<String, Object> _toOrderMap(Order o, List<String> receiptNumbers) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",            o.getId());
         m.put("orderCode",     o.getOrderCode());
@@ -846,6 +1239,7 @@ public class AccountantController {
         m.put("pendingPaymentAt", o.getPendingPaymentAt());
         m.put("receiptFileUrl", o.getReceiptFileUrl());
         m.put("invoiceNumber",  o.getInvoiceNumber());
+        m.put("receiptNumbers", receiptNumbers);
         return m;
     }
 
@@ -960,6 +1354,41 @@ public class AccountantController {
             return u.getFullName() != null && !u.getFullName().isBlank()
                     ? u.getFullName() : u.getUsername();
         return auth.getName();
+    }
+
+    /**
+     * Thứ tự ưu tiên khi tài khoản kiêm nhiều role mà JWT KHÔNG có claim
+     * {@code selected_role} (authorities lúc đó chứa tất cả role của user).
+     */
+    private static final List<Role> ACTOR_ROLE_PRIORITY = List.of(
+            Role.SUPER_ACCOUNTANT, Role.ACCOUNTANT,
+            Role.SUPER_SELLER,     Role.SELLER,
+            Role.SUPER_WAREHOUSE,  Role.WAREHOUSE,
+            Role.OWNER, Role.ADMIN, Role.SUPERADMIN);
+
+    /**
+     * Role ĐANG THAO TÁC của request — đọc từ authorities của JWT (tôn trọng
+     * claim {@code selected_role} khi tài khoản có nhiều vai trò).
+     *
+     * <p>KHÔNG dùng {@code user.getRole()}: cột {@code _user.role} có thể NULL
+     * với tài khoản multi-role (role thật nằm ở bảng {@code _user_roles}), gây
+     * NPE và routing thông báo sai vai trò.</p>
+     */
+    private String getActorRole(Authentication auth, User user) {
+        Set<Role> acting = AuthRoleUtil.rolesOf(auth);
+        if (!acting.isEmpty()) {
+            if (acting.size() == 1) return acting.iterator().next().name();
+            for (Role r : ACTOR_ROLE_PRIORITY) if (acting.contains(r)) return r.name();
+            return acting.iterator().next().name();
+        }
+        // Fallback khi authorities rỗng (token cũ / role lạ)
+        if (user != null) {
+            if (user.getRole() != null) return user.getRole().name();
+            Set<Role> owned = user.getAllRoles();
+            for (Role r : ACTOR_ROLE_PRIORITY) if (owned.contains(r)) return r.name();
+            if (!owned.isEmpty()) return owned.iterator().next().name();
+        }
+        return "UNKNOWN";
     }
 
     /** Change 3: Danh sách sản phẩm để filter đơn hàng */

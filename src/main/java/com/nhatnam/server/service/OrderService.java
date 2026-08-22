@@ -38,6 +38,35 @@ public interface OrderService {
                                     null, null, null);
     }
 
+    /**
+     * THU TIỀN TRƯỚC KHI GIAO — dành cho khách bị owner yêu cầu "thanh toán trước".
+     *
+     * <p>Chỉ áp dụng khi đơn còn ở trạng thái trước khi giao (PENDING/CONFIRMED/PREPARING/READY).
+     * <b>KHÔNG đổi trạng thái đơn</b> — chỉ cập nhật paidAmount + paymentStatus.
+     * Khi paymentStatus = PAID thì kho mới được chuyển đơn sang "Đang giao".
+     *
+     * @param waiveRemainder true = bỏ phần lẻ còn thiếu, đánh dấu đã thu đủ
+     */
+    OrderResponse recordPrepayment(Long orderId, BigDecimal amount, boolean waiveRemainder,
+                                   String actorName, String paymentMethod,
+                                   String bankName, String transactionRef, Long actorUserId);
+
+    /**
+     * GỠ một khoản đã thu khỏi đơn — dùng khi SỬA phiếu thu.
+     *
+     * <p>Sửa phiếu thu = đảo tác động cũ rồi áp lại. "Đảo" nghĩa là trừ đúng số
+     * tiền phiếu đó đã ghi cho đơn, rồi tính lại trạng thái từ paidAmount còn lại:
+     * <pre>
+     *   paidAmount mới = 0  → về "chờ thanh toán" (PENDING_PAYMENT), UNPAID
+     *   0 &lt; paidAmount &lt; final → PARTIAL, giữ nguyên đang giao/chờ TT
+     * </pre>
+     * Đây KHÔNG phải hoàn tiền cho khách; chỉ chỉnh sổ nội bộ khi phiếu ghi sai.
+     *
+     * @param amountToRemove số tiền cần trừ khỏi paidAmount của đơn
+     */
+    OrderResponse detachPaymentForVoucherEdit(Long orderId, BigDecimal amountToRemove,
+                                              String actorName, Long actorUserId);
+
     OrderResponse createOrder(CreateOrderRequest request, Long userId);
     OrderResponse markAsPreparing(Long orderId, Long userId);
     OrderResponse markAsCompleted(Long orderId, String actorName);

@@ -35,6 +35,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.Locale;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nhatnam.server.service.AddressCatalogService;
 
 @Service
 @RequiredArgsConstructor
@@ -59,6 +60,7 @@ public class OrderServiceImpl implements OrderService {
     private final FifoDeductService             fifoDeductService;
     private final OrderStockDeductionRepository orderStockDeductionRepository;
     private final IngredientExpiryRepository    ingredientExpiryRepository;
+    private final com.nhatnam.server.service.CustomerContractService customerContractService;
     private final OrderCodePrefixRepository     orderCodePrefixRepository;
 
     private static final String RETAIL_GUEST_LABEL = "Khách vãng lai";
@@ -182,6 +184,10 @@ public class OrderServiceImpl implements OrderService {
                 && order.getStatus() != OrderStatus.PENDING_PAYMENT)
             throw new RuntimeException("Chỉ được đổi phương thức khi đơn đang Giao hàng hoặc Chờ thanh toán");
 
+        assertDebtAllowed(order.getCustomer(), paymentMethod);
+        assertPaymentMethodAllowedForZone(order.getCustomer(), paymentMethod,
+                order.getProvinceName(), order.getWardName(), order.getDeliveryAddress());
+
         order.setPaymentMethod(paymentMethod);
         boolean isDebt = "DEBT".equalsIgnoreCase(paymentMethod) || "OTHER".equalsIgnoreCase(paymentMethod);
         if (isDebt) {
@@ -275,6 +281,13 @@ public class OrderServiceImpl implements OrderService {
                 .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
         assertNotCancelled(order);
 
+        // Đơn CHƯA GIAO đi qua luồng thu tiền trước: nó không đổi trạng thái đơn và bắt
+        // buộc thu đủ. Chuyển hướng tại đây thay vì ném lỗi, vì thanh toán bằng voucher
+        // hoàn toàn có thể diễn ra lúc đơn còn "Đang chuẩn bị".
+        if (isPreDelivery(order))
+            return recordPrepayment(orderId, paidAmount, false, actorName,
+                    paymentMethod, bankName, transactionRef, actorUserId);
+
         if (order.getStatus() != OrderStatus.DELIVERING && order.getStatus() != OrderStatus.PENDING_PAYMENT)
             throw new RuntimeException("Chỉ có thể ghi nhận thanh toán ở trạng thái 'Đang giao' hoặc 'Chờ thanh toán'");
 
@@ -282,7 +295,12 @@ public class OrderServiceImpl implements OrderService {
         BigDecimal newPaid     = currentPaid.add(paidAmount);
         BigDecimal finalAmount = order.getFinalAmount();
 
-        if (newPaid.compareTo(finalAmount) > 0)
+        // Dung sai 1 đồng: VND không có lẻ nên người dùng chỉ gõ được số nguyên, nhưng các đơn
+        // cũ (tạo trước khi finalAmount được làm tròn nguyên ở nguồn) có thể còn lệch vài hào/đồng.
+        // Không dùng dung sai này để thay đổi cách tính finalAmount — chỉ để so sánh "đã thu đủ".
+        BigDecimal tolerance = BigDecimal.ONE;
+
+        if (newPaid.compareTo(finalAmount.add(tolerance)) > 0)
             throw new RuntimeException(String.format(
                     "Tổng số tiền thu (%s) vượt quá giá trị đơn hàng (%s)",
                     newPaid.toPlainString(), finalAmount.toPlainString()));
@@ -291,14 +309,32 @@ public class OrderServiceImpl implements OrderService {
         order.setPaidAmount(newPaid);
         order.setUpdatedAt(now);
 
-        boolean isFullyPaid = newPaid.compareTo(finalAmount) >= 0;
+        boolean isFullyPaid = newPaid.compareTo(finalAmount.subtract(tolerance)) >= 0;
+
+        // ĐƠN CHƯA GIAO XONG thì THU TIỀN KHÔNG ĐƯỢC ĐÓNG ĐƠN.
+        //
+        // Với luồng thanh toán trước (khách không công nợ, hoặc giao ngoài địa bàn), kế
+        // toán lập phiếu thu khi đơn còn PREPARING/DELIVERING. Nếu vẫn set COMPLETED như
+        // cũ thì đơn biến mất khỏi hàng chờ của kho, hàng chưa ai giao mà hệ thống báo
+        // xong — và trạng thái đó cũng chặn luôn markAsDelivering ở bước sau.
+        //
+        // Ở đây chỉ ghi nhận ĐÃ THANH TOÁN. Việc chuyển sang COMPLETED để cho
+        // markAsDelivered lo: nó đã có sẵn nhánh "thu đủ rồi thì hoàn thành luôn".
+        // Không dùng isPreDelivery(): tập đó KHÔNG gồm DELIVERING vì nó phục vụ tính công
+        // nợ (hàng đã rời kho là đã ghi nợ). Ở đây câu hỏi khác — "hàng tới tay khách
+        // chưa" — nên đơn đang trên đường giao vẫn phải tính là CHƯA giao xong.
+        boolean deliveredAlready = order.getStatus() == OrderStatus.PENDING_PAYMENT
+                || order.getStatus() == OrderStatus.COMPLETED;
+
         if (isFullyPaid) {
             order.setPaymentStatus(PaymentStatus.PAID);
-            order.setStatus(OrderStatus.COMPLETED);
+            if (deliveredAlready) order.setStatus(OrderStatus.COMPLETED);
         } else {
             order.setPaymentStatus(PaymentStatus.PARTIAL);
-            order.setStatus(OrderStatus.PENDING_PAYMENT);
-            order.setPendingPaymentAt(now);
+            if (deliveredAlready) {
+                order.setStatus(OrderStatus.PENDING_PAYMENT);
+                order.setPendingPaymentAt(now);
+            }
             order.setDebtDays(debtDays);
         }
 
@@ -324,6 +360,247 @@ public class OrderServiceImpl implements OrderService {
 
         notifyOrderUpdate(saved, isFullyPaid ? "ORDER_PAID" : "ORDER_PARTIAL_PAID", msg, payload, actorUserId);
         if (isFullyPaid) updateSellerKpi(saved);
+        return mapToResponse(saved);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // YÊU CẦU THANH TOÁN TRƯỚC (PREPAYMENT)
+    // ════════════════════════════════════════════════════════════════
+
+    /** Các trạng thái TRƯỚC KHI GIAO — đơn chưa rời kho. */
+    private static final java.util.EnumSet<OrderStatus> PRE_DELIVERY_STATUSES =
+            java.util.EnumSet.of(OrderStatus.PENDING, OrderStatus.CONFIRMED,
+                    OrderStatus.PREPARING, OrderStatus.READY);
+
+    /** Dung sai 1 đồng khi so sánh "đã thu đủ" (đơn cũ có thể còn lệch vài hào). */
+    private static final BigDecimal PAY_TOLERANCE = BigDecimal.ONE;
+
+    /**
+     * MỨC "BỎ PHẦN DƯ" TỐI ĐA khi thu tiền trước.
+     *
+     * <p>Đơn thu trước bắt buộc trả HẾT trong một lần, nhưng thực tế quầy hay làm tròn:
+     * đơn 202.000 khách đưa 200.000. Cho phép kế toán tick "thu đủ, bỏ phần dư" trong
+     * hạn mức này.
+     *
+     * <p>Phải có trần, nếu không cờ đó thành cửa sau: thu 100.000 cho đơn 5 triệu rồi
+     * tick bỏ dư là đơn được đánh dấu PAID và kho được phép giao. Lấy đúng ngưỡng
+     * 50.000đ mà màn hình seller đang dùng cho thao tác tương đương.
+     */
+    private static final BigDecimal MAX_WAIVE_AMOUNT = new BigDecimal("50000");
+
+    /**
+     * Đơn này có bắt buộc thanh toán trước không?
+     * Ưu tiên SNAPSHOT trên đơn; đơn cũ (null) thì fallback đọc từ khách hàng.
+     */
+    /**
+     * ĐƠN NÀY CÓ BẮT BUỘC THU TIỀN TRƯỚC KHI GIAO KHÔNG.
+     *
+     * <p>Ba nguồn, xét theo thứ tự:
+     * <ol>
+     *   <li>Cờ đặt riêng trên đơn — người có thẩm quyền đã quyết cho đơn này.</li>
+     *   <li>Cấu hình của khách hàng.</li>
+     *   <li><b>Suy ra từ nghiệp vụ</b>: giao NGOÀI địa bàn TP.HCM cũ.</li>
+     * </ol>
+     *
+     * <p>Nhánh (3) là quy tắc mới: xe đi xa, khách từ chối nhận là mất nguyên chuyến. Xem
+     * {@link DeliveryZoneUtil} về lý do Bình Dương và Bà Rịa – Vũng Tàu vẫn tính là ngoài
+     * địa bàn dù đã sáp nhập.
+     *
+     * <p>CHƯA xét điều kiện "khách không được cấp công nợ" — {@code invoiceDays} hiện mặc
+     * định {@code -1} cho hầu hết khách, bật lên sẽ khiến gần như mọi đơn phải thu tiền
+     * trước và kho kẹt hàng loạt. Cần làm sạch dữ liệu khách trước, rồi mới thêm nhánh đó.
+     *
+     * <p>Cờ trên đơn vẫn TẮT được yêu cầu này cho một đơn cụ thể (khách quen, đã thoả
+     * thuận riêng) — vì vậy nó được xét trước.
+     */
+    public boolean isPrepaymentRequired(Order order) {
+        // Cờ trên đơn CHỈ BẬT THÊM được yêu cầu, không tắt được — createOrder luôn ghi
+        // false cho mọi đơn nên đọc thẳng giá trị sẽ vô hiệu hoá toàn bộ quy tắc bên dưới.
+        if (Boolean.TRUE.equals(order.getRequirePrepayment())) return true;
+
+        Customer c = order.getCustomer();
+        if (c != null && Boolean.TRUE.equals(c.getRequirePrepayment())) return true;
+
+        // ── KHÁCH CÓ HỢP ĐỒNG: miễn hoàn toàn ────────────────────────────────
+        // CK, TM hay công nợ đều được giao trước khi thu — đã có hợp đồng làm căn cứ đòi.
+        if (c != null && c.getId() != null && customerContractService.isDebtAllowed(c))
+            return false;
+
+        // ── KHÁCH CHƯA CÓ HỢP ĐỒNG ───────────────────────────────────────────
+        // TH1. Chuyển khoản  → luôn phải thu trước. Không ai cầm tiền lúc giao; hàng đi
+        //      rồi mà khách không chuyển thì không còn đòn bẩy nào.
+        if (!"CASH".equalsIgnoreCase(order.getPaymentMethod())) return true;
+
+        // KHÁCH TỰ TỚI KHO: hàng chỉ rời kho khi khách đứng đó trả tiền — đúng bản chất
+        // COD, và không có chuyến giao nào để mất. Không có tỉnh/phường nên phải nhận
+        // dạng riêng, nếu không mọi đơn nhận tại kho sẽ bị bắt thu trước.
+        if (addressCatalogService.isPickupAtWarehouse(order.getDeliveryAddress())) return false;
+
+        // TH2 + TH3. Tiền mặt → chỉ được COD nếu phường/xã nằm trong allow.json.
+        //      Danh sách đó hiện chỉ chứa phường thuộc TP.HCM cũ, nên phường của Bình
+        //      Dương / Bà Rịa – Vũng Tàu tuy đã thuộc TP.HCM vẫn phải thu trước — đúng
+        //      yêu cầu nghiệp vụ, và mở rộng vùng COD về sau chỉ cần sửa file, không sửa code.
+        return !addressCatalogService.isCodAllowed(order.getProvinceName(), order.getWardName());
+    }
+
+    /** Lý do bắt buộc thu tiền trước — để thông báo nói rõ nguyên nhân. */
+    public String prepaymentReason(Order order) {
+        Customer c = order.getCustomer();
+        if (c != null && c.getId() != null && customerContractService.isDebtAllowed(c))
+            return "Đơn hàng yêu cầu thanh toán trước";
+
+        if (!"CASH".equalsIgnoreCase(order.getPaymentMethod()))
+            return "Đơn chuyển khoản phải thanh toán trước khi giao";
+
+        if (addressCatalogService.isPickupAtWarehouse(order.getDeliveryAddress()))
+            return "Đơn hàng yêu cầu thanh toán trước";
+        if (order.getWardName() == null || order.getWardName().isBlank())
+            return "Địa chỉ giao chưa chọn phường/xã nên không xác định được vùng giao";
+
+        return "Địa chỉ giao (" + order.getWardName() + ") không thuộc vùng được giao COD";
+    }
+
+    public static boolean isPreDelivery(Order order) {
+        return order.getStatus() != null && PRE_DELIVERY_STATUSES.contains(order.getStatus());
+    }
+
+    private static BigDecimal remainingAmount(Order order) {
+        BigDecimal fin  = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal paid = order.getPaidAmount()  != null ? order.getPaidAmount()  : BigDecimal.ZERO;
+        BigDecimal rem  = fin.subtract(paid);
+        return rem.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : rem;
+    }
+
+    private static boolean isFullyPaid(Order order) {
+        if (order.getPaymentStatus() == PaymentStatus.PAID) return true;
+        BigDecimal fin  = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal paid = order.getPaidAmount()  != null ? order.getPaidAmount()  : BigDecimal.ZERO;
+        return paid.compareTo(fin.subtract(PAY_TOLERANCE)) >= 0;
+    }
+
+    /**
+     * Tính lại {@code paymentStatus} sau khi {@code finalAmount} bị thay đổi (sửa đơn).
+     *
+     * <p>Chỉ áp dụng cho đơn CHƯA GIAO và ĐÃ CÓ TIỀN THU (thu trước). Không đụng tới
+     * đơn đã giao (DELIVERING/PENDING_PAYMENT/COMPLETED) để không phá logic công nợ hiện có.
+     *
+     * <p>Không đổi {@code order.status} — chỉ đổi {@code paymentStatus}, vì đây chính là
+     * thứ quyết định kho có được bấm "Đang giao" hay không.
+     */
+    private void recalcPaymentStatusAfterAmountChange(Order order) {
+        if (!isPreDelivery(order)) return;
+
+        BigDecimal paid = order.getPaidAmount() != null ? order.getPaidAmount() : BigDecimal.ZERO;
+        if (paid.compareTo(BigDecimal.ZERO) <= 0) return;   // chưa thu đồng nào → giữ nguyên
+
+        BigDecimal fin = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+
+        if (paid.compareTo(fin.subtract(PAY_TOLERANCE)) >= 0) {
+            order.setPaymentStatus(PaymentStatus.PAID);
+        } else {
+            // Đơn tăng tiền sau khi đã thu → thu THIẾU → chặn kho giao cho tới khi thu bù
+            order.setPaymentStatus(PaymentStatus.PARTIAL);
+        }
+        // Thu vượt (đơn bị giảm tiền sau khi thu) → cần hoàn tiền/ghi có, ghi log để kế toán biết
+        if (paid.compareTo(fin.add(PAY_TOLERANCE)) > 0) {
+            log.warn("[PREPAYMENT] Đơn {} đã thu {} nhưng tổng đơn sau khi sửa chỉ còn {} — THU VƯỢT {}",
+                    order.getOrderCode(), paid.toPlainString(), fin.toPlainString(),
+                    paid.subtract(fin).toPlainString());
+        }
+    }
+
+    /**
+     * GHI NHẬN THU TIỀN TRƯỚC KHI GIAO (đơn còn ở PENDING/CONFIRMED/PREPARING/READY).
+     *
+     * <p>Khác biệt cốt lõi với {@code markAsCompleted} / {@code recordPartialPayment}:
+     * <b>KHÔNG đụng tới {@code order.status}</b>. Đơn vẫn nằm nguyên ở "Đang chuẩn bị"
+     * để nhân viên kho tiếp tục soạn hàng — chỉ cập nhật {@code paidAmount} +
+     * {@code paymentStatus}. Khi đã PAID thì kho mới được bấm "Đang giao".
+     *
+     * @param waiveRemainder true = bỏ phần lẻ còn thiếu, đánh dấu PAID luôn
+     */
+    @Override
+    @Transactional
+    public OrderResponse recordPrepayment(Long orderId, BigDecimal amount, boolean waiveRemainder,
+                                          String actorName, String paymentMethod,
+                                          String bankName, String transactionRef, Long actorUserId) {
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0)
+            throw new RuntimeException("Số tiền thu phải lớn hơn 0");
+
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
+        assertNotCancelled(order);
+
+        if (!isPreDelivery(order))
+            throw new RuntimeException("Đơn " + order.getOrderCode()
+                    + " không còn ở trạng thái trước khi giao — dùng thu tiền thông thường");
+
+        BigDecimal currentPaid = order.getPaidAmount() != null ? order.getPaidAmount() : BigDecimal.ZERO;
+        BigDecimal newPaid     = currentPaid.add(amount);
+        BigDecimal finalAmount = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+
+        if (newPaid.compareTo(finalAmount.add(PAY_TOLERANCE)) > 0)
+            throw new RuntimeException(String.format(
+                    "Tổng số tiền thu (%s) vượt quá giá trị đơn hàng (%s)",
+                    newPaid.toPlainString(), finalAmount.toPlainString()));
+
+        // ── ĐƠN THU TRƯỚC PHẢI TRẢ HẾT TRONG MỘT LẦN ──────────────────────────
+        // Mục đích của việc thu trước là kho chỉ giao khi tiền đã về đủ. Cho phép thu
+        // nhiều đợt sẽ tạo ra những đơn nằm lửng ở PARTIAL: kho vẫn bị chặn, kế toán
+        // tưởng đã xử lý xong, và không ai thấy đơn đó đang kẹt vì lý do gì.
+        BigDecimal shortfall = finalAmount.subtract(newPaid);
+        boolean coversAll = shortfall.compareTo(PAY_TOLERANCE) <= 0;
+
+        if (!coversAll) {
+            if (!waiveRemainder)
+                throw new RuntimeException(String.format(
+                        "Đơn thu tiền trước phải thanh toán đủ. Còn thiếu %s đ — "
+                                + "nếu khách trả thiếu do làm tròn, chọn \"thu đủ, bỏ phần dư\".",
+                        shortfall.setScale(0, RoundingMode.HALF_UP).toPlainString()));
+
+            if (shortfall.compareTo(MAX_WAIVE_AMOUNT) > 0)
+                throw new RuntimeException(String.format(
+                        "Phần dư %s đ vượt mức được phép bỏ (tối đa %s đ). "
+                                + "Vui lòng thu đủ hoặc điều chỉnh giá trị đơn hàng.",
+                        shortfall.setScale(0, RoundingMode.HALF_UP).toPlainString(),
+                        MAX_WAIVE_AMOUNT.toPlainString()));
+        }
+
+        long now = System.currentTimeMillis();
+        // Tới đây chắc chắn PAID: hoặc đã đủ tiền, hoặc phần thiếu nằm trong hạn mức bỏ dư.
+        boolean fullyPaid = true;
+
+        order.setPaidAmount(newPaid);
+        order.setPaymentStatus(fullyPaid ? PaymentStatus.PAID : PaymentStatus.PARTIAL);
+        // ⚠️ CỐ TÌNH KHÔNG đổi order.status — đơn vẫn "Đang chuẩn bị"
+        order.setUpdatedAt(now);
+        Order saved = orderRepository.save(order);
+
+        String method = paymentMethod != null ? paymentMethod.toUpperCase()
+                : (order.getPaymentMethod() != null ? order.getPaymentMethod() : "CASH");
+        paymentTransactionRepository.save(PaymentTransaction.builder()
+                .order(saved).amount(amount).paymentMethod(method)
+                .bankName(bankName).transactionRef(transactionRef)
+                .collectedBy(actorName).createdAt(now)
+                .note("Thu trước khi giao hàng"
+                        + (waiveRemainder ? " (bỏ số lẻ còn thiếu)" : ""))
+                .build());
+
+        log(saved, fullyPaid ? "PREPAYMENT_FULL" : "PREPAYMENT_PARTIAL", actorName, "ACCOUNTANT",
+                String.format("Thu trước: %s (%s) | Tổng đã thu: %s / %s%s",
+                        amount.toPlainString(), method,
+                        newPaid.toPlainString(), finalAmount.toPlainString(),
+                        fullyPaid ? " — ĐÃ ĐỦ, kho có thể giao hàng" : " — CHƯA ĐỦ, kho chưa được giao"));
+
+        String payload = "{\"orderId\":" + orderId + ",\"orderCode\":\"" + saved.getOrderCode() + "\"}";
+        notifyOrderUpdate(saved,
+                fullyPaid ? "ORDER_PREPAID" : "ORDER_PARTIAL_PAID",
+                fullyPaid
+                        ? "Đơn " + saved.getOrderCode() + " đã thu đủ tiền trước — kho có thể giao hàng"
+                        : "Đơn " + saved.getOrderCode() + " đã thu trước 1 phần bởi " + actorName
+                          + " (" + amount.toPlainString() + ") — chưa đủ để giao",
+                payload, actorUserId);
+
         return mapToResponse(saved);
     }
 
@@ -360,6 +637,19 @@ public class OrderServiceImpl implements OrderService {
         assertNotCancelled(order);
         if (order.getStatus() != OrderStatus.DELIVERING)
             throw new RuntimeException("Chỉ có thể chuyển sang 'Chờ thanh toán' từ trạng thái 'Đang giao'");
+
+        // ── ĐƠN ĐÃ THU ĐỦ TIỀN → HOÀN THÀNH LUÔN ─────────────────────────────
+        // Điển hình: khách bắt buộc THANH TOÁN TRƯỚC — tiền đã thu xong từ lúc đơn
+        // còn đang chuẩn bị. Khi kho xác nhận đã giao xong thì không có gì để "chờ thu"
+        // nữa → chuyển thẳng COMPLETED thay vì PENDING_PAYMENT (nếu không, đơn sẽ nằm
+        // lì ở "Chờ thanh toán" và bị tính vào công nợ dù đã trả tiền).
+        //
+        // So sánh sau khi LÀM TRÒN CẢ HAI về hàng đơn vị đồng — final_amount có thể
+        // còn số lẻ (VAT/chiết khấu), paid_amount là tiền thực thu (số nguyên).
+        if (isPaidInFullRounded(order)) {
+            return markAsCompleted(orderId, actorName, actorUserId);
+        }
+
         Customer customer = order.getCustomer();
         order.setStatus(OrderStatus.PENDING_PAYMENT);
         order.setDebtDays(customer != null ? customer.getDebtDays() : 0);
@@ -371,6 +661,22 @@ public class OrderServiceImpl implements OrderService {
         notifyOrderUpdate(saved, "ORDER_PENDING_PAYMENT",
                 "Đơn " + saved.getOrderCode() + " chuyển trạng thái Chờ Thanh Toán bởi " + actorName, payload, actorUserId);
         return mapToResponse(saved);
+    }
+
+    /**
+     * ĐÃ THU ĐỦ chưa? So sánh {@code paid_amount} với {@code final_amount}
+     * sau khi LÀM TRÒN CẢ HAI về hàng đơn vị đồng (HALF_UP).
+     *
+     * <p>{@code final_amount} có thể còn số lẻ do VAT/chiết khấu, trong khi tiền thực thu
+     * luôn là số nguyên → so sánh trực tiếp sẽ luôn ra "thiếu vài hào" và đơn không bao giờ
+     * được coi là thu đủ.
+     */
+    private static boolean isPaidInFullRounded(Order order) {
+        BigDecimal fin  = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal paid = order.getPaidAmount()  != null ? order.getPaidAmount()  : BigDecimal.ZERO;
+        if (fin.compareTo(BigDecimal.ZERO) <= 0) return false;   // đơn 0đ → không tự hoàn thành
+        return paid.setScale(0, RoundingMode.HALF_UP)
+                .compareTo(fin.setScale(0, RoundingMode.HALF_UP)) >= 0;
     }
 
     @Override
@@ -402,10 +708,149 @@ public class OrderServiceImpl implements OrderService {
 
     @Override
     @Transactional
+    public OrderResponse detachPaymentForVoucherEdit(Long orderId, BigDecimal amountToRemove,
+                                                     String actorName, Long actorUserId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
+
+        BigDecimal fin    = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal remove = amountToRemove != null
+                ? amountToRemove.setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO;
+
+        // ── 1. XOÁ giao dịch tương ứng khỏi sổ tiền ──────────────────────────
+        //   Tìm giao dịch MỚI NHẤT có đúng số tiền đang gỡ. Phiếu chỉ ghi một
+        //   khoản cho mỗi đơn nên khớp theo số tiền là đủ; lấy bản mới nhất để
+        //   khi có hai khoản trùng số thì gỡ cái gần nhất.
+        List<PaymentTransaction> txs =
+                paymentTransactionRepository.findByOrderIdOrderByCreatedAtAsc(orderId);
+        PaymentTransaction toDelete = null;
+        for (PaymentTransaction tx : txs) {
+            BigDecimal amt = tx.getAmount() != null
+                    ? tx.getAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO;
+            if (amt.compareTo(remove) == 0) toDelete = tx;   // giữ cái sau cùng
+        }
+
+        boolean ledgerComplete;
+        if (toDelete != null) {
+            paymentTransactionRepository.delete(toDelete);
+            txs.remove(toDelete);
+            ledgerComplete = true;
+        } else {
+            // Không tìm thấy giao dịch khớp (dữ liệu CŨ: khoản thu tạo bằng
+            // markAsCompleted trước đây không ghi sổ). Không dựng lại log để khỏi
+            // làm mất lịch sử; chỉ trừ tiền và ghi một log gỡ.
+            ledgerComplete = false;
+        }
+
+        // ── 2. Tính lại paidAmount ───────────────────────────────────────────
+        BigDecimal newPaid;
+        if (ledgerComplete) {
+            // Cộng lại từ sổ đã xoá giao dịch → luôn khớp lịch sử.
+            newPaid = txs.stream()
+                    .map(t -> t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+                    .setScale(0, RoundingMode.HALF_UP);
+        } else {
+            BigDecimal paid = order.getPaidAmount() != null ? order.getPaidAmount() : BigDecimal.ZERO;
+            newPaid = paid.subtract(remove);
+        }
+        if (newPaid.compareTo(BigDecimal.ZERO) < 0) newPaid = BigDecimal.ZERO;
+        newPaid = newPaid.setScale(0, RoundingMode.HALF_UP);
+        order.setPaidAmount(newPaid);
+
+        // ── 3. Tính lại trạng thái từ số tiền còn lại ────────────────────────
+        boolean preDelivery = isPreDelivery(order);
+        if (newPaid.compareTo(BigDecimal.ZERO) <= 0) {
+            // Gỡ HẾT phần phiếu này đã thu (đơn chỉ thu từ 1 phiếu, hoặc gỡ nốt
+            // khoản cuối) → về chưa thanh toán.
+            order.setPaymentStatus(PaymentStatus.UNPAID);
+            if (!preDelivery && order.getStatus() == OrderStatus.COMPLETED)
+                order.setStatus(OrderStatus.PENDING_PAYMENT);
+        } else if (newPaid.compareTo(fin) >= 0) {
+            order.setPaymentStatus(PaymentStatus.PAID);
+        } else {
+            // Còn một phần (đơn thu từ nhiều phiếu, mới gỡ một) → PARTIAL.
+            order.setPaymentStatus(PaymentStatus.PARTIAL);
+            if (!preDelivery && order.getStatus() == OrderStatus.COMPLETED)
+                order.setStatus(OrderStatus.PENDING_PAYMENT);
+        }
+        order.setUpdatedAt(System.currentTimeMillis());
+        Order saved = orderRepository.save(order);
+
+        // ── 4. Dựng lại order_log ────────────────────────────────────────────
+        if (ledgerComplete) {
+            rebuildPaymentLogsFromLedger(saved, txs);
+        } else {
+            log(saved, "PAYMENT_DETACHED", actorName, "ACCOUNTANT",
+                    "Gỡ " + remove.toPlainString() + "đ khi sửa phiếu thu");
+        }
+
+        updateSellerKpi(saved);
+        return mapToResponse(saved);
+    }
+
+    /**
+     * DỰNG LẠI toàn bộ log thanh toán của đơn TỪ SỔ TIỀN (payment_transaction).
+     *
+     * <p>Xoá hết log dạng thanh toán cũ rồi phát lại theo đúng thứ tự giao dịch —
+     * mỗi giao dịch một dòng, có tổng luỹ kế đúng, và tự đánh dấu FULLY_PAID khi
+     * chạm giá trị đơn. Nhờ vậy khi gỡ một khoản giữa chừng, các khoản còn lại
+     * "dồn lên" và một dòng từng là COMPLETED sẽ thành PARTIAL_PAYMENT.
+     *
+     * <p>KHÔNG đụng các log khác (tạo đơn, chuẩn bị, giao, đổi phương thức…) —
+     * chỉ dựng lại đúng nhóm log tiền.
+     *
+     * @param txs sổ tiền đã bỏ giao dịch bị gỡ, theo thứ tự thời gian
+     */
+    private void rebuildPaymentLogsFromLedger(Order order, List<PaymentTransaction> txs) {
+        // Xoá log tiền cũ, giữ nguyên log quy trình.
+        Set<String> paymentActions = Set.of(
+                "PARTIAL_PAYMENT", "FULLY_PAID",
+                "PREPAYMENT_PARTIAL", "PREPAYMENT_FULL",
+                "COMPLETED", "PAYMENT_DETACHED");
+        List<OrderLog> all = orderLogRepository.findByOrderIdOrderByCreatedAtAsc(order.getId());
+        List<OrderLog> toRemove = all.stream()
+                .filter(l -> l.getAction() != null && paymentActions.contains(l.getAction()))
+                .toList();
+        orderLogRepository.deleteAll(toRemove);
+
+        BigDecimal fin = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal tolerance = BigDecimal.ONE;
+
+        BigDecimal running = BigDecimal.ZERO;
+        List<OrderLog> rebuilt = new ArrayList<>();
+        for (PaymentTransaction tx : txs) {
+            BigDecimal amt = tx.getAmount() != null ? tx.getAmount() : BigDecimal.ZERO;
+            running = running.add(amt);
+            boolean fully = running.compareTo(fin.subtract(tolerance)) >= 0;
+            String method = tx.getPaymentMethod() != null ? tx.getPaymentMethod() : "CASH";
+
+            rebuilt.add(OrderLog.builder()
+                    .order(order)
+                    .action(fully ? "FULLY_PAID" : "PARTIAL_PAYMENT")
+                    .actorName(tx.getCollectedBy())
+                    .actorRole("ACCOUNTANT")
+                    .note(String.format("Thu: %s (%s) | Tổng đã thu: %s / %s",
+                            amt.setScale(0, RoundingMode.HALF_UP).toPlainString(), method,
+                            running.setScale(0, RoundingMode.HALF_UP).toPlainString(),
+                            fin.setScale(0, RoundingMode.HALF_UP).toPlainString()))
+                    // Giữ mốc thời gian gốc của giao dịch để log vẫn đúng thứ tự
+                    // xen kẽ với các log quy trình khác.
+                    .createdAt(tx.getCreatedAt())
+                    .build());
+        }
+        orderLogRepository.saveAll(rebuilt);
+    }
+
+    @Override
+    @Transactional
     public OrderResponse updatePaymentMethod(Long orderId, String paymentMethod, String actorName) {
         Order order = orderRepository.findById(orderId)
                 .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
         assertNotCancelled(order);
+        assertDebtAllowed(order.getCustomer(), paymentMethod);
+        assertPaymentMethodAllowedForZone(order.getCustomer(), paymentMethod,
+                order.getProvinceName(), order.getWardName(), order.getDeliveryAddress());
         order.setPaymentMethod(paymentMethod);
         order.setUpdatedAt(System.currentTimeMillis());
         Order saved = orderRepository.saveAndFlush(order);
@@ -427,6 +872,18 @@ public class OrderServiceImpl implements OrderService {
         assertNotCancelled(order);
         if (order.getStatus() != OrderStatus.PREPARING)
             throw new RuntimeException("Chỉ có thể chuyển sang 'Đang giao' từ 'Đang chuẩn bị'");
+
+        // ── YÊU CẦU THANH TOÁN TRƯỚC ──────────────────────────────────────────
+        // Khách hàng được owner cấu hình "bắt buộc thanh toán trước" → nhân viên kho
+        // KHÔNG được chuyển đơn sang "Đang giao" khi đơn chưa thanh toán đủ.
+        if (isPrepaymentRequired(order) && !isFullyPaid(order)) {
+            BigDecimal remaining = remainingAmount(order);
+            throw new RuntimeException(
+                    prepaymentReason(order) + " — cần THANH TOÁN TRƯỚC khi giao hàng. "
+                            + "Đơn còn thiếu " + remaining.setScale(0, RoundingMode.HALF_UP).toPlainString()
+                            + " đ. Vui lòng chờ kinh doanh/kế toán xác nhận đã thu đủ tiền.");
+        }
+
         order.setStatus(OrderStatus.DELIVERING);
         order.setUpdatedAt(System.currentTimeMillis());
         Order saved = orderRepository.save(order);
@@ -442,6 +899,7 @@ public class OrderServiceImpl implements OrderService {
     // ════════════════════════════════════════════════════════════════
 
     private final CartHoldService cartHoldService;
+    private final AddressCatalogService addressCatalogService;
 
     @Override
     @Transactional
@@ -832,8 +1290,17 @@ public class OrderServiceImpl implements OrderService {
         order.setVatAmount(totalVat);
         order.setTotalAmount(afterDiscount);
         order.setSurcharge(surcharge);
-        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge));
+        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge)
+                .setScale(0, RoundingMode.HALF_UP)); // VND không có lẻ — làm tròn nguyên để khớp số tiền thực thu
         order.setSurchargeDetail(surchargeDetail);
+
+        // ── FIX: ĐƠN ĐÃ THU TIỀN TRƯỚC MÀ BỊ SỬA LẠI ─────────────────────────
+        // Sale sửa món/số lượng/giá của đơn đang PREPARING → finalAmount thay đổi.
+        // Nếu đơn đã thu tiền trước (paidAmount > 0), paymentStatus cũ có thể sai:
+        //   - Tăng tiền đơn  → vẫn PAID nhưng thực tế thu THIẾU → kho vẫn giao được (SAI!)
+        //   - Giảm tiền đơn  → vẫn PARTIAL nhưng thực tế đã thu ĐỦ → kho bị chặn oan
+        // → Tính lại paymentStatus theo finalAmount MỚI.
+        recalcPaymentStatusAfterAmountChange(order);
 
         if (request.getShowPrices() != null) order.setShowPrices(request.getShowPrices());
         if (request.getHideAllPrices() != null) {
@@ -852,6 +1319,9 @@ public class OrderServiceImpl implements OrderService {
         }
         if (request.getDeliveryDatetime() != null) order.setDeliveryDatetime(request.getDeliveryDatetime());
         if (request.getPaymentMethod() != null) {
+            assertDebtAllowed(order.getCustomer(), request.getPaymentMethod());
+            assertPaymentMethodAllowedForZone(order.getCustomer(), request.getPaymentMethod(),
+                    order.getProvinceName(), order.getWardName(), order.getDeliveryAddress());
             order.setPaymentMethod(request.getPaymentMethod());
             boolean isDebt = "DEBT".equalsIgnoreCase(request.getPaymentMethod());
             if (isDebt && order.getCustomer() != null && order.getCustomer().getDebtDays() > 0) {
@@ -919,16 +1389,27 @@ public class OrderServiceImpl implements OrderService {
             BigDecimal canRestore = remaining.min(d.getQuantity());
             remaining = remaining.subtract(canRestore);
 
-            if (d.getIngredientExpiry() != null) {
-                ingredientExpiryRepository.findById(d.getIngredientExpiry().getId())
-                        .ifPresent(lot -> {
-                            lot.setQuantity(lot.getQuantity().add(canRestore));
-                            lot.setUpdatedAt(now);
-                            ingredientExpiryRepository.save(lot);
-                        });
-            }
-
             IngredientStock stock = d.getIngredientStock();
+
+            // Hoàn lô — cùng lý do như restoreStock(): không được có nhánh nào
+            // chỉ cộng tồn tổng mà bỏ qua lô.
+            IngredientExpiry linked = d.getIngredientExpiry() != null
+                    ? ingredientExpiryRepository.findById(d.getIngredientExpiry().getId()).orElse(null)
+                    : null;
+
+            if (linked != null) {
+                linked.setQuantity(linked.getQuantity().add(canRestore));
+                linked.setUpdatedAt(now);
+                ingredientExpiryRepository.save(linked);
+            } else {
+                ingredientExpiryRepository.save(IngredientExpiry.builder()
+                        .warehouse(stock.getWarehouse())
+                        .ingredientId(stock.getIngredientId())
+                        .expiryDate(d.getExpiryDate())
+                        .costPrice(d.getCostPrice() != null ? d.getCostPrice() : BigDecimal.ZERO)
+                        .quantity(canRestore)
+                        .createdAt(now).updatedAt(now).build());
+            }
             if (d.getCostPrice() != null && d.getCostPrice().compareTo(BigDecimal.ZERO) > 0) {
                 BigDecimal costToRestore = d.getCostPrice().multiply(canRestore).setScale(2, RoundingMode.HALF_UP);
                 BigDecimal newCost = (stock.getTotalCostValue() != null
@@ -977,6 +1458,10 @@ public class OrderServiceImpl implements OrderService {
         if (!customer.getIsActive())
             throw new RuntimeException("Khách hàng tạm ngưng tạo đơn mới");
 
+        // Chặn công nợ trước khi dựng đơn — dựng xong rồi mới ném lỗi là phí công
+        // trừ kho / tính giá.
+        assertDebtAllowed(customer, request.getPaymentMethod());
+
         final Customer finalCustomer = customer;
         boolean isCompany = finalCustomer != null
                 && finalCustomer.getCustomerType() == Customer.CustomerType.COMPANY;
@@ -991,6 +1476,8 @@ public class OrderServiceImpl implements OrderService {
         int discountRate;
 
         String deliveryAddress = firstNonBlank(request.getReceiverAddress(), request.getShippingAddress());
+        assertPaymentMethodAllowedForZone(finalCustomer, request.getPaymentMethod(),
+                request.getProvinceName(), request.getWardName(), deliveryAddress);
 
         if (isCompany) {
             customerType    = "COMPANY";
@@ -1055,11 +1542,18 @@ public class OrderServiceImpl implements OrderService {
                 .debtDays(request.getPaymentMethod().equalsIgnoreCase("debt") ? customer.getDebtDays() : 0)
                 .companyAddress(companyAddress).customerType(customerType)
                 .companyName(companyName).pendingPaymentAt(0L)
+                // SNAPSHOT yêu cầu thanh toán trước từ khách hàng tại thời điểm tạo đơn
+                // Snapshot: chỉ ghi TRUE khi khách được cấu hình yêu cầu thu trước.
+                // Các điều kiện còn lại (vùng giao, hình thức thanh toán) KHÔNG snapshot
+                // vì địa chỉ và phương thức đều sửa được sau khi tạo đơn — chốt cứng lúc
+                // này sẽ giữ nguyên kết luận cũ dù đơn đã đổi sang địa chỉ khác.
+                .requirePrepayment(finalCustomer != null
+                        && Boolean.TRUE.equals(finalCustomer.getRequirePrepayment()))
                 .shortName(shortName).taxCode(taxCode).contactName(contactName)
                 .shippingAddress(deliveryAddress).deliveryAddress(deliveryAddress)
+                .provinceName(request.getProvinceName()).wardName(request.getWardName())
                 .orderedByName(orderedByName).createdAt(now).updatedAt(now)
-                .deliveryDatetime(request.getDeliveryDatetime() != null
-                        ? request.getDeliveryDatetime() : calcDeliveryDatetimeFallback(now))
+                .deliveryDatetime(request.getDeliveryDatetime())
                 .showPrices(showPrices).hideAllPrices(hideAllPrices)
                 .visibleToSellerId(visibleToSellerId).orderItems(new ArrayList<>()).build();
 
@@ -1190,7 +1684,8 @@ public class OrderServiceImpl implements OrderService {
         savedOrder.setDiscountAmount(discountAmount);
         savedOrder.setVatAmount(totalVat);
         savedOrder.setTotalAmount(afterDiscount);
-        savedOrder.setFinalAmount(afterDiscount.add(exclusiveVat).add(surchargeVal));
+        savedOrder.setFinalAmount(afterDiscount.add(exclusiveVat).add(surchargeVal)
+                .setScale(0, RoundingMode.HALF_UP)); // VND không có lẻ — làm tròn nguyên để khớp số tiền thực thu
         savedOrder.setSurcharge(surchargeVal);
         savedOrder.getOrderItems().addAll(orderItems);
 
@@ -1249,6 +1744,75 @@ public class OrderServiceImpl implements OrderService {
             totalVat = totalVat.add(itemVat);
         }
         return new BigDecimal[]{ exclusiveVat, totalVat };
+    }
+
+    /**
+     * CHẶN CÔNG NỢ KHI KHÁCH CHƯA CÓ HỢP ĐỒNG.
+     *
+     * <p>Bán chịu mà không có hợp đồng thì khoản nợ không có căn cứ đòi. FE đã ẩn
+     * lựa chọn công nợ, nhưng chặn ở đây mới là chốt thật: đơn có thể được tạo
+     * hoặc đổi phương thức từ nhiều màn khác nhau (POS, sửa đơn, kế toán, trưởng
+     * phòng kinh doanh) — sót một đường là thủng.
+     *
+     * <p>Khách lẻ (customer = null) cũng không được mua công nợ: không có hồ sơ
+     * thì không có ai để đòi.
+     *
+     * <p>KHÁCH CŨ (tạo trước khi có tính năng hợp đồng) được miễn quy tắc này —
+     * họ vẫn bán chịu như trước. Chỉ khách tạo mới mới bắt buộc có hợp đồng.
+     */
+    /**
+     * CHẶN HÌNH THỨC THANH TOÁN KHÔNG HỢP LỆ THEO VÙNG GIAO.
+     *
+     * <p>Khách <b>chưa có hợp đồng</b> chỉ được TIỀN MẶT hoặc CHUYỂN KHOẢN (công nợ đã bị
+     * {@link #assertDebtAllowed} chặn riêng). Trong hai lựa chọn đó:
+     *
+     * <ul>
+     *   <li>Giao <b>trong TP.HCM cũ</b> → được cả TM lẫn CK.</li>
+     *   <li>Giao <b>ngoài</b> (gồm phường/xã cũ của Bình Dương, Bà Rịa – Vũng Tàu, và mọi
+     *       tỉnh khác) → <b>chỉ CHUYỂN KHOẢN</b>.</li>
+     * </ul>
+     *
+     * <p>Vì sao chặn ngay từ lúc tạo đơn thay vì chỉ chặn ở khâu giao: đơn tiền mặt đi
+     * tỉnh xa tạo xong sẽ nằm chờ vô thời hạn — kho không được giao (phải thu trước), mà
+     * khách cũng không có cách trả tiền mặt từ xa. Người tạo đơn phải biết ngay lúc chọn,
+     * không phải để kho phát hiện vài ngày sau.
+     *
+     * <p>Khách <b>đã có hợp đồng</b> không bị ràng buộc này — họ có công nợ và có căn cứ
+     * pháp lý để đòi.
+     *
+     * @param deliveryAddress địa chỉ giao của ĐƠN (không phải địa chỉ mặc định của khách)
+     */
+    private void assertPaymentMethodAllowedForZone(Customer customer, String paymentMethod,
+                                                   String provinceName, String wardName,
+                                                   String deliveryAddress) {
+        // Nhận tại kho không phải "giao đi tỉnh" nên không bị hạn chế hình thức thanh toán.
+        if (addressCatalogService.isPickupAtWarehouse(deliveryAddress)) return;
+        if (paymentMethod == null || paymentMethod.isBlank()) return;
+        if (!"CASH".equalsIgnoreCase(paymentMethod.trim())) return;   // chỉ chặn tiền mặt
+
+        // Khách có hợp đồng → miễn.
+        if (customer != null && customer.getId() != null
+                && customerContractService.isDebtAllowed(customer)) return;
+
+        if (!addressCatalogService.isCodAllowed(provinceName, wardName)) {
+            throw new RuntimeException(
+                    "Địa chỉ giao không thuộc vùng được giao COD — khách chưa có hợp đồng chỉ "
+                            + "được thanh toán bằng CHUYỂN KHOẢN. Vui lòng đổi hình thức thanh toán.");
+        }
+    }
+
+    private void assertDebtAllowed(Customer customer, String paymentMethod) {
+        if (paymentMethod == null) return;
+        if (!"DEBT".equalsIgnoreCase(paymentMethod.trim())) return;
+
+        if (customer == null || customer.getId() == null)
+            throw new RuntimeException("Khách lẻ không có hợp đồng nên không được thanh toán công nợ.");
+
+        // Khách cũ được miễn — xem CustomerContractService.isDebtAllowed.
+        if (!customerContractService.isDebtAllowed(customer))
+            throw new RuntimeException(
+                    "Khách hàng chưa có hợp đồng nên không được chọn thanh toán công nợ. "
+                            + "Vui lòng tải hợp đồng lên trước.");
     }
 
     private PaymentStatus resolvePaymentStatus(String paymentMethod) {
@@ -1518,13 +2082,15 @@ public class OrderServiceImpl implements OrderService {
                 .paymentMethod(order.getPaymentMethod()).notes(order.getNotes())
                 .customerType(order.getCustomerType()).companyName(order.getCompanyName())
                 .orderedByName(order.getOrderedByName()).taxCode(order.getTaxCode())
+                .requirePrepaymentEffective(isPrepaymentRequired(order))
+                .prepaymentReason(isPrepaymentRequired(order) ? prepaymentReason(order) : null)
+                .provinceName(order.getProvinceName()).wardName(order.getWardName())
                 .contactName(order.getContactName()).deliveryAddress(order.getDeliveryAddress())
                 .companyPhone(order.getCompanyPhone()).companyAddress(order.getCompanyAddress())
                 .createdAt(order.getCreatedAt())
                 // ── Tài xế: dùng deliveryInfo thay cho drivers ──
                 .deliveryInfo(parseDeliveryInfo(order.getDeliveryInfoJson()))
-                .deliveryDatetime(order.getDeliveryDatetime() != null
-                        ? order.getDeliveryDatetime() : calcDeliveryDatetimeFallback(order.getCreatedAt()))
+                .deliveryDatetime(order.getDeliveryDatetime())
                 .showPrices(order.getShowPrices() != null ? order.getShowPrices() : Boolean.TRUE)
                 .hideAllPrices(order.getHideAllPrices() != null ? order.getHideAllPrices() : Boolean.FALSE)
                 .surcharge(order.getSurcharge())
@@ -1548,19 +2114,9 @@ public class OrderServiceImpl implements OrderService {
         }
     }
 
-    private Long calcDeliveryDatetimeFallback(Long createdAt) {
-        if (createdAt == null) return null;
-        LocalDateTime ordered = LocalDateTime.ofInstant(Instant.ofEpochMilli(createdAt), TZ);
-        LocalDateTime rounded = ordered.getMinute() == 0 && ordered.getSecond() == 0
-                ? ordered.truncatedTo(java.time.temporal.ChronoUnit.HOURS)
-                : ordered.truncatedTo(java.time.temporal.ChronoUnit.HOURS).plusHours(1);
-        return rounded.plusHours(1).atZone(TZ).toInstant().toEpochMilli();
-    }
-
     private String calcEstimatedDelivery(Long deliveryDatetime, Long createdAt) {
-        Long ts = deliveryDatetime != null ? deliveryDatetime : calcDeliveryDatetimeFallback(createdAt);
-        if (ts == null) return null;
-        return LocalDateTime.ofInstant(Instant.ofEpochMilli(ts), TZ)
+        if (deliveryDatetime == null) return null;
+        return LocalDateTime.ofInstant(Instant.ofEpochMilli(deliveryDatetime), TZ)
                 .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm dd/MM/yyyy"));
     }
 
@@ -1707,19 +2263,32 @@ public class OrderServiceImpl implements OrderService {
             stock.setUpdatedAt(now);
             ingredientStockRepository.save(stock);
 
-            if (d.getIngredientExpiry() != null) {
-                ingredientExpiryRepository.findById(d.getIngredientExpiry().getId())
-                        .ifPresentOrElse(lot -> {
-                            lot.setQuantity(lot.getQuantity().add(d.getQuantity()));
-                            lot.setUpdatedAt(now);
-                            ingredientExpiryRepository.save(lot);
-                        }, () -> {
-                            if (d.getExpiryDate() != null || d.getCostPrice() != null)
-                                ingredientExpiryRepository.save(IngredientExpiry.builder()
-                                        .warehouse(stock.getWarehouse()).ingredientId(stock.getIngredientId())
-                                        .expiryDate(d.getExpiryDate()).costPrice(d.getCostPrice())
-                                        .quantity(d.getQuantity()).createdAt(now).updatedAt(now).build());
-                        });
+            // HOÀN LÔ — luôn phải có, không được bỏ qua trường hợp nào.
+            //
+            //   Bản cũ chỉ hoàn lô khi d.getIngredientExpiry() != null, và bên
+            //   trong còn đòi thêm expiryDate/costPrice khác null mới tạo lô bù.
+            //   Mọi nhánh không thoả đều cộng tồn tổng mà bỏ quên lô ⇒ tồn tổng
+            //   nhiều hơn tổng lô, phần chênh không bao giờ xuất được vì FIFO
+            //   trừ theo lô. Đây là nguồn gốc các dòng lệch dạng
+            //   "Có tồn tổng nhưng không có lô nào".
+            IngredientExpiry linked = d.getIngredientExpiry() != null
+                    ? ingredientExpiryRepository.findById(d.getIngredientExpiry().getId()).orElse(null)
+                    : null;
+
+            if (linked != null) {
+                linked.setQuantity(linked.getQuantity().add(d.getQuantity()));
+                linked.setUpdatedAt(now);
+                ingredientExpiryRepository.save(linked);
+            } else {
+                // Lô gốc đã bị xoá, hoặc bản ghi trừ kho cũ không lưu lô nào.
+                // Tạo lô mới mang đúng HSD + giá vốn đã ghi lại lúc trừ.
+                ingredientExpiryRepository.save(IngredientExpiry.builder()
+                        .warehouse(stock.getWarehouse())
+                        .ingredientId(stock.getIngredientId())
+                        .expiryDate(d.getExpiryDate())
+                        .costPrice(d.getCostPrice() != null ? d.getCostPrice() : BigDecimal.ZERO)
+                        .quantity(d.getQuantity())
+                        .createdAt(now).updatedAt(now).build());
             }
         }
         log.info("[CANCEL] Đã hoàn kho {} deduction records cho orderId={}", deductions.size(), orderId);
@@ -1730,26 +2299,28 @@ public class OrderServiceImpl implements OrderService {
         String role = actorRole != null ? actorRole.toUpperCase() : "";
         User creator = order.getUser();
         Role creatorRole = creator != null ? creator.getRole() : null;
+        // Issue #4: Tạm thời không gửi noti đơn hàng cho OWNER và ADMIN
         switch (role) {
             case "SELLER", "SUPER_SELLER" ->
-                    notifyRoles(List.of(Role.SUPER_SELLER, Role.ACCOUNTANT, Role.SUPER_ACCOUNTANT,
-                            Role.ADMIN, Role.OWNER), actorUserId, "ORDER_CANCELLED", message, payload);
+                    notifyRoles(List.of(Role.SUPER_SELLER, Role.ACCOUNTANT, Role.SUPER_ACCOUNTANT),
+                            actorUserId, "ORDER_CANCELLED", message, payload);
             case "ACCOUNTANT" ->
-                    notifyRoles(List.of(Role.SUPER_ACCOUNTANT, Role.ADMIN, Role.OWNER),
+                    notifyRoles(List.of(Role.SUPER_ACCOUNTANT),
                             actorUserId, "ORDER_CANCELLED", message, payload);
-            case "SUPER_ACCOUNTANT" ->
-                    notifyRoles(List.of(Role.ADMIN, Role.OWNER),
-                            actorUserId, "ORDER_CANCELLED", message, payload);
+            case "SUPER_ACCOUNTANT" -> {
+                // không gửi cho ADMIN/OWNER nữa
+            }
             case "WAREHOUSE", "SUPER_WAREHOUSE" -> {
                 notifyRoles(List.of(Role.SUPER_WAREHOUSE, Role.SUPER_SELLER, Role.ACCOUNTANT,
-                                Role.SUPER_ACCOUNTANT, Role.ADMIN, Role.OWNER),
+                                Role.SUPER_ACCOUNTANT),
                         actorUserId, "ORDER_CANCELLED", message, payload);
                 if (creator != null && creatorRole == Role.SELLER
                         && (actorUserId == null || !actorUserId.equals(creator.getId())))
                     notificationService.sendToUser(creator, "SELLER", "ORDER_CANCELLED", message, payload);
             }
-            default -> notifyRoles(List.of(Role.ADMIN, Role.OWNER),
-                    actorUserId, "ORDER_CANCELLED", message, payload);
+            default -> {
+                // không gửi cho ADMIN/OWNER nữa
+            }
         }
     }
 

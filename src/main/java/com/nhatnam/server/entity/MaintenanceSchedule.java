@@ -73,6 +73,10 @@ public class MaintenanceSchedule {
     @Column(name = "vendor_name", length = 200)
     private String vendorName;
 
+    /** Người liên hệ của đơn vị */
+    @Column(name = "vendor_contact_person", length = 200)
+    private String vendorContactPerson;
+
     /** SĐT đơn vị */
     @Column(name = "vendor_phone", length = 20)
     private String vendorPhone;
