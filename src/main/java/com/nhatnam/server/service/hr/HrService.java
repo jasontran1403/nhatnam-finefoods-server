@@ -40,6 +40,7 @@ public class HrService {
     private final PayrollInputProvider payrollInputProvider;
     private final AllowanceLabelRepository allowanceLabelRepository;
     private final com.nhatnam.server.repository.AttendanceEntryRepository attendanceEntryRepository;
+    private final ExpenseVoucherRepository expenseVoucherRepository;
 
     // ── Thâm niên ─────────────────────────────────────────────────────────────
     /**
@@ -57,7 +58,40 @@ public class HrService {
      * lương theo GIỜ (phòng Xưởng / ban Sản xuất). Nếu trường "Bộ phận"
      * (department) chứa một trong các từ khóa này thì lương tính theo giờ công.
      */
-    private static final String[] HOURLY_DEPT_KEYWORDS = { "xuong", "san xuat" };
+    /**
+     * Từ khoá bộ phận được tính lương theo ngày công thực tế (prorate).
+     * FACTORY  → xưởng sản xuất.
+     * ACCOUNTING → kế toán: vào/ra đúng giờ, trễ/sớm trừ lương.
+     * Giữ lại string-keyword fallback cho trường hợp user chưa gán payrollRole.
+     */
+    private static final String[] HOURLY_DEPT_KEYWORDS = { "xuong", "san xuat", "ke toan", "kế toán" };
+
+    /**
+     * TRUE nếu bộ phận tính lương theo ngày công thực tế (prorate).
+     * Ưu tiên dùng {@link com.nhatnam.server.service.hr.PayrollDepartmentResolver}
+     * qua {@code payrollDept} parameter; fallback về string-keyword khi null.
+     */
+    private static boolean isHourlyBased(String department, String division,
+                                         com.nhatnam.server.enumtype.PayrollDepartment payrollDept) {
+        // FIX (10/2026): toàn bộ 5 bộ phận đều tính lương theo ngày công thực
+        // tế. Trước đây SALES & DRIVER giữ nguyên full lương bất kể số công
+        // (triệu chứng: Phạm Khắc Thuận 16/26 công vẫn ăn 6.219.000, Tuấn Tài
+        // 19/26 vẫn ăn 8.500.000). Theo yêu cầu nghiệp vụ, mọi bộ phận prorate
+        // y chang Xưởng/Kế toán/Kho; chỉ còn OWNER/ADMIN (không thuộc bộ phận
+        // nào) là nhận cứng theo hợp đồng.
+        if (payrollDept != null) return true;
+        // fallback: string keyword khi payrollDept chưa được resolve
+        String d = normalize(department);
+        for (String kw : HOURLY_DEPT_KEYWORDS) {
+            if (d.contains(kw)) return true;
+        }
+        return false;
+    }
+
+    /** @deprecated dùng {@link #isHourlyBased(String, String, com.nhatnam.server.enumtype.PayrollDepartment)} */
+    private static boolean isHourlyBased(String department, String division) {
+        return isHourlyBased(department, division, null);
+    }
 
     /** Bỏ dấu tiếng Việt + đưa về chữ thường để so khớp từ khóa phòng ban linh hoạt. */
     private static String normalize(String s) {
@@ -88,13 +122,6 @@ public class HrService {
      * Hiện chỉ xét department vì Phòng ban (division) mới được sửa để lưu ổn định;
      * có thể mở rộng xét thêm division sau.
      */
-    private static boolean isHourlyBased(String department, String division) {
-        String d = normalize(department);
-        for (String kw : HOURLY_DEPT_KEYWORDS) {
-            if (d.contains(kw)) return true;
-        }
-        return false;
-    }
 
     // ── Current user helper ───────────────────────────────────────────────────
 
@@ -167,6 +194,24 @@ public class HrService {
             u.setWorkStartDate(req.getWorkStartDate() > 0 ? req.getWorkStartDate() : null);
         }
 
+        // Thông tin ngân hàng — null = không đụng tới, chuỗi rỗng = xoá trắng.
+        // Cách này để FE có thể gửi chỉ những field muốn đổi mà không mất dữ liệu
+        // cũ, và vẫn cho phép xoá thông tin ngân hàng khi cần.
+        if (req.getBankAccountNumber() != null) {
+            String v = req.getBankAccountNumber().trim();
+            u.setBankAccountNumber(v.isEmpty() ? null : v);
+        }
+        if (req.getBankName() != null) {
+            String v = req.getBankName().trim();
+            u.setBankName(v.isEmpty() ? null : v);
+        }
+
+        // Nghỉ thai sản: null = giữ nguyên; true/false = bật/tắt cờ. Nhân viên
+        // đi làm trở lại → HR bỏ cờ → tháng sau tự có tên trong file chi lương.
+        if (req.getOnMaternityLeave() != null) {
+            u.setOnMaternityLeave(req.getOnMaternityLeave());
+        }
+
         // Suy role hưởng lương từ cặp (Bộ phận, Chức vụ) vừa chọn.
         com.nhatnam.server.enumtype.Role payrollRole =
                 com.nhatnam.server.enumtype.OrgCatalog.payrollRoleOf(u.getDepartment(), u.getPosition());
@@ -217,6 +262,7 @@ public class HrService {
                 .bonus(req.getBonus() != null ? req.getBonus() : 0L)
                 .bonusTaxable(bonusTaxable)
                 .dependents(req.getDependents() != null ? req.getDependents() : 0)
+                .partTime(Boolean.TRUE.equals(req.getPartTime()))
                 .status("PENDING")
                 .createdBy(hr)
                 .createdAt(System.currentTimeMillis())
@@ -511,6 +557,17 @@ public class HrService {
                                                 List<AllowanceItemDto> allowances, long bonusInput, boolean bonusTaxable,
                                                 Integer month, Integer year) {
 
+        // NHÂN VIÊN BỊ KHOÁ TÀI KHOẢN: KHÔNG được nhận bất kỳ khoản THƯỞNG nào.
+        // Ép bonusInput = 0 để KPI × bonus của hồ sơ ra 0, đồng thời cờ dưới đây
+        // sẽ chặn cả bonus import (MonthlyAdjustment.Type.BONUS) và thưởng KPI
+        // sản xuất (factory_kpi_bonus_item). Lương cơ bản + phụ cấp vẫn được
+        // tính bình thường theo chấm công đã có.
+        boolean userLocked = u != null && u.isLockAccount();
+        if (userLocked) {
+            bonusInput = 0L;
+            bonusTaxable = false;
+        }
+
         // (1) KPI → thưởng thực lĩnh
         double kpiPercent = u != null ? payrollInputProvider.getKpiPercentage(u) : 100.0;
         long effectiveBonus = PayrollTaxCalculator.applyKpiToBonus(bonusInput, kpiPercent);
@@ -536,7 +593,8 @@ public class HrService {
         if (isFlatContractRole(u, department, position)) {
             long importedBonus = 0L;
             java.util.List<com.nhatnam.server.dto.hr.HrDtos.BonusItemDto> bonusItemsOutFlat = new ArrayList<>();
-            if (u != null && month != null && year != null) {
+            // KHOÁ TÀI KHOẢN: bỏ qua toàn bộ bonus import — không cộng vào lương.
+            if (!userLocked && u != null && month != null && year != null) {
                 var payrollDept = payrollDepartmentResolver.departmentOf(u);
                 String deptCode = payrollDept != null ? payrollDept.name() : null;
                 for (MonthlyAdjustment adj : monthlyAdjustmentRepository
@@ -598,7 +656,7 @@ public class HrService {
                     .build();
         }
 
-        // ── (2) LƯƠNG THEO NGÀY CÔNG — bộ phận Xưởng sản xuất ─────────────────
+        // ── (2) LƯƠNG THEO NGÀY CÔNG — bộ phận Xưởng sản xuất & Kế toán ────────
         //
         //   Lương nhập trong hồ sơ là mức ĐỦ CÔNG (26 công/tháng). Lương thực
         //   nhận được chia ngược ra theo số công thực tế trên bảng chấm công:
@@ -613,7 +671,11 @@ public class HrService {
         //   Số 6.966.147đ này là căn cứ TÍNH THUẾ TNCN (cộng thêm phụ cấp /
         //   thưởng chịu thuế). MỨC LƯƠNG ĐÓNG BẢO HIỂM thì KHÔNG bị chia —
         //   vẫn giữ nguyên `insSalary` đã nhập trong hồ sơ.
-        boolean hourlyBased = isHourlyBased(department, division);
+
+        // Resolve PayrollDepartment một lần — dùng cho isHourlyBased và monthlyBonus
+        com.nhatnam.server.enumtype.PayrollDepartment resolvedDept =
+                u != null ? payrollDepartmentResolver.departmentOf(u) : null;
+        boolean hourlyBased = isHourlyBased(department, division, resolvedDept);
 
         // ── CÔNG CHUẨN THEO ĐÚNG THÁNG ĐANG TÍNH ──────────────────────────────
         //   = số ngày trong tháng trừ các Chủ nhật (T7 tính tròn 1 công).
@@ -633,12 +695,64 @@ public class HrService {
         long netBase = standardNetBase;
 
         if (hourlyBased && u != null && month != null && year != null) {
-            Double days = actualWorkdaysOf(u.getId(), month, year);
-            if (days != null) {
-                actualDays = days;
+
+            // ── FIX (10/2026): NGHỈ THAI SẢN → 0 LƯƠNG, 0 CÔNG, 0 CÔNG LỄ ────
+            //   Trước đó HrService không biết nhân viên nghỉ thai sản nên vẫn
+            //   cộng công lễ (2 ngày T9/2026) → cô Nguyễn Thị Tuyết (nghỉ thai
+            //   sản, 0 chấm công) vẫn được ăn 2/26 × base ≈ 518.308đ.
+            //   Danh sách nghỉ thai sản ở FactoryKpiService.MATERNITY_LEAVE_NAMES.
+            //   Khi đang trong kỳ nghỉ thai sản, cả lương lẫn công lễ đều = 0.
+            if (com.nhatnam.server.service.FactoryKpiService.isMaternityLeave(u)) {
+                actualDays = 0.0;
                 attendanceProrated = true;
-                netBase = PayrollTaxCalculator.prorateSalaryByDays(
-                        standardNetBase, actualDays, standardDays);
+                netBase = 0L;
+            } else {
+                // ── FIX (10/2026): ƯU TIÊN ManualAttendanceOverrides.actualDays ──
+                //   Overrides (VD Tuấn Tài T9/2026 → 19 công) trước đây CHỈ áp
+                //   ở file export. HrService đọc thẳng entry.actualDays nên
+                //   preview lương không đồng bộ với số công override. Giờ ưu
+                //   tiên override — không có mới rơi về entry.
+                com.nhatnam.server.utils.ManualAttendanceOverrides.Override ov =
+                        com.nhatnam.server.utils.ManualAttendanceOverrides
+                                .lookup(u.getFullName(), year, month);
+                Double days;
+                if (ov != null) {
+                    days = (double) ov.actualDays();
+                } else {
+                    days = actualWorkdaysOf(u.getId(), month, year);
+                }
+                if (days != null) {
+                    actualDays = days;
+
+                    // ── CỘNG CÔNG LỄ cho MỌI bộ phận có attendance ─────────
+                    //   File chấm công KHÔNG có bản ghi ngày lễ (NV không đi
+                    //   làm hôm đó) nên actualDays từ attendance thiếu đúng
+                    //   số ngày lễ T2..T7. Ngày lễ hợp pháp vẫn hưởng lương
+                    //   nên phải bù.
+                    //
+                    //   skipHolidayBonus (ManualAttendanceOverrides) cho các
+                    //   nhân viên vào làm SAU ngày lễ (VD Tuấn Tài 9/9 — lễ
+                    //   1-2/9 nằm trước ngày bắt đầu nên không hưởng).
+                    //
+                    //   FIX (10/2026): mở rộng cho DRIVER + SALES. Trước đây
+                    //   chỉ FACTORY/ACCOUNTING/WAREHOUSE được bù công lễ nên
+                    //   SALES không prorate (full lương) còn DRIVER cũng vậy
+                    //   — đã đổi 2 nhánh sang hourlyBased.
+                    //
+                    //   Cap tại standardDays để tránh dư nếu attendance đã
+                    //   bao gồm FULL_DAY_OFF cho ngày lễ.
+                    if (resolvedDept != null) {
+                        int holidayBonus = com.nhatnam.server.utils.ManualAttendanceOverrides
+                                .holidayBonusDaysFor(u.getFullName(), year, month);
+                        if (holidayBonus > 0) {
+                            actualDays = Math.min(standardDays, actualDays + holidayBonus);
+                        }
+                    }
+
+                    attendanceProrated = true;
+                    netBase = PayrollTaxCalculator.prorateSalaryByDays(
+                            standardNetBase, actualDays, standardDays);
+                }
             }
         }
 
@@ -691,30 +805,18 @@ public class HrService {
                     .label(MEAL_ALLOWANCE_LABEL).amount(mealOverride).taxable(true).build());
         }
 
-        // ── (3b) PHỤ CẤP THÂM NIÊN ────────────────────────────────────────────
-        //   Chính sách chung như phụ cấp cơm: hệ thống TỰ tính từ ngày vào làm,
-        //   không ai nhập tay vào hồ sơ lương. Gốc nhân % là lương cơ bản CHUẨN
-        //   (standardNetBase) chứ không phải netBase đã chia theo ngày công —
-        //   thâm niên gắn với thời gian gắn bó, không gắn với số ngày đi làm.
-        SeniorityResult seniority = resolveSeniority(u, standardNetBase, month, year);
-
-        if (seniority.amount() > 0) {
-            // Hồ sơ cũ có thể đã có sẵn một dòng "phụ cấp thâm niên" nhập tay.
-            // Bỏ dòng đó đi rồi thay bằng số hệ thống tính, nếu không sẽ cộng đôi.
-            for (Iterator<AllowanceItemDto> it = allowanceOut.iterator(); it.hasNext(); ) {
-                AllowanceItemDto a = it.next();
-                if (SeniorityCalculator.isSeniorityAllowance(a.getLabel())) {
-                    allowanceTotal -= (a.getAmount() != null ? a.getAmount() : 0L);
-                    it.remove();
-                }
+        // ── (3b) PHỤ CẤP THÂM NIÊN — [ĐÃ BỎ 2026] ────────────────────────────
+        //   Công ty ngừng dùng phụ cấp thâm niên nên bỏ hoàn toàn phần cộng vào
+        //   lương. Vẫn CHỦ ĐỘNG xoá dòng "Phụ cấp thâm niên" cũ nếu hồ sơ lương
+        //   nhập tay còn để lại — tránh nhân viên vẫn thấy phụ cấp đó trên phiếu.
+        //   {@code seniorityYears/percent/amount} trên DTO cũng đặt về 0 ở dưới
+        //   để FE cũ (đã render trường này) không hiển thị số cũ nữa.
+        for (Iterator<AllowanceItemDto> it = allowanceOut.iterator(); it.hasNext(); ) {
+            AllowanceItemDto a = it.next();
+            if (SeniorityCalculator.isSeniorityAllowance(a.getLabel())) {
+                allowanceTotal -= (a.getAmount() != null ? a.getAmount() : 0L);
+                it.remove();
             }
-
-            allowanceTotal += seniority.amount();
-            allowanceOut.add(AllowanceItemDto.builder()
-                    .label(SeniorityCalculator.labelFor(seniority.years(), seniority.percent()))
-                    .amount(seniority.amount())
-                    .taxable(true)
-                    .build());
         }
 
         // ── PHỤ CẤP & THƯỞNG IMPORT THEO THÁNG ────────────────────────────────
@@ -724,20 +826,23 @@ public class HrService {
         java.util.List<com.nhatnam.server.dto.hr.HrDtos.BonusItemDto> bonusItemsOut = new ArrayList<>();
         if (u != null && month != null && year != null) {
             // Chỉ lấy adjustment CỦA ĐÚNG BỘ PHẬN của user — tránh import cho
-            // tài xế lại cộng vào lương xưởng và ngược lại. Dept của user resolve
-            // qua PayrollDepartmentResolver (dùng payrollRole + department string).
-            var payrollDept = payrollDepartmentResolver.departmentOf(u);
-            String deptCode = payrollDept != null ? payrollDept.name() : null;
+            // tài xế lại cộng vào lương xưởng và ngược lại. Dùng resolvedDept đã
+            // resolve ở trên (tránh double-call vào PayrollDepartmentResolver).
+            String deptCode = resolvedDept != null ? resolvedDept.name() : null;
             for (MonthlyAdjustment adj : monthlyAdjustmentRepository
                     .findByUserPeriodAndDepartment(u.getId(), month, year, deptCode)) {
                 long amt = adj.getAmount() != null ? Math.max(0, adj.getAmount()) : 0L;
                 if (amt <= 0) continue;
 
                 if (adj.getType() == MonthlyAdjustment.Type.ALLOWANCE) {
+                    // Phụ cấp (xăng xe, điện thoại...) VẪN được nhận kể cả khi
+                    // tài khoản bị khoá — đó là bù đắp cho công việc thực tế đã
+                    // làm (VD tài xế đã chạy nhiều km trước khi bị khoá).
                     allowanceTotal += amt;
                     allowanceOut.add(AllowanceItemDto.builder()
                             .label(adj.getLabel()).amount(amt).taxable(true).build());
-                } else {
+                } else if (!userLocked) {
+                    // THƯỞNG (BONUS): tài khoản bị khoá → BỎ QUA, không cộng.
                     monthlyBonus += amt;
                     bonusItemsOut.add(com.nhatnam.server.dto.hr.HrDtos.BonusItemDto.builder()
                             .label(adj.getLabel() != null && !adj.getLabel().isBlank()
@@ -757,7 +862,12 @@ public class HrService {
         //   khác chia theo trọng số × sản lượng tấn. FE render THÀNH DÒNG RIÊNG
         //   "Thưởng KPI sản xuất theo sản lượng" kèm chi tiết kg × đơn giá/tấn
         //   thay vì gộp vào KPI hồ sơ.
-        if (u != null && month != null && year != null) {
+        //
+        //   KHOÁ TÀI KHOẢN: bỏ qua thưởng KPI sản xuất — không cộng vào lương.
+        //   (FactoryKpiService.activeUsersWithRole đã lọc locked ở tầng tính,
+        //   nên thường sẽ không có bản ghi. Vẫn kiểm ở đây phòng trường hợp
+        //   nhân viên bị khoá SAU khi KPI đã chốt.)
+        if (!userLocked && u != null && month != null && year != null) {
             var kpiItemOpt = factoryKpiBonusItemRepository
                     .findByUserAndPeriod(u.getId(), month, year);
             if (kpiItemOpt.isPresent()) {
@@ -775,7 +885,7 @@ public class HrService {
                     if (parent != null) {
                         long kgLong = parent.getTotalOutputKg() != null
                                 ? parent.getTotalOutputKg().setScale(0,
-                                    java.math.RoundingMode.HALF_UP).longValue() : 0L;
+                                java.math.RoundingMode.HALF_UP).longValue() : 0L;
                         long rate = parent.getRatePerTon() != null ? parent.getRatePerTon() : 0L;
                         if (kgLong > 0 && rate > 0) {
                             detail = " (%s kg × %s đ/tấn)".formatted(fmtVN(kgLong), fmtVN(rate));
@@ -841,11 +951,13 @@ public class HrService {
                 .bonusItemsTotal(monthlyBonus)
                 .effectiveBonusKpiOnly(effectiveBonusKpiOnly)
                 .dependents(dependents)
-                .workStartDate(seniority.workStartDate())
-                .seniorityReferenceDate(seniority.referenceDate())
-                .seniorityYears(seniority.years())
-                .seniorityPercent(seniority.percent())
-                .seniorityAllowance(seniority.amount())
+                // Ngày vào làm vẫn cần cho FE (hiển thị "Ngày bắt đầu làm việc").
+                // Các trường thâm niên đặt về 0/null vì đã bỏ phụ cấp thâm niên.
+                .workStartDate(u != null ? u.getWorkStartDate() : null)
+                .seniorityReferenceDate(null)
+                .seniorityYears(0)
+                .seniorityPercent(0)
+                .seniorityAllowance(0L)
                 .taxableAdditions(taxableAdditions).nonTaxableAdditions(nonTaxableAdditions)
                 .kpiPercent(kpiPercent).hourlyBased(hourlyBased)
                 .standardWorkHours(standardHours).actualWorkHours(actualHours)
@@ -905,31 +1017,12 @@ public class HrService {
      */
     private SeniorityResult resolveSeniority(User u, long standardBaseSalary,
                                              Integer month, Integer year) {
-        if (u == null) return SeniorityResult.NONE;
-
-        // 1) Bản chốt của kỳ — giữ nguyên con số đã trả, kể cả khi hồ sơ sửa sau.
-        if (month != null && year != null) {
-            EmployeeSeniority snap = seniorityRepository
-                    .findByUserAndPeriod(u.getId(), month, year).orElse(null);
-            if (snap != null) {
-                return new SeniorityResult(
-                        snap.getWorkStartDate(), snap.getReferenceDate(),
-                        snap.getYears() != null ? snap.getYears() : 0,
-                        snap.getPercent() != null ? snap.getPercent() : 0,
-                        snap.getAmount() != null ? snap.getAmount() : 0L);
-            }
-        }
-
-        Long workStart = u.getWorkStartDate();
-        if (workStart == null) return SeniorityResult.NONE;   // chưa khai báo ⇒ 0đ
-
-        Long reference = payrollReferenceDate(month, year);
-
-        int years   = SeniorityCalculator.years(workStart, reference);
-        int percent = SeniorityCalculator.percentOf(years);
-        long amount = SeniorityCalculator.allowance(standardBaseSalary, percent);
-
-        return new SeniorityResult(workStart, reference, years, percent, amount);
+        // [ĐÃ BỎ 2026] Công ty không dùng phụ cấp thâm niên nữa. Hàm luôn trả
+        // NONE. Giữ chữ ký hàm và {@link SeniorityResult} để không phải sửa các
+        // chỗ khác đang gọi tới. Bản chốt cũ trong {@code employee_seniority}
+        // cũng KHÔNG đọc lại — nếu muốn quay lại chính sách này, khôi phục body
+        // cũ từ git.
+        return SeniorityResult.NONE;
     }
 
     /**
@@ -1044,10 +1137,50 @@ public class HrService {
     private Long mealAllowanceFor(User u, Integer month, Integer year) {
         if (u == null || month == null || year == null) return null;
 
+        // FIX (10/2026): nghỉ thai sản → 0 cơm (không đi làm thì không có bữa
+        // giữa ca). Trước đây rơi vào nhánh fallback SALES/ACCOUNTING/WAREHOUSE
+        // thì vẫn full mealEligibleDays × 30.000đ dù không chấm công.
+        if (com.nhatnam.server.service.FactoryKpiService.isMaternityLeave(u)) return 0L;
+
         AttendanceEntry entry = attendanceEntryRepository
                 .findByUserAndPeriod(u.getId(), month, year)
                 .orElse(null);
-        if (entry == null) return null;
+
+        // SALES, ACCOUNTING và WAREHOUSE không bắt buộc upload file chấm công.
+        // Khi không có AttendanceEntry (chưa có file), mặc định cơm = full ngày chuẩn.
+        //
+        // [2026] Thêm WAREHOUSE vào danh sách "auto-full cơm" — chính sách công
+        // ty coi kho là bộ phận văn phòng như kế toán / kinh doanh, đủ công
+        // trong tháng thì mặc định đủ cơm, không cần chấm công quẹt thẻ.
+        if (entry == null) {
+            com.nhatnam.server.enumtype.PayrollDepartment dept = null;
+            try {
+                dept = com.nhatnam.server.enumtype.PayrollDepartment.of(
+                        com.nhatnam.server.enumtype.PayrollDepartment.resolvePayrollRole(u.getAllRoles()));
+            } catch (Exception ignored) {}
+
+            if (dept == com.nhatnam.server.enumtype.PayrollDepartment.SALES
+                    || dept == com.nhatnam.server.enumtype.PayrollDepartment.ACCOUNTING
+                    || dept == com.nhatnam.server.enumtype.PayrollDepartment.WAREHOUSE) {
+                // Full cơm mặc định = SỐ NGÀY LÀM VIỆC TRỪ LỄ của tháng × 30.000đ.
+                //
+                //   Dùng mealEligibleDaysOf chứ KHÔNG dùng standardWorkdaysOf, vì:
+                //     - standardWorkdaysOf = ngày − CN                 (26 ở T9/2026)
+                //     - mealEligibleDaysOf = ngày − CN − lễ T2..T7     (24 ở T9/2026)
+                //   Ngày lễ hợp pháp không đi làm nên không có cơm giữa ca; để
+                //   standardWorkdaysOf ở đây sẽ dôi ra ngày lễ.
+                //
+                //   HR dùng ManualAttendanceOverrides (SalaryExportService &
+                //   BankPaymentExportService) để ghi đè số ngày cho các trường hợp
+                //   đặc biệt (quên quẹt thẻ, đi làm nhưng máy hỏng…).
+                double mealDays = PayrollTaxCalculator.mealEligibleDaysOf(month, year);
+                return BigDecimal.valueOf(MEAL_ALLOWANCE_PER_DAY)
+                        .multiply(BigDecimal.valueOf(mealDays))
+                        .setScale(0, RoundingMode.HALF_UP)
+                        .longValue();
+            }
+            return null;
+        }
 
         // Ưu tiên mealDays — số ngày ĐƯỢC HƯỞNG CƠM, do khâu tính công dựng ra.
         //
@@ -1092,7 +1225,7 @@ public class HrService {
     }
 
     private static final String[] DEFAULT_ALLOWANCE_LABELS = {
-            "Phụ cấp cơm trưa", "Phụ cấp điện thoại", "Phụ cấp xăng xe", "Phụ cấp công tác"
+            "Phụ cấp cơm trưa", "Phụ cấp điện thoại", "Phụ cấp xăng xe", "Phụ cấp công tác", "Phụ cấp OT"
     };
 
     @Transactional
@@ -1141,6 +1274,7 @@ public class HrService {
                     .allowance(req.getAllowance() != null ? req.getAllowance() : 0L)
                     .bonus(req.getBonus() != null ? req.getBonus() : 0L)
                     .dependents(req.getDependents() != null ? req.getDependents() : 0)
+                    .partTime(Boolean.TRUE.equals(req.getPartTime()))
                     .status("PENDING")
                     .createdBy(hr)
                     .createdAt(System.currentTimeMillis())
@@ -1359,6 +1493,7 @@ public class HrService {
                 .rejectReason(s.getRejectReason())
                 .createdAt(s.getCreatedAt())
                 .updatedAt(s.getUpdatedAt())
+                .partTime(Boolean.TRUE.equals(s.getPartTime()))
                 .createdByName(s.getCreatedBy() != null ? s.getCreatedBy().getFullName() : null)
                 .approvedByName(s.getApprovedBy() != null ? s.getApprovedBy().getFullName() : null)
                 .build();
@@ -1414,5 +1549,65 @@ public class HrService {
     /** Số nguyên → chuỗi kiểu VN "1.234.567" (dùng cho nhãn hiển thị). */
     private static String fmtVN(long v) {
         return String.format(java.util.Locale.GERMANY, "%,d", v);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ỨNG LƯƠNG
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /** DTO trả về thông tin ứng lương của nhân viên trong tháng. */
+    @lombok.Data @lombok.Builder @lombok.NoArgsConstructor @lombok.AllArgsConstructor
+    public static class SalaryAdvanceInfoDto {
+        /** Họ tên nhân viên */
+        private String fullName;
+        /** Lương cơ bản (từ hồ sơ lương đã duyệt hiện tại). 0 nếu chưa có. */
+        private long baseSalary;
+        /** Tổng đã ứng trong tháng (các phiếu chi APPROVED). */
+        private long totalAdvanced;
+        /** Còn lại có thể ứng = baseSalary - totalAdvanced (≥ 0). */
+        private long remainingAdvanceable;
+        /** Tháng đang tính — "YYYY-MM". */
+        private String month;
+    }
+
+    /**
+     * Tính thông tin ứng lương cho 1 nhân viên trong tháng hiện tại.
+     *
+     * <ul>
+     *   <li>lương cơ bản = hồ sơ lương đã được duyệt (baseSalary).</li>
+     *   <li>đã ứng       = tổng phiếu chi SALARY_ADVANCE đã APPROVED trong tháng.</li>
+     *   <li>còn lại      = max(0, cơ bản - đã ứng).</li>
+     * </ul>
+     */
+    public SalaryAdvanceInfoDto getSalaryAdvanceInfo(Long userId) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new com.nhatnam.server.common.ResourceNotFoundException("Nhân viên không tồn tại"));
+
+        // Tháng hiện tại
+        java.time.YearMonth ym = java.time.YearMonth.now(java.time.ZoneId.of("Asia/Ho_Chi_Minh"));
+        String monthStr = ym.toString(); // "YYYY-MM"
+
+        // Lương cơ bản từ hồ sơ đã duyệt
+        long baseSalary = 0L;
+        try {
+            var salary = salaryRepository.findApprovedByUserId(userId).stream().findFirst().orElse(null);
+            if (salary != null && salary.getBaseSalary() != null) {
+                baseSalary = salary.getBaseSalary().longValue();
+            }
+        } catch (Exception ignored) {}
+
+        // Tổng đã ứng trong tháng (chỉ tính phiếu APPROVED)
+        java.math.BigDecimal advanced = expenseVoucherRepository.sumSalaryAdvance(
+                userId, monthStr, ExpenseVoucher.VoucherStatus.APPROVED);
+        long totalAdvanced = advanced != null ? advanced.longValue() : 0L;
+        long remaining = Math.max(0L, baseSalary - totalAdvanced);
+
+        return SalaryAdvanceInfoDto.builder()
+                .fullName(user.getFullName())
+                .baseSalary(baseSalary)
+                .totalAdvanced(totalAdvanced)
+                .remainingAdvanceable(remaining)
+                .month(monthStr)
+                .build();
     }
 }

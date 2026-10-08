@@ -21,6 +21,7 @@ public class FifoDeductService {
     private final IngredientExpiryRepository    expiryRepository;
     private final IngredientStockRepository     stockRepository;
     private final OrderStockDeductionRepository deductionRepository;
+    private final StockMutationService          stockMutationService;   // BUG FIX (cross-field lost update)
 
     /**
      * Trừ kho theo FIFO.
@@ -58,9 +59,17 @@ public class FifoDeductService {
             avgCost = currentCostValue.divide(currentStock, 6, RoundingMode.HALF_UP);
         }
 
-        // FIFO: dùng ingredientId plain column
+        // BUG FIX 1.3: dùng PESSIMISTIC_WRITE thay findFifoLots không lock.
+        // Trước: 2 request FIFO song song cùng đọc list lô, cùng chọn lô đầu,
+        // cùng trừ → lô có thể xuống âm hoặc tổng lô vượt số hàng thực.
+        // Sau: SELECT ... FOR UPDATE khóa các row lô đến khi transaction commit.
+        // Request thứ 2 phải chờ → không race.
+        //
+        // DEADLOCK GUARD: caller (OrderServiceImpl.createOrder, updateOrderItems,
+        // WarehouseService.exportForOrder) PHẢI sort ingredientId ASC khi trừ
+        // nhiều ingredient trong 1 transaction.
         List<IngredientExpiry> lots = expiryRepository
-                .findFifoLots(warehouse.getId(), ingredientId);
+                .findFifoLotsForUpdate(warehouse.getId(), ingredientId);
 
         BigDecimal remaining    = needed;
         BigDecimal costDeducted = BigDecimal.ZERO;
@@ -141,13 +150,13 @@ public class FifoDeductService {
             toDeduct = needed.multiply(avgCost).setScale(2, RoundingMode.HALF_UP);
 
         if (toDeduct.compareTo(BigDecimal.ZERO) > 0 && stock != null) {
-            BigDecimal updated = currentCostValue.subtract(toDeduct)
-                    .max(BigDecimal.ZERO).setScale(2, RoundingMode.HALF_UP);
-            stock.setTotalCostValue(updated);
-            stock.setUpdatedAt(now);
-            stockRepository.save(stock);
-            log.debug("[FIFO] ingId={} -{} units → cost -{} → remaining cost {}",
-                    ingredientId, needed, toDeduct, updated);
+            // BUG FIX (cross-field lost update): atomic sub thay cho read-modify-write.
+            // Trước: read currentCostValue → subtract → save → race với các flow
+            // khác ghi totalCostValue (confirm cost, cancel restore).
+            // Sau: 1 câu UPDATE atomic ép sàn 0.
+            stockMutationService.subCostValue(ingredientId, warehouse.getId(), toDeduct, now);
+            log.debug("[FIFO] ingId={} -{} units → cost -{} (atomic)",
+                    ingredientId, needed, toDeduct);
         }
 
         return costDeducted;

@@ -8,7 +8,6 @@ import com.nhatnam.server.dto.response.CategoryResponse;
 import com.nhatnam.server.dto.response.IngredientResponse;
 import com.nhatnam.server.entity.*;
 import com.nhatnam.server.repository.*;
-import com.nhatnam.server.dto.request.CreateCompleteProductRequest;
 import com.nhatnam.server.enumtype.VatMode;
 import com.nhatnam.server.enumtype.VatRate;
 import com.nhatnam.server.service.CategoryService;
@@ -135,6 +134,22 @@ public class OperatorServiceImpl implements OperatorService {
         Number vatRateN   = item.get("vatRate") instanceof Number n ? n : null;
         Number unitsPerBoxN = item.get("unitsPerBox") instanceof Number n ? n : null;
 
+        // ── Conversion fields ────────────────────────────────────────────────
+        String conversionUnit = item.get("conversionUnit") instanceof String s ? s : null;
+        BigDecimal conversionFactor = null;
+        if (item.get("conversionFactor") != null) {
+            try { conversionFactor = new BigDecimal(item.get("conversionFactor").toString()); }
+            catch (Exception ignored) {}
+        }
+
+        // ── SKU, specification, misaCategory ─────────────────────────────────
+        String sku = item.get("sku") instanceof String s ? s : null;
+        String misaCategory = item.get("misaCategory") instanceof String s ? s : null;
+        Integer specification = null;
+        if (item.get("specification") instanceof Number n) {
+            specification = n.intValue();
+        }
+
         // ── Resolve existingProduct cho loại UPDATE ──────────────────
         Long existingProductId = null;
         if (item.get("existingProductId") instanceof Number n) {
@@ -143,7 +158,7 @@ public class OperatorServiceImpl implements OperatorService {
 
         return ProductBatchItem.builder()
                 .batch(batch)
-                .existingProductId(existingProductId)   // ← thêm dòng này
+                .existingProductId(existingProductId)
                 .productName(item.get("name") instanceof String s ? s : "")
                 .categoryName(item.get("categoryName") instanceof String s ? s : null)
                 .imageUrl(item.get("imageUrl") instanceof String s ? s : null)
@@ -154,6 +169,11 @@ public class OperatorServiceImpl implements OperatorService {
                 .vatMode(item.get("vatMode") instanceof String s ? s : "INCLUSIVE")
                 .unitsPerBox(unitsPerBoxN != null && unitsPerBoxN.intValue() > 0
                         ? unitsPerBoxN.intValue() : null)
+                .conversionUnit(conversionUnit)
+                .conversionFactor(conversionFactor)
+                .sku(sku)
+                .specification(specification)
+                .misaCategory(misaCategory)
                 .tiersJson(tiersJson)
                 .ingredientsJson(ingredientsJson)
                 .status(ProductBatchItem.ItemStatus.PENDING)
@@ -176,17 +196,23 @@ public class OperatorServiceImpl implements OperatorService {
     @Transactional
     public void applyBatchItem(ProductBatchItem item) throws Exception {
         CreateCompleteProductRequest req = buildRequest(item);
+        Product p;
         if (item.getExistingProductId() != null) {
             productService.updateProduct(item.getExistingProductId(), req);
-            Product p = productRepository.findById(item.getExistingProductId()).orElseThrow();
-            if (item.getMaxDiscountRate() != null) p.setMaxDiscountRate(item.getMaxDiscountRate());
-            productRepository.save(p);
+            p = productRepository.findById(item.getExistingProductId()).orElseThrow();
         } else {
             var created = productService.createCompleteProduct(req);
-            Product p = productRepository.findById(created.getId()).orElseThrow();
-            if (item.getMaxDiscountRate() != null) p.setMaxDiscountRate(item.getMaxDiscountRate());
-            productRepository.save(p);
+            p = productRepository.findById(created.getId()).orElseThrow();
         }
+
+        // ── Các field mà createCompleteProduct/updateProduct không xử lý ────
+        if (item.getMaxDiscountRate() != null) p.setMaxDiscountRate(item.getMaxDiscountRate());
+        p.setConversionUnit(item.getConversionUnit());
+        p.setConversionFactor(item.getConversionFactor());
+        if (item.getSku() != null && !item.getSku().isBlank()) p.setSku(item.getSku());
+        if (item.getSpecification() != null) p.setSpecification(item.getSpecification());
+        if (item.getMisaCategory() != null) p.setMisaCategory(item.getMisaCategory());
+        productRepository.save(p);
     }
 
     @SuppressWarnings("unchecked")
@@ -232,5 +258,4 @@ public class OperatorServiceImpl implements OperatorService {
         }
         return req;
     }
-
 }

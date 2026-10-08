@@ -4,7 +4,7 @@ import com.nhatnam.server.dto.ChartPointResponse;
 import com.nhatnam.server.dto.DashboardSummaryResponse;
 import com.nhatnam.server.dto.InvoiceDTO;
 import com.nhatnam.server.dto.TopProductResponse;
-import com.nhatnam.server.repository.ProductRepository;
+import com.nhatnam.server.repository.*;
 import com.nhatnam.server.dto.dashboard.TopCustomerDto;
 import com.nhatnam.server.dto.dashboard.TopSellerDto;
 import com.nhatnam.server.dto.response.ApiResponse;
@@ -14,9 +14,8 @@ import com.nhatnam.server.enumtype.OrderStatus;
 import com.nhatnam.server.enumtype.PaymentStatus;
 import com.nhatnam.server.enumtype.Role;
 import com.nhatnam.server.enumtype.StatusCode;
-import com.nhatnam.server.repository.CustomerRepository;
-import com.nhatnam.server.repository.OrderRepository;
 import com.nhatnam.server.service.DashboardService;
+import com.nhatnam.server.service.MisaService;
 import com.nhatnam.server.service.OrderService;
 import com.nhatnam.server.utils.AuthRoleUtil;
 import com.nhatnam.server.utils.InvoicePdf;
@@ -41,8 +40,6 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.multipart.MultipartFile;
 import com.nhatnam.server.service.FileStorageService;
-import com.nhatnam.server.repository.OrderLogRepository;
-import com.nhatnam.server.repository.IncomeVoucherRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 @RestController
@@ -55,6 +52,8 @@ public class AccountantController {
     private final DashboardService   dashboardService;
     private final OrderRepository    orderRepository;
     private final OrderService       orderService;
+    private final MisaService misaService;
+    private final MisaReceiptRepository misaReceiptRepository;
     /** Quy tắc thu tiền trước nằm ở impl, không có trên interface OrderService. */
     private final com.nhatnam.server.service.serviceimpl.OrderServiceImpl orderServiceImpl;
     private final CustomerRepository customerRepository;
@@ -811,6 +810,18 @@ public class AccountantController {
         }
     }
 
+    @PatchMapping("/orders/{id}/mark-as-complete")
+    public ResponseEntity<ApiResponse<Object>> markAsCompleted(
+            @PathVariable Long id, Authentication auth) {
+        try {
+            User actor = (User) auth.getPrincipal();
+            orderService.markAsCompletedNoFixedPaidAmount(id, getActorName(auth), actor.getId());
+            return ResponseEntity.ok(ApiResponse.success(null, "Đã hoàn thành đơn hàng"));
+        } catch (RuntimeException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
+    }
+
     @PatchMapping("/orders/{id}/payment")
     public ResponseEntity<ApiResponse<Object>> updatePayment(
             @PathVariable Long id,
@@ -1041,6 +1052,9 @@ public class AccountantController {
                 // Sử dụng method receiptNumbersOf đã có
                 List<String> receiptNumbers = receiptNumbersOf(o);
                 m.put("receiptNumbers", receiptNumbers);
+                m.put("misaOrderId",       o.getMisaOrderId());
+                m.put("misaOrderCode",     o.getMisaOrderCode());
+                m.put("misaReceiptCount",  misaReceiptRepository.countByOrderId(o.getId()));
 
                 // Nếu có receiptNumbers thì lấy paymentStatus để biết màu
                 if (!receiptNumbers.isEmpty()) {
@@ -1087,6 +1101,57 @@ public class AccountantController {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, e.getMessage()));
         } catch (Exception e) {
             log.error("[ACCOUNTANT] getCustomerOrders error", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * Tìm đơn hàng cần hoàn tiền (pendingRefundAmount > 0, chưa có refundVoucherCode).
+     * Dùng cho modal tạo phiếu chi hoàn tiền.
+     * Nếu customerId truyền vào thì chỉ tìm của khách đó.
+     */
+    @GetMapping("/orders/pending-refund-search")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> searchPendingRefundOrders(
+            @RequestParam(required = false, defaultValue = "") String keyword,
+            @RequestParam(required = false) Long customerId,
+            @RequestParam(defaultValue = "50") int size) {
+        try {
+            List<Order> orders = orderRepository
+                    .findPendingRefundOrders(keyword, org.springframework.data.domain.PageRequest.of(0, size));
+
+            // Nếu đã chọn khách đầu tiên, chỉ trả về đơn của khách đó
+            if (customerId != null) {
+                final Long cid = customerId;
+                orders = orders.stream()
+                        .filter(o -> o.getCustomer() != null && cid.equals(o.getCustomer().getId()))
+                        .toList();
+            }
+
+            List<Map<String, Object>> result = orders.stream().map(o -> {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id",                  o.getId());
+                m.put("orderCode",            o.getOrderCode());
+                m.put("customerName",         o.getCustomerName());
+                m.put("customerPhone",        o.getCustomerPhone());
+                m.put("customerId",           o.getCustomer() != null ? o.getCustomer().getId() : null);
+                m.put("pendingRefundAmount",  o.getPendingRefundAmount() != null
+                        ? o.getPendingRefundAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO);
+                m.put("refundedAmount",       o.getRefundedAmount() != null
+                        ? o.getRefundedAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO);
+                m.put("refundVoucherCode",    o.getRefundVoucherCode());
+                m.put("finalAmount",          o.getFinalAmount() != null
+                        ? o.getFinalAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO);
+                m.put("paidAmount",           o.getPaidAmount() != null
+                        ? o.getPaidAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO);
+                m.put("status",              o.getStatus());
+                m.put("createdAt",           o.getCreatedAt());
+                m.put("returnExchangeNote",  o.getReturnExchangeNote());
+                return m;
+            }).toList();
+
+            return ResponseEntity.ok(ApiResponse.success(result, "OK"));
+        } catch (Exception e) {
+            log.error("[ACCOUNTANT] searchPendingRefundOrders error", e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
     }
@@ -1208,6 +1273,23 @@ public class AccountantController {
         m.put("requirePrepayment", prepay);
         // true → phiếu thu chỉ ghi nhận ĐÃ THU, KHÔNG chuyển đơn sang Hoàn thành
         m.put("prepaymentOrder",   prepay && preDelivery);
+        m.put("misaOrderId",       o.getMisaOrderId());
+        m.put("misaOrderCode",     o.getMisaOrderCode());
+        m.put("misaReceiptCount",  misaReceiptRepository.countByOrderId(o.getId()));
+
+        // ── Hoàn/Đổi SP — cho FE hiện badge và nút phiếu chi ─────────────────
+        m.put("linkType",             o.getLinkType());
+        m.put("sourceOrderId",        o.getSourceOrderId());
+        m.put("sourceOrderCode",      o.getSourceOrderCode());
+        m.put("returnExchangeNote",   o.getReturnExchangeNote());
+        m.put("pendingRefundAmount",  o.getPendingRefundAmount() != null
+                ? o.getPendingRefundAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO);
+        m.put("refundedAmount",       o.getRefundedAmount() != null
+                ? o.getRefundedAmount().setScale(0, RoundingMode.HALF_UP) : BigDecimal.ZERO);
+        m.put("refundVoucherCode",    o.getRefundVoucherCode());
+        m.put("customerId",           o.getCustomer() != null ? o.getCustomer().getId() : null);
+        m.put("version",              o.getVersion());
+
         return m;
     }
 
@@ -1240,6 +1322,28 @@ public class AccountantController {
         m.put("receiptFileUrl", o.getReceiptFileUrl());
         m.put("invoiceNumber",  o.getInvoiceNumber());
         m.put("receiptNumbers", receiptNumbers);
+        m.put("misaOrderId",      o.getMisaOrderId());
+        m.put("misaOrderCode",    o.getMisaOrderCode());
+        m.put("misaReceiptCount", misaReceiptRepository.countByOrderId(o.getId()));
+
+        // ── Hoàn/Đổi SP — FE dùng để hiện nút phiếu chi, badge "Có SP hoàn" ──
+        m.put("linkType",             o.getLinkType());
+        m.put("sourceOrderId",        o.getSourceOrderId());
+        m.put("sourceOrderCode",      o.getSourceOrderCode());
+        m.put("returnExchangeNote",   o.getReturnExchangeNote());
+        m.put("pendingRefundAmount",  o.getPendingRefundAmount() != null
+                ? o.getPendingRefundAmount().setScale(0, java.math.RoundingMode.HALF_UP) : BigDecimal.ZERO);
+        m.put("refundedAmount",       o.getRefundedAmount() != null
+                ? o.getRefundedAmount().setScale(0, java.math.RoundingMode.HALF_UP) : BigDecimal.ZERO);
+        m.put("refundVoucherCode",    o.getRefundVoucherCode());
+        // overpaidAmount — cho nút phiếu chi đơn EXCHANGE
+        BigDecimal overpaid = o.getOverpaidAmount() != null
+                ? o.getOverpaidAmount().setScale(0, java.math.RoundingMode.HALF_UP) : BigDecimal.ZERO;
+        m.put("overpaidAmount",             overpaid);
+        m.put("overpaidRefundVoucherCode",  o.getOverpaidRefundVoucherCode());
+        m.put("customerId",           o.getCustomer() != null ? o.getCustomer().getId() : null);
+        m.put("version",              o.getVersion());
+
         return m;
     }
 
@@ -1484,6 +1588,119 @@ public class AccountantController {
             return ResponseEntity.ok(ApiResponse.success(result, "OK"));
         } catch (Exception e) {
             log.error("[ACCOUNTANT] getDebtOrders error", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    @PostMapping("/orders/{id}/misa-order")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> createMisaOrder(
+            @PathVariable Long id,
+            @RequestBody Map<String, Object> body) {
+        try {
+            Order order = orderRepository.findById(id)
+                    .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn #" + id));
+
+            String mode = body.get("mode") instanceof String s ? s : "AUTO";
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> manualItems = body.get("items") instanceof List<?> l
+                    ? (List<Map<String, Object>>) l : List.of();
+
+            Map<String, Object> result = misaService.createMisaOrder(order, mode, manualItems);
+            return ResponseEntity.ok(ApiResponse.success(result, "Tạo đơn Misa thành công"));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[MISA] createMisaOrder error id={}", id, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /** Xem đơn Misa đã tạo */
+    @GetMapping("/orders/{id}/misa-order")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getMisaOrder(@PathVariable Long id) {
+        try {
+            Order order = orderRepository.findById(id)
+                    .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn #" + id));
+            if (order.getMisaOrderId() == null)
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, "Chưa tạo đơn Misa"));
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("misaOrderId", order.getMisaOrderId());
+            result.put("misaOrderCode", order.getMisaOrderCode());
+            result.put("createdAt", order.getMisaOrderCreatedAt());
+            result.put("orderCode", order.getOrderCode());
+            result.put("finalAmount", order.getFinalAmount());
+            // Parse payload JSON để FE hiển thị
+            if (order.getMisaOrderPayload() != null) {
+                try { result.put("payload", objectMapper.readValue(order.getMisaOrderPayload(), Map.class)); }
+                catch (Exception ignored) { result.put("payload", order.getMisaOrderPayload()); }
+            }
+            if (order.getMisaOrderResponse() != null) {
+                try { result.put("response", objectMapper.readValue(order.getMisaOrderResponse(), Map.class)); }
+                catch (Exception ignored) { result.put("response", order.getMisaOrderResponse()); }
+            }
+            return ResponseEntity.ok(ApiResponse.success(result, "OK"));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * Tạo phiếu thu Misa (sandbox). 1 đơn có thể có nhiều phiếu thu.
+     * Body: { amount, paymentMethod, bankTransactionRef?, note? }
+     */
+    @PostMapping("/orders/{id}/misa-receipt")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> createMisaReceipt(
+            @PathVariable Long id,
+            @RequestBody Map<String, Object> body) {
+        try {
+            Order order = orderRepository.findById(id)
+                    .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn #" + id));
+
+            Object amtRaw = body.get("amount");
+            if (amtRaw == null)
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, "Thiếu trường amount"));
+
+            BigDecimal amount = new BigDecimal(amtRaw.toString());
+            String paymentMethod = body.get("paymentMethod") instanceof String s ? s : "CASH";
+            String bankRef = body.get("bankTransactionRef") instanceof String s ? s : null;
+            String note = body.get("note") instanceof String s ? s : null;
+
+            Map<String, Object> result = misaService.createMisaReceipt(order, amount, paymentMethod, bankRef, note);
+            return ResponseEntity.ok(ApiResponse.success(result, "Tạo phiếu thu Misa thành công"));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[MISA] createMisaReceipt error id={}", id, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /** Lấy danh sách phiếu thu Misa của 1 đơn */
+    @GetMapping("/orders/{id}/misa-receipts")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getMisaReceipts(@PathVariable Long id) {
+        try {
+            List<Map<String, Object>> list = misaReceiptRepository.findByOrderIdOrderByCreatedAtDesc(id)
+                    .stream().map(r -> {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("id", r.getId());
+                        m.put("misaRefId", r.getMisaRefId());
+                        m.put("misaReceiptCode", r.getMisaReceiptCode());
+                        m.put("amount", r.getAmount());
+                        m.put("paymentMethod", r.getPaymentMethod());
+                        m.put("bankTransactionRef", r.getBankTransactionRef());
+                        m.put("note", r.getNote());
+                        m.put("synced", r.getSynced());
+                        m.put("createdAt", r.getCreatedAt());
+                        // Parse payload nếu có
+                        if (r.getRequestPayload() != null) {
+                            try { m.put("requestPayload", objectMapper.readValue(r.getRequestPayload(), Map.class)); }
+                            catch (Exception ignored) {}
+                        }
+                        return m;
+                    }).toList();
+            return ResponseEntity.ok(ApiResponse.success(list, "OK"));
+        } catch (Exception e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
     }

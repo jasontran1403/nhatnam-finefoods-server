@@ -31,6 +31,14 @@ public class UserAdminService {
     private final com.nhatnam.server.repository.TokenRepository tokenRepository;
     private final com.nhatnam.server.service.DriverUserSyncService driverUserSyncService;
 
+    // ── Auto-gán kho VPP "Kho Trung tâm" cho user mới ────────────────────────
+    // Sau khi refactor UX module VPP không còn chọn kho ở FE. Cột warehouse_id
+    // trên OfficeSupplyRequest/Order vẫn còn (để không phải migrate schema) nhưng
+    // luôn trỏ về đúng 1 kho — "Kho Trung tâm" — được seed ở
+    // {@link com.nhatnam.server.config.CentralSupplyWarehouseInitializer}.
+    private final com.nhatnam.server.repository.SupplyWarehouseRepository supplyWarehouseRepository;
+    private final com.nhatnam.server.repository.UserSupplyWarehouseRepository userSupplyWarehouseRepository;
+
     @Transactional(readOnly = true)
     public PageResponse<UserDto> list(String q, Role role, Boolean locked, Pageable pageable) {
         return list(q, role, locked, false, pageable);
@@ -165,7 +173,33 @@ public class UserAdminService {
         // Có role Tài xế → tạo luôn bản ghi driver tương ứng để hai bảng khớp nhau
         driverUserSyncService.syncFromUser(saved);
 
+        // Auto-gán vào "Kho Trung tâm" — kho VPP duy nhất sau khi refactor.
+        // Không throw nếu kho chưa được seed (lần build đầu, race condition với
+        // CentralSupplyWarehouseInitializer): user sẽ được gán ngay lần initializer
+        // chạy sau đó. Việc user không có mapping VPP không chặn được flow tạo TK.
+        assignToCentralSupplyWarehouse(saved);
+
         return toDto(saved);
+    }
+
+    /**
+     * Gán user vào kho VPP "Kho Trung tâm" nếu chưa có. Idempotent — chạy lại
+     * an toàn (dùng cả trong luồng tạo user mới và luồng khôi phục user đã xoá).
+     */
+    private void assignToCentralSupplyWarehouse(User u) {
+        supplyWarehouseRepository.findByName(
+                com.nhatnam.server.config.CentralSupplyWarehouseInitializer.CENTRAL_NAME)
+            .ifPresent(central -> {
+                if (!userSupplyWarehouseRepository.existsByUserIdAndWarehouseId(
+                        u.getId(), central.getId())) {
+                    userSupplyWarehouseRepository.save(
+                            com.nhatnam.server.entity.UserSupplyWarehouse.builder()
+                                    .userId(u.getId())
+                                    .warehouseId(central.getId())
+                                    .assignedByName("SYSTEM")
+                                    .build());
+                }
+            });
     }
 
     @Transactional

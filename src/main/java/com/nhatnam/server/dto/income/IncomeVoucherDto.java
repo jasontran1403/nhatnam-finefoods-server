@@ -10,6 +10,7 @@ public class IncomeVoucherDto {
     private Long id;
     private String voucherCode;
     private String receiptNumber;
+    private String customerName;
     private String payerName;
     private String reason;
     private String createdByName;
@@ -35,7 +36,14 @@ public class IncomeVoucherDto {
     /** Tên khách hàng của các đơn liên kết — đã loại trùng (nhiều đơn cùng tên chỉ hiện 1). */
     private List<String> linkedCustomerNames;
     private List<IncomeItemDto> items;
+    /** Tổng tiền GROSS (Σ items.amount) — số nguyên owner đã nhập, chưa trừ cấn trừ. */
     private BigDecimal totalAmount;
+    /**
+     * Tổng tiền THỰC THU = {@code totalAmount − offsetUsedAmount}. Đây là số phải
+     * dùng khi cộng doanh thu/dòng tiền để không bị DOUBLE-COUNT với các phiếu con
+     * được tạo bằng "Cấn trừ". FE list card và dashboard hiển thị số này.
+     */
+    private BigDecimal effectiveTotalAmount;
     private List<String> imageUrls;
     private Long createdAt;
     private Long updatedAt;
@@ -45,6 +53,13 @@ public class IncomeVoucherDto {
      * FE dùng để hiện nút "Tạo phiếu chi hoàn phần dư". {@code null} = không dư.
      */
     private OverpayInfoDto overpay;
+
+    /** ID phiếu NGUỒN nếu phiếu này được cấn trừ từ phiếu khác. */
+    private Long offsetSourceVoucherId;
+    /** Số phiếu NGUỒN — tiện FE hiển thị. */
+    private String offsetSourceReceiptNumber;
+    /** Tổng số tiền đã cấn trừ TỪ phiếu này sang các phiếu con. */
+    private BigDecimal offsetUsedAmount;
 
     @Data @Builder
     public static class IncomeItemDto {

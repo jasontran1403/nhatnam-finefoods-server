@@ -42,6 +42,7 @@ public class WarehouseReceiptCostService {
     private final UserRepository userRepository;
     private final WarehouseService warehouseService;
     private final ObjectMapper objectMapper;
+    private final StockMutationService stockMutationService;   // BUG FIX 2.1
 
     // ════════════════════════════════════════════════════════════════════════
     // REQUEST DTO
@@ -57,16 +58,22 @@ public class WarehouseReceiptCostService {
         @Data
         public static class ItemCost {
             private Long receiptItemId;
-            /**
-             * Đơn giá 1 đơn vị. Nếu FE gửi theo kiểu "tổng tiền" thì FE đã tự chia
-             * cho số lượng và làm tròn 3 số thập phân trước khi gửi lên.
-             */
             private BigDecimal unitPrice;
-            /**
-             * Tương thích ngược với payload cũ (chỉ có costPrice = đơn giá).
-             * Dùng khi unitPrice không được gửi.
-             */
             private BigDecimal costPrice;
+
+            /**
+             * BUG FIX KB6: snapshot số lượng phiếu tại thời điểm FE đọc.
+             * Nếu khác giá trị hiện tại → ai đó đã sửa phiếu → throw để user reload.
+             * Optional: bỏ qua check nếu null (tương thích ngược).
+             */
+            private BigDecimal expectedQuantity;
+
+            /**
+             * BUG FIX KB6: snapshot giá vốn hiện tại tại thời điểm FE đọc.
+             * Với phiếu chưa confirm thì thường = 0 hoặc null.
+             * Nếu khác giá trị hiện tại → ai đó đã confirm rồi → throw để user reload.
+             */
+            private BigDecimal expectedUnitCost;
 
             public BigDecimal resolvedUnitPrice() {
                 return unitPrice != null ? unitPrice : costPrice;
@@ -100,8 +107,48 @@ public class WarehouseReceiptCostService {
     @Transactional
     public Map<String, Object> confirmCost(Long receiptId, ConfirmCostRequest req, Long actorUserId) {
         WarehouseReceipt receipt = loadImportReceipt(receiptId);
+
+        // BUG FIX KB6 (defense 1): status check — chặn confirm 2 lần khi tx đã commit
         if (receipt.getCostStatus() != CostStatus.PENDING_COST)
-            throw new BusinessException("Phiếu đã được xác nhận giá vốn trước đó");
+            throw new BusinessException("Phiếu đã được xác nhận giá vốn trước đó. Vui lòng tải lại trang.");
+
+        // BUG FIX KB6 (defense 2): compare-and-set trên từng receipt item
+        // Nếu FE gửi expectedQuantity/expectedUnitCost → verify khớp với DB
+        // hiện tại. Không khớp = ai đó đã sửa phiếu hoặc confirm trước → user
+        // đang thao tác trên dữ liệu cũ, phải reload.
+        Map<Long, WarehouseReceiptItem> itemById = receipt.getItems().stream()
+                .collect(Collectors.toMap(WarehouseReceiptItem::getId, i -> i));
+
+        for (ConfirmCostRequest.ItemCost ic : req.getItems()) {
+            WarehouseReceiptItem dbItem = itemById.get(ic.getReceiptItemId());
+            if (dbItem == null) continue;
+
+            // TH1: số lượng phiếu đã thay đổi
+            if (ic.getExpectedQuantity() != null) {
+                BigDecimal dbQty = dbItem.getQuantity() != null ? dbItem.getQuantity() : BigDecimal.ZERO;
+                if (dbQty.compareTo(ic.getExpectedQuantity()) != 0) {
+                    throw new BusinessException(String.format(
+                            "Số lượng của '%s' đã thay đổi từ %s → %s. "
+                                    + "Vui lòng tải lại phiếu và nhập giá vốn mới.",
+                            dbItem.resolvedIngredientName(),
+                            ic.getExpectedQuantity().toPlainString(),
+                            dbQty.toPlainString()));
+                }
+            }
+
+            // TH2: giá vốn đã được cập nhật (kế toán khác confirm giữa chừng)
+            if (ic.getExpectedUnitCost() != null) {
+                BigDecimal dbCost = dbItem.getCostPrice() != null ? dbItem.getCostPrice() : BigDecimal.ZERO;
+                if (dbCost.compareTo(ic.getExpectedUnitCost()) != 0) {
+                    throw new BusinessException(String.format(
+                            "Giá vốn của '%s' đã được cập nhật (%sđ → %sđ) bởi người khác. "
+                                    + "Vui lòng tải lại và kiểm tra.",
+                            dbItem.resolvedIngredientName(),
+                            ic.getExpectedUnitCost().toPlainString(),
+                            dbCost.toPlainString()));
+                }
+            }
+        }
 
         Map<Long, CostAllocation.Result> results = compute(receipt, req);
         long now = System.currentTimeMillis();
@@ -118,7 +165,6 @@ public class WarehouseReceiptCostService {
             item.setCostPrice(unitCost);
 
             if (item.getIngredientExpiryId() != null) {
-                // ── Flow mới: lô đã tồn tại (tạo lúc nhập kho, giá vốn 0) → chỉ cập nhật giá
                 IngredientExpiry lot = expiryRepository.findById(item.getIngredientExpiryId())
                         .orElseThrow(() -> new BusinessException(
                                 "Không tìm thấy lô kho của nguyên liệu: " + item.resolvedIngredientName()));
@@ -126,42 +172,29 @@ public class WarehouseReceiptCostService {
                 lot.setUpdatedAt(now);
                 expiryRepository.save(lot);
 
-                // Tồn kho đã cộng lúc nhập; ở đây chỉ ghi nhận GIÁ TRỊ tồn
-                IngredientStock stock = stockRepository
-                        .findByIngredientIdAndWarehouseId(item.getIngredientId(), warehouse.getId())
-                        .orElseThrow(() -> new BusinessException(
-                                "Không tìm thấy tồn kho của nguyên liệu: " + item.resolvedIngredientName()));
-                BigDecimal cur = stock.getTotalCostValue() != null ? stock.getTotalCostValue() : BigDecimal.ZERO;
-                stock.setTotalCostValue(cur.add(unitCost.multiply(qty)));
-                stock.setUpdatedAt(now);
-                stockRepository.save(stock);
-
+                stockMutationService.addCostValue(item.getIngredientId(), warehouse.getId(),
+                        unitCost.multiply(qty), now);
             } else {
-                // ── Tương thích ngược: phiếu CŨ tạo trước khi đổi flow → chưa cộng tồn.
-                //    Giữ nguyên hành vi cũ: cộng tồn + tạo lô ngay tại bước này.
-                IngredientStock stock = stockRepository
-                        .findByIngredientIdAndWarehouseId(item.getIngredientId(), warehouse.getId())
-                        .orElseGet(() -> stockRepository.save(IngredientStock.builder()
-                                .ingredientId(item.getIngredientId())
-                                .ingredientNameSnapshot(item.resolvedIngredientName())
-                                .ingredientUnitSnapshot(item.resolvedIngredientUnit())
-                                .warehouse(warehouse)
-                                .stockQuantity(BigDecimal.ZERO)
-                                .updatedAt(now)
-                                .build()));
-
-                BigDecimal before = stock.getStockQuantity();
-                BigDecimal after = before.add(qty);
-                stock.setStockQuantity(after);
-                BigDecimal cur = stock.getTotalCostValue() != null ? stock.getTotalCostValue() : BigDecimal.ZERO;
-                stock.setTotalCostValue(cur.add(unitCost.multiply(qty)));
-                stock.setUpdatedAt(now);
-                stockRepository.save(stock);
-
-                item.setQuantityBefore(before);
-                item.setQuantityAfter(after);
+                // ... giữ nguyên nhánh tương thích ngược cũ ...
+                if (!stockRepository.existsByIngredientIdAndWarehouseId(
+                        item.getIngredientId(), warehouse.getId())) {
+                    stockRepository.save(IngredientStock.builder()
+                            .ingredientId(item.getIngredientId())
+                            .ingredientNameSnapshot(item.resolvedIngredientName())
+                            .ingredientUnitSnapshot(item.resolvedIngredientUnit())
+                            .warehouse(warehouse)
+                            .stockQuantity(BigDecimal.ZERO)
+                            .totalCostValue(BigDecimal.ZERO)
+                            .updatedAt(now)
+                            .build());
+                }
+                StockMutationResult inc = stockMutationService.increase(
+                        item.getIngredientId(), warehouse.getId(), qty, now);
+                stockMutationService.addCostValue(
+                        item.getIngredientId(), warehouse.getId(), unitCost.multiply(qty), now);
+                item.setQuantityBefore(inc.getBefore());
+                item.setQuantityAfter(inc.getAfter());
                 item.setDifference(qty);
-
                 IngredientExpiry lot = expiryRepository.save(IngredientExpiry.builder()
                         .warehouse(warehouse)
                         .ingredientId(item.getIngredientId())

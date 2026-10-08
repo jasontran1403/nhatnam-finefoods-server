@@ -58,6 +58,9 @@ public class DriverAttendance {
     @Column(name = "updated_at")
     private Long updatedAt;
 
+    @Column(name = "note", length = 500)
+    private String note;
+
     @PrePersist
     void onCreate() {
         long now = System.currentTimeMillis();

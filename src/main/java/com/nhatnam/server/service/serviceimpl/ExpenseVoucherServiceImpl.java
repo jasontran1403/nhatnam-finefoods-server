@@ -10,6 +10,7 @@ import com.nhatnam.server.dto.expense.ExpenseVoucherDto;
 import com.nhatnam.server.dto.expense.UpdateExpenseVoucherRequest;
 import com.nhatnam.server.entity.*;
 import com.nhatnam.server.enumtype.Role;
+import com.nhatnam.server.repository.EmployeeSalaryRepository;
 import com.nhatnam.server.repository.ExpenseApprovalConfigRepository;
 import com.nhatnam.server.repository.ExpenseVoucherRepository;
 import com.nhatnam.server.repository.UserRepository;
@@ -41,6 +42,7 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
     private final com.nhatnam.server.repository.MaterialVendorRepository materialVendorRepo;
     private final com.nhatnam.server.repository.ExpenseVoucherLogRepository voucherLogRepo;
     private final com.nhatnam.server.repository.OrderRepository orderRepository;
+    private final EmployeeSalaryRepository salaryRepository;
 
     /**
      * Tham chiếu CHÍNH bean này qua proxy — dùng khi nhập Excel để mỗi lần gọi
@@ -316,7 +318,14 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
         Set<Long> keptIds = new HashSet<>();
         List<String> changeLog = new ArrayList<>();
 
+        // Nhân viên ([NN]) không có vendorId → nhập tên khoản chi tự do, không cần categoryId
         for (var p : req.getItems()) {
+            if (p.getAmount() == null || p.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
+                throw new BusinessException("Số tiền phải lớn hơn 0");
+            }
+            String note = (p.getNote() == null || p.getNote().isBlank()) ? null : p.getNote().trim();
+
+            // Luôn bắt buộc chọn categoryId (cả nhân viên lẫn NCC)
             if (p.getCategoryId() == null) {
                 throw new BusinessException("Mỗi khoản chi phải chọn một nhãn từ danh mục khoản chi");
             }
@@ -324,19 +333,11 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
             if (cat == null) {
                 throw new BusinessException("Nhãn khoản chi không hợp lệ hoặc đã bị ẩn (id=" + p.getCategoryId() + ")");
             }
-            if (p.getAmount() == null || p.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
-                throw new BusinessException("Số tiền của \"" + cat.getName() + "\" phải lớn hơn 0");
-            }
-            String note = (p.getNote() == null || p.getNote().isBlank()) ? null : p.getNote().trim();
 
             if (p.getId() == null) {
                 result.add(ExpenseItem.builder()
-                        .voucher(v)
-                        .itemName(cat.getName())
-                        .categoryId(cat.getId())
-                        .amount(p.getAmount())
-                        .note(note)
-                        .build());
+                        .voucher(v).itemName(cat.getName()).categoryId(cat.getId())
+                        .amount(p.getAmount()).note(note).build());
                 changeLog.add("thêm \"" + cat.getName() + "\" (" + p.getAmount().toPlainString() + ")");
                 continue;
             }
@@ -483,7 +484,7 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
     public ExpenseVoucherDto create(Long createdByUserId, CreateExpenseVoucherRequest req) {
         User creator = userRepository.findById(createdByUserId)
                 .orElseThrow(() -> new ResourceNotFoundException("User không tồn tại"));
-
+        Map<Long, com.nhatnam.server.entity.VendorExpenseCategory> categoryById = new HashMap<>();
         String creatorName = creator.getFullName() != null && !creator.getFullName().isBlank()
                 ? creator.getFullName() : creator.getUsername();
         Role creatorRole = effectiveRoleOf(creator);
@@ -562,6 +563,48 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
                 .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
+        // ── Validate ứng lương (SALARY_ADVANCE) ────────────────────────────────
+        String salaryAdvanceMonth = null;
+        Long salaryAdvanceUserId = null;
+        if ("SALARY_ADVANCE".equals(req.getVendorType())) {
+            if (req.getSalaryAdvanceUserId() == null) {
+                throw new BusinessException("Phải chọn nhân viên khi tạo phiếu ứng lương");
+            }
+            salaryAdvanceUserId = req.getSalaryAdvanceUserId();
+
+            // Tháng ứng = tháng hiện tại (VN timezone)
+            java.time.YearMonth ym = java.time.YearMonth.now(java.time.ZoneId.of("Asia/Ho_Chi_Minh"));
+            salaryAdvanceMonth = ym.toString();
+
+            // Tổng đã ứng trong tháng
+            java.math.BigDecimal alreadyAdvanced = voucherRepo.sumSalaryAdvance(
+                    salaryAdvanceUserId, salaryAdvanceMonth, ExpenseVoucher.VoucherStatus.APPROVED);
+            long already = alreadyAdvanced != null ? alreadyAdvanced.longValue() : 0L;
+
+            // Lương cơ bản từ hồ sơ đã duyệt
+            long baseSalary = 0L;
+            var salary = salaryRepository.findApprovedByUserId(salaryAdvanceUserId).stream().findFirst().orElse(null);
+            if (salary != null && salary.getBaseSalary() != null) {
+                baseSalary = salary.getBaseSalary().longValue();
+            }
+            long remaining = Math.max(0L, baseSalary - already);
+
+            if (baseSalary <= 0) {
+                throw new BusinessException("Nhân viên này chưa có hồ sơ lương được duyệt — không thể tạo phiếu ứng lương");
+            }
+            if (total.longValue() > remaining) {
+                throw new BusinessException(String.format(
+                        "Vượt hạn mức ứng lương. Còn có thể ứng: %,d đ (lương cơ bản %,d đ – đã ứng %,d đ)",
+                        remaining, baseSalary, already));
+            }
+
+            // Phiếu ứng lương chỉ có 1 khoản, tên cố định
+            if (req.getItems().size() != 1) {
+                throw new BusinessException("Phiếu ứng lương chỉ có 1 khoản chi duy nhất");
+            }
+            req.getItems().get(0).setItemName("Ứng lương");
+        }
+
         // ── Đánh giá điều kiện SUPER_ACCOUNTANT được duyệt ────────────────────
         ExpenseApprovalConfig cfg = loadConfigEntity();
         boolean saCanApprove = evaluateSaCanApprove(cfg, total, req.getVendorType());
@@ -570,40 +613,30 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
                 || creatorRole == Role.SUPERADMIN;
         boolean creatorIsSA = creatorRole == Role.SUPER_ACCOUNTANT;
 
-        ExpenseVoucher.VoucherStatus status;
-        ExpenseVoucher.ApproverScope scope;
-        User approver = null;
-        String approverName = null;
-        Long approvedAt = null;
-
-        if (creatorIsOwnerAdmin) {
-            status = ExpenseVoucher.VoucherStatus.APPROVED;
-            scope  = ExpenseVoucher.ApproverScope.OWNER;
-            approver = creator; approverName = creatorName; approvedAt = System.currentTimeMillis();
-        } else if (creatorIsSA) {
-            scope = saCanApprove ? ExpenseVoucher.ApproverScope.SUPER_ACCOUNTANT
-                    : ExpenseVoucher.ApproverScope.OWNER;
-            if (saCanApprove) {
-                status = ExpenseVoucher.VoucherStatus.APPROVED;
-                approver = creator; approverName = creatorName; approvedAt = System.currentTimeMillis();
-            } else {
-                status = ExpenseVoucher.VoucherStatus.PENDING;
-            }
-        } else {
-            status = ExpenseVoucher.VoucherStatus.PENDING;
-            scope  = saCanApprove ? ExpenseVoucher.ApproverScope.SUPER_ACCOUNTANT
-                    : ExpenseVoucher.ApproverScope.OWNER;
-        }
+        // ── AUTO-APPROVE: mọi phiếu chi được tạo đều tự động duyệt bởi
+        //    Owner có user_id = 2. Nếu Owner id=2 không tồn tại thì fallback
+        //    về creator để không chặn luồng tạo phiếu.
+        //
+        //    Giữ nguyên biến saCanApprove / creatorIsSA cho các nhánh khác dùng
+        //    (notifyOnCreate), nhưng status luôn là APPROVED.
+        ExpenseVoucher.VoucherStatus status = ExpenseVoucher.VoucherStatus.APPROVED;
+        ExpenseVoucher.ApproverScope scope = ExpenseVoucher.ApproverScope.OWNER;
+        User approver = userRepository.findById(2L).orElse(creator);
+        String approverName = approver != null && approver.getFullName() != null
+                && !approver.getFullName().isBlank()
+                ? approver.getFullName()
+                : (approver != null ? approver.getUsername() : creatorName);
+        Long approvedAt = System.currentTimeMillis();
 
         // ── DANH MỤC KHOẢN CHI ──────────────────────────────────────────────────
-        Map<Long, com.nhatnam.server.entity.VendorExpenseCategory> categoryById = new HashMap<>();
+        categoryRepo.findByActiveTrueOrderByNameAsc().forEach(c -> categoryById.put(c.getId(), c));
+
         if (req.getVendorId() != null) {
-            var activeCats = categoryRepo.findByActiveTrueOrderByNameAsc();
-            if (activeCats.isEmpty()) {
+            // NCC ngoài: bắt buộc phải có danh mục và mỗi khoản chi phải chọn nhãn
+            if (categoryById.isEmpty()) {
                 throw new BusinessException("Chưa có danh mục khoản chi nào. "
                         + "Vui lòng liên hệ Owner thêm nhãn khoản chi trước khi lập phiếu.");
             }
-            activeCats.forEach(c -> categoryById.put(c.getId(), c));
             for (CreateExpenseVoucherRequest.ExpenseItemRequest it : req.getItems()) {
                 if (it.getCategoryId() == null) {
                     throw new BusinessException("Mỗi khoản chi phải chọn một nhãn từ danh mục khoản chi");
@@ -638,6 +671,8 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
                 .approvedByName(approverName)
                 .approvedAt(approvedAt)
                 .imageUrls(imageUrlsJson)
+                .salaryAdvanceUserId(salaryAdvanceUserId)
+                .salaryAdvanceMonth(salaryAdvanceMonth)
                 .items(new ArrayList<>())
                 .build();
 
@@ -963,15 +998,16 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
             Set.of("OWNER", "ADMIN", "SUPERADMIN", "SUPER_ACCOUNTANT");
 
     private boolean canSeeAll(String callerRole) {
-        return callerRole != null && SEE_ALL_ROLES.contains(callerRole.toUpperCase());
+//        return callerRole != null && SEE_ALL_ROLES.contains(callerRole.toUpperCase());
+        return true;
     }
 
     private List<ExpenseVoucherDto> filterByScope(String callerRole, Long callerUserId,
                                                   List<ExpenseVoucherDto> list) {
         if (canSeeAll(callerRole)) return list;
-        if (callerUserId == null) return List.of();
+//        if (callerUserId == null) return List.of();
         return list.stream()
-                .filter(v -> callerUserId.equals(v.getCreatedById()))
+//                .filter(v -> callerUserId.equals(v.getCreatedById()))
                 .toList();
     }
 
@@ -992,14 +1028,13 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
     @Transactional(readOnly = true)
     public PageResponse<ExpenseVoucherDto> listByExpenseDateRange(String callerRole, Long callerUserId,
                                                                   Long from, Long to, Pageable pageable) {
-        // Sử dụng findByExpenseDateRangeList để lấy tất cả phiếu theo ngày chi/kỳ chi
-        List<ExpenseVoucher> all = voucherRepo.findByExpenseDateRangeList(from, to);
+        // Snap biên về ngày VN — xem snapToVnDayRange.
+        long[] range = snapToVnDayRange(from, to);
+        List<ExpenseVoucher> all = voucherRepo.findByExpenseDateRangeList(range[0], range[1]);
         List<ExpenseVoucherDto> merged = new ArrayList<>(all.stream().map(this::toDto).toList());
-        merged.addAll(vendorDebtService.listVendorPaymentsAsExpenseDto(from, to));
+        merged.addAll(vendorDebtService.listVendorPaymentsAsExpenseDto(range[0], range[1]));
 
-        // Lọc theo scope (phòng ban)
         List<ExpenseVoucherDto> filtered = filterByScope(callerRole, callerUserId, merged);
-
         return paginateMerged(filtered, pageable);
     }
 
@@ -1009,36 +1044,40 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
                                                                     String q, Long from, Long to, Pageable pageable) {
         List<ExpenseVoucher> all = new ArrayList<>();
 
-        // Kiểm tra nếu q là số tiền
+        // Snap biên về ngày VN khi có — xem snapToVnDayRange.
+        boolean hasRange = from != null && to != null;
+        long f = 0, t = 0;
+        if (hasRange) {
+            long[] range = snapToVnDayRange(from, to);
+            f = range[0]; t = range[1];
+        }
+
         BigDecimal amount = parseAmount(q);
         if (amount != null) {
-            // Tìm theo số tiền
-            if (from != null && to != null) {
-                all = voucherRepo.searchByAmountAndExpenseDateRange(amount, from, to);
+            if (hasRange) {
+                all = voucherRepo.searchByAmountAndExpenseDateRange(amount, f, t);
             } else {
                 all = voucherRepo.searchAllByAmount(amount);
             }
         } else if (q != null && !q.trim().isEmpty()) {
-            // Tìm theo text
-            if (from != null && to != null) {
-                all = voucherRepo.searchByExpenseDateRangeList(q, from, to);
+            if (hasRange) {
+                all = voucherRepo.searchByExpenseDateRangeList(q, f, t);
             } else {
                 all = voucherRepo.searchAllByExpenseDate(q);
             }
         } else {
-            // Không có từ khóa, chỉ lọc theo ngày
-            if (from != null && to != null) {
-                all = voucherRepo.findByExpenseDateRangeList(from, to);
+            if (hasRange) {
+                all = voucherRepo.findByExpenseDateRangeList(f, t);
             } else {
                 all = voucherRepo.findAllByOrderByCreatedAtDesc(Pageable.unpaged()).getContent();
             }
         }
 
         List<ExpenseVoucherDto> merged = new ArrayList<>(all.stream().map(this::toDto).toList());
-        merged.addAll(vendorDebtService.searchVendorPaymentsAsExpenseDto(q, from, to));
+        merged.addAll(vendorDebtService.searchVendorPaymentsAsExpenseDto(
+                q, hasRange ? f : from, hasRange ? t : to));
 
         List<ExpenseVoucherDto> filtered = filterByScope(callerRole, callerUserId, merged);
-
         return paginateMerged(filtered, pageable);
     }
 
@@ -1310,6 +1349,45 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
             notificationService.sendToRole("ADMIN", "EXPENSE_APPROVED", msg, payload);
         }
         return toDto(voucher);
+    }
+
+    /**
+     * One-time: duyệt TOÀN BỘ phiếu chi {@code PENDING} bằng Owner user_id = 2.
+     *
+     * <p>Dùng khi dọn lại dữ liệu cũ (vd. trước đây có phiếu chờ duyệt, nay chính
+     * sách là tự động duyệt bởi Owner 2). Mỗi phiếu được xử lý trong vòng lặp đơn
+     * giản — không gọi {@link #approve} để bỏ qua {@code assertCanApprove} và
+     * KHÔNG gửi notification hàng loạt (sẽ spam user).
+     */
+    @Override
+    @Transactional
+    public int approveAllPendingByOwner2() {
+        User owner = userRepository.findById(2L)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Không tìm thấy Owner user_id=2"));
+        String approverName = owner.getFullName() != null && !owner.getFullName().isBlank()
+                ? owner.getFullName() : owner.getUsername();
+
+        List<ExpenseVoucher> pending = voucherRepo.findAll().stream()
+                .filter(v -> v.getStatus() == ExpenseVoucher.VoucherStatus.PENDING)
+                .toList();
+
+        long now = System.currentTimeMillis();
+        int count = 0;
+        for (ExpenseVoucher v : pending) {
+            v.setStatus(ExpenseVoucher.VoucherStatus.APPROVED);
+            v.setApprovedBy(owner);
+            v.setApprovedByName(approverName);
+            v.setApprovedAt(now);
+            voucherRepo.save(v);
+            writeLog(v, "APPROVED", owner,
+                    ExpenseVoucher.VoucherStatus.PENDING.name(),
+                    ExpenseVoucher.VoucherStatus.APPROVED.name(),
+                    "Bulk auto-approve by Owner id=2");
+            count++;
+        }
+        log.info("[ExpenseVoucher] Owner id=2 bulk-approved {} phiếu PENDING", count);
+        return count;
     }
 
     @Override
@@ -1725,15 +1803,31 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
     @Override
     public String suggestNextPaymentNumber() {
         String latest = voucherRepo.findLatestPaymentNumber();
-        if (latest == null) return "1";
-        String digitsOnly = latest.replaceAll("[^0-9]", "");
-        if (digitsOnly.isBlank()) return "1";
+        if (latest == null || latest.isBlank()) {
+            return "00001"; // Mặc định 00001
+        }
+
+        // Tách phần chữ và phần số
+        String prefix = latest.replaceAll("[0-9]", "");
+        String numberPart = latest.replaceAll("[^0-9]", "");
+
+        if (numberPart.isEmpty()) {
+            return "00001";
+        }
+
         try {
-            long n = Long.parseLong(digitsOnly);
-            if (n >= PAYMENT_MAX || n < 1) return "1";
-            return String.valueOf(n + 1);
-        } catch (NumberFormatException ignored) {
-            return "1";
+            long num = Long.parseLong(numberPart);
+            long nextNum = (num >= PAYMENT_MAX || num < 1) ? 1L : num + 1;
+            String formattedNumber = String.format("%05d", nextNum);
+
+            // Nếu có prefix thì giữ nguyên prefix + số đã format
+            if (!prefix.isEmpty()) {
+                return prefix + formattedNumber;
+            }
+            // Nếu chỉ có số, trả về số đã format
+            return formattedNumber;
+        } catch (NumberFormatException e) {
+            return "00001";
         }
     }
 
@@ -1845,5 +1939,45 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
                 .createdAt(v.getCreatedAt())
                 .updatedAt(v.getUpdatedAt())
                 .build();
+    }
+
+    private long endOfVnDayMs(long epochMs) {
+        return java.time.LocalDate.ofInstant(java.time.Instant.ofEpochMilli(epochMs), VN_ZONE)
+                .atTime(23, 59, 59, 999_000_000)
+                .atZone(VN_ZONE).toInstant().toEpochMilli();
+    }
+
+    /**
+     * Mở rộng [from, to] về biên NGÀY theo giờ VN.
+     *
+     * <p>FE thường gửi midnight theo múi giờ UTC (hoặc múi giờ máy client), còn
+     * {@code expenseDate} của phiếu được lưu ở 00:00 VN qua
+     * {@code .atStartOfDay(VN_ZONE)} khi chọn kỳ, hoặc tại thời điểm FE gửi khi
+     * chọn ngày cụ thể. Nếu không snap biên về giờ VN, phiếu ở 00:00–06:59 VN
+     * sẽ bị rơi ra ngoài khoảng lọc (lệch đúng 7 tiếng).
+     *
+     * <p>Snap theo NGÀY (không theo giờ) để người dùng chọn "01/10" luôn thấy
+     * mọi phiếu có mốc rơi trong ngày 01/10 VN, bất kể client gửi mốc chính xác
+     * nào trong ngày đó.
+     */
+    private long[] snapToVnDayRange(Long from, Long to) {
+        if (from == null && to == null) return new long[]{ Long.MIN_VALUE, Long.MAX_VALUE };
+        if (from == null) return new long[]{ Long.MIN_VALUE, endOfVnDayMs(to) };
+        if (to == null)   return new long[]{ startOfVnDayMs(from), Long.MAX_VALUE };
+
+        // Tính SỐ NGÀY UTC từ FE gửi (thường là N × 86400000 − 1).
+        // Snap `from` về đầu ngày VN, rồi dời `to` theo đúng số ngày đó.
+        //
+        //   FE gửi UTC midnight, convert sang VN sẽ thành 07:00 cùng ngày —
+        //   startOfVnDayMs trả về 00:00 VN cùng ngày: OK.
+        //   Nhưng `to` = UTC 23:59 convert sang VN thành 06:59 NGÀY HÔM SAU —
+        //   endOfVnDayMs snap lên 23:59 ngày hôm sau → kéo dài range 1 ngày.
+        //
+        //   Giải pháp: lấy số ngày UTC gốc (dura/86400000) và cộng lên from VN.
+        long fromVn = startOfVnDayMs(from);
+        long duraMs = to - from;
+        long days = Math.max(0, (duraMs + 1) / 86_400_000L);   // làm tròn lên 1 ngày
+        long toVn = fromVn + days * 86_400_000L - 1;
+        return new long[]{ fromVn, toVn };
     }
 }

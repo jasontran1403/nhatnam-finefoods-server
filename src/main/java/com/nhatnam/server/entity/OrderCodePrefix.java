@@ -22,6 +22,16 @@ public class OrderCodePrefix {
     @Builder.Default
     private Boolean isActive = true;   // prefix đang dùng cho năm hiện tại
 
+    /**
+     * BUG FIX 1.1 (race order_code): Counter atomic thay cho count(*) query.
+     * Repository dùng UPDATE ... SET counter = counter + 1 để đảm bảo mỗi
+     * request lấy được 1 số duy nhất, không race lost update.
+     * Mặc định 0 cho row cũ, migration SQL sẽ set giá trị đúng cho dữ liệu cũ.
+     */
+    @Column(name = "counter", nullable = false)
+    @Builder.Default
+    private Long counter = 0L;
+
     @Column(name = "created_at", nullable = false)
     private Long createdAt;
 }

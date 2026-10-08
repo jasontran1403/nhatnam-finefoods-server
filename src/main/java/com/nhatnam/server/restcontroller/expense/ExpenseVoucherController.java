@@ -319,6 +319,19 @@ public class ExpenseVoucherController {
         return ApiResponse.ok(voucherService.bulkApprove(user.getId(), req));
     }
 
+    /**
+     * ONE-TIME MIGRATION: duyệt TẤT CẢ phiếu chi còn PENDING bằng Owner user_id=2.
+     * Thời điểm duyệt = thời gian hiện tại. Chỉ cho OWNER/ADMIN gọi.
+     *
+     * <p>Trả về {@code { approved: <số phiếu đã duyệt> }}. Chạy xong có thể gỡ bỏ.
+     */
+    @PostMapping("/admin/approve-all-pending-by-owner2")
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+    public ApiResponse<java.util.Map<String, Integer>> approveAllPendingByOwner2() {
+        int n = voucherService.approveAllPendingByOwner2();
+        return ApiResponse.ok(java.util.Map.of("approved", n));
+    }
+
     /** TỪ CHỐI HÀNG LOẠT — dùng chung một lý do từ chối cho mọi phiếu được chọn. */
     @PostMapping("/bulk-reject")
     @PreAuthorize(APPROVE_ROLES)

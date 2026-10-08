@@ -283,7 +283,7 @@ public class AuthenticationController {
                     "seller-import","inventory-management","landingpage",
                     "expense-voucher","landingpage-events","order-receipt",
                     "income-voucher","production","certificate",
-                    "customer-contract"
+                    "customer-contract", "feedback"
             );
             if (!ALLOWED_TYPES.contains(type)) {
                 log.warn("⚠️ Invalid image type requested: {}", type);

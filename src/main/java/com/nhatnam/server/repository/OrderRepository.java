@@ -47,7 +47,9 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT DATE_FORMAT(FROM_UNIXTIME(created_at / 1000), '%Y-%m-%d %H') AS h,
-               SUM(final_amount), COUNT(*)
+               SUM(final_amount
+                   - COALESCE(refunded_amount, 0)
+                   - COALESCE(pending_refund_amount, 0)), COUNT(*)
         FROM `order`
         WHERE status = 'COMPLETED' AND created_at BETWEEN :from AND :to
         GROUP BY h ORDER BY h
@@ -56,7 +58,9 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT DATE_FORMAT(FROM_UNIXTIME(created_at / 1000), '%Y-%m-%d') AS d,
-               SUM(final_amount), COUNT(*)
+               SUM(final_amount
+                   - COALESCE(refunded_amount, 0)
+                   - COALESCE(pending_refund_amount, 0)), COUNT(*)
         FROM `order`
         WHERE status = 'COMPLETED' AND created_at BETWEEN :from AND :to
         GROUP BY d ORDER BY d
@@ -65,7 +69,9 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT DATE_FORMAT(FROM_UNIXTIME(created_at / 1000), '%Y-%m') AS m,
-               SUM(final_amount), COUNT(*)
+               SUM(final_amount
+                   - COALESCE(refunded_amount, 0)
+                   - COALESCE(pending_refund_amount, 0)), COUNT(*)
         FROM `order`
         WHERE status = 'COMPLETED' AND created_at BETWEEN :from AND :to
         GROUP BY m ORDER BY m
@@ -76,10 +82,12 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT oi.product_id, oi.product_name, oi.product_image_url, oi.unit,
-               SUM(oi.quantity) AS total_qty, COUNT(DISTINCT oi.order_id) AS total_orders,
-               SUM(oi.subtotal) AS total_revenue
+               SUM(oi.quantity - COALESCE(oi.returned_qty, 0)) AS total_qty,
+               COUNT(DISTINCT oi.order_id) AS total_orders,
+               SUM(oi.subtotal * (1 - COALESCE(oi.returned_qty, 0) / NULLIF(oi.quantity, 0))) AS total_revenue
         FROM order_item oi JOIN `order` o ON o.id = oi.order_id
         WHERE o.status = 'COMPLETED' AND o.created_at BETWEEN :from AND :to
+          AND (oi.returned_qty IS NULL OR oi.returned_qty < oi.quantity)
         GROUP BY oi.product_id, oi.product_name, oi.product_image_url, oi.unit
         ORDER BY total_revenue DESC LIMIT :limit
         """, nativeQuery = true)
@@ -88,10 +96,12 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT oi.product_id, oi.product_name, oi.product_image_url, oi.unit,
-               SUM(oi.quantity) AS total_qty, COUNT(DISTINCT oi.order_id) AS total_orders,
-               SUM(oi.subtotal) AS total_revenue
+               SUM(oi.quantity - COALESCE(oi.returned_qty, 0)) AS total_qty,
+               COUNT(DISTINCT oi.order_id) AS total_orders,
+               SUM(oi.subtotal * (1 - COALESCE(oi.returned_qty, 0) / NULLIF(oi.quantity, 0))) AS total_revenue
         FROM order_item oi JOIN `order` o ON o.id = oi.order_id
         WHERE o.status = 'COMPLETED' AND o.created_at BETWEEN :from AND :to
+          AND (oi.returned_qty IS NULL OR oi.returned_qty < oi.quantity)
         GROUP BY oi.product_id, oi.product_name, oi.product_image_url, oi.unit
         ORDER BY total_qty DESC LIMIT :limit
         """, nativeQuery = true)
@@ -100,10 +110,12 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT oi.product_id, oi.product_name, oi.product_image_url, oi.unit,
-               SUM(oi.quantity) AS total_qty, COUNT(DISTINCT oi.order_id) AS total_orders,
-               SUM(oi.subtotal) AS total_revenue
+               SUM(oi.quantity - COALESCE(oi.returned_qty, 0)) AS total_qty,
+               COUNT(DISTINCT oi.order_id) AS total_orders,
+               SUM(oi.subtotal * (1 - COALESCE(oi.returned_qty, 0) / NULLIF(oi.quantity, 0))) AS total_revenue
         FROM order_item oi JOIN `order` o ON o.id = oi.order_id
         WHERE o.status = 'COMPLETED' AND o.created_at BETWEEN :from AND :to
+          AND (oi.returned_qty IS NULL OR oi.returned_qty < oi.quantity)
         GROUP BY oi.product_id, oi.product_name, oi.product_image_url, oi.unit
         ORDER BY total_orders DESC LIMIT :limit
         """, nativeQuery = true)
@@ -114,7 +126,10 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT o.user_id, u.username, u.full_name,
-               COUNT(*) AS total_orders, SUM(o.final_amount) AS total_revenue
+               COUNT(*) AS total_orders,
+               SUM(o.final_amount
+                   - COALESCE(o.refunded_amount, 0)
+                   - COALESCE(o.pending_refund_amount, 0)) AS total_revenue
         FROM `order` o JOIN _user u ON u.id = o.user_id
             WHERE o.status IN ('PREPARING', 'DELIVERING', 'PENDING_PAYMENT', 'COMPLETED')
                                      AND o.created_at BETWEEN :from AND :to
@@ -126,7 +141,10 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     @Query(value = """
         SELECT o.user_id, u.username, u.full_name,
-               COUNT(*) AS total_orders, SUM(o.final_amount) AS total_revenue
+               COUNT(*) AS total_orders,
+               SUM(o.final_amount
+                   - COALESCE(o.refunded_amount, 0)
+                   - COALESCE(o.pending_refund_amount, 0)) AS total_revenue
         FROM `order` o JOIN _user u ON u.id = o.user_id
             WHERE o.status IN ('PREPARING', 'DELIVERING', 'PENDING_PAYMENT', 'COMPLETED')
                                      AND o.created_at BETWEEN :from AND :to
@@ -142,7 +160,11 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
         SELECT o.customer_id, o.customer_name,
                COUNT(o.id) AS total_orders,
                SUM(CASE WHEN o.status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_orders,
-               COALESCE(SUM(CASE WHEN o.status = 'COMPLETED' THEN o.final_amount ELSE 0 END), 0) AS total_spent
+               COALESCE(SUM(CASE WHEN o.status = 'COMPLETED'
+                   THEN o.final_amount
+                        - COALESCE(o.refunded_amount, 0)
+                        - COALESCE(o.pending_refund_amount, 0)
+                   ELSE 0 END), 0) AS total_spent
         FROM `order` o
         WHERE o.created_at BETWEEN :from AND :to
         GROUP BY o.customer_id, o.customer_name
@@ -165,29 +187,36 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             @Param("from") long from,
             @Param("to") long to);
 
-    @Query("SELECT SUM(o.finalAmount) FROM Order o " +
+    @Query("SELECT SUM(o.finalAmount - COALESCE(o.refundedAmount, 0) - COALESCE(o.pendingRefundAmount, 0)) FROM Order o " +
             "WHERE o.status = :status AND o.createdAt BETWEEN :from AND :to")
     BigDecimal sumFinalAmountByStatusAndRange(
             @Param("status") OrderStatus status, @Param("from") long from, @Param("to") long to);
 
-    @Query("SELECT new com.nhatnam.server.dto.dashboard.StatusCountDto(CAST(o.status AS string), COUNT(o)) " +
-            "FROM Order o GROUP BY o.status")
+    @Query(value = """
+        SELECT new com.nhatnam.server.dto.dashboard.StatusCountDto(CAST(o.status AS string), COUNT(o))
+        FROM Order o GROUP BY o.status""")
     List<StatusCountDto> countOrdersByStatus();
 
-    @Query("SELECT new com.nhatnam.server.dto.dashboard.StatusCountDto(CAST(o.status AS string), COUNT(o)) " +
-            "FROM Order o WHERE o.createdAt BETWEEN :from AND :to GROUP BY o.status")
+    @Query("""
+        SELECT new com.nhatnam.server.dto.dashboard.StatusCountDto(CAST(o.status AS string), COUNT(o))
+        FROM Order o WHERE o.createdAt BETWEEN :from AND :to GROUP BY o.status""")
     List<StatusCountDto> countOrdersByStatusAndRange(
             @Param("from") long from, @Param("to") long to);
 
+    // FIX: SUM() trong JPQL trả về BigDecimal, COUNT() trả về Long.
+    // Constructor PaymentMethodStatDto(String method, Long orderCount, BigDecimal revenue)
+    // → truyền đúng thứ tự: method (String), COUNT(o) (Long), SUM(...) (BigDecimal)
     @Query("""
-        SELECT new com.nhatnam.server.dto.dashboard.PaymentMethodStatDto(
-            COALESCE(o.paymentMethod, 'UNKNOWN'), COUNT(o), SUM(o.finalAmount)
-        )
-        FROM Order o
-        WHERE o.status = com.nhatnam.server.enumtype.OrderStatus.COMPLETED
-          AND o.createdAt BETWEEN :from AND :to
-        GROUP BY o.paymentMethod
-        """)
+    SELECT new com.nhatnam.server.dto.dashboard.PaymentMethodStatDto(
+        COALESCE(o.paymentMethod, 'UNKNOWN'),
+        COUNT(o),
+        CAST(COALESCE(SUM(o.finalAmount - COALESCE(o.refundedAmount, 0) - COALESCE(o.pendingRefundAmount, 0)), 0) AS bigdecimal)
+    )
+    FROM Order o
+    WHERE o.status = com.nhatnam.server.enumtype.OrderStatus.COMPLETED
+      AND o.createdAt BETWEEN :from AND :to
+    GROUP BY o.paymentMethod
+    """)
     List<PaymentMethodStatDto> revenueByPaymentMethod(@Param("from") Long from, @Param("to") Long to);
 
     Page<Order> findAll(Specification<Order> spec, Pageable pageable);
@@ -215,16 +244,6 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     /**
      * Thống kê khách mới / khách cũ trong kỳ [from, to] cho seller.
-     *
-     * Khách MỚI = có đơn trong [from,to] VÀ không có đơn nào trước from
-     * Khách CŨ  = có đơn trong [from,to] VÀ có ít nhất 1 đơn trước from
-     *
-     * Nhận diện khách theo:
-     *   - customer_id nếu có (khách đã đăng ký)
-     *   - customer_phone nếu không có customer_id (khách lẻ)
-     *   - Bỏ qua đơn không có cả hai (không xác định được khách)
-     *
-     * Returns Object[3]: [totalCustomers, newCustomers, returningCustomers]
      */
     @Query(value = """
         WITH customers_in_period AS (
@@ -275,17 +294,6 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             @Param("status") OrderStatus status,
             Pageable pageable);
 
-    /**
-     * Đơn công nợ dùng cho báo cáo Aged Receivables.
-     *
-     * <p>FIX: trước đây chỉ lọc {@code paymentMethod='DEBT'} + {@code paymentStatus ∈ {UNPAID, PARTIAL}},
-     * KHÔNG lọc trạng thái đơn → kéo cả đơn ĐÃ HUỶ (CANCELLED/FAILED) và đơn CHƯA GIAO
-     * (PENDING/CONFIRMED/PREPARING/READY) vào công nợ. Với tính năng "thanh toán trước",
-     * đơn đang chuẩn bị có thể ở PARTIAL → sẽ bị tính nhầm thành nợ phải thu.
-     *
-     * <p>Công nợ chỉ phát sinh khi hàng ĐÃ RỜI KHO → chỉ lấy
-     * DELIVERING / PENDING_PAYMENT / COMPLETED.
-     */
     @Query("""
             SELECT o FROM Order o
             LEFT JOIN FETCH o.customer c
@@ -300,11 +308,6 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             """)
     List<Order> findDebtReceivables();
 
-    /**
-     * Toàn bộ đơn công nợ dùng cho dashboard (KHÔNG lọc ngày tháng):
-     * status = PENDING_PAYMENT và paymentStatus ∈ {UNPAID, PARTIAL}.
-     * JOIN FETCH customer để đọc customer.debtDays mà không bị lazy-load.
-     */
     @Query("""
             SELECT o FROM Order o
             LEFT JOIN FETCH o.customer c
@@ -315,14 +318,6 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             """)
     List<Order> findPendingPaymentReceivables();
 
-    /**
-     * Đơn có gắn tài xế trong một khoảng thời gian — dùng cho báo cáo ODO tài xế.
-     *
-     * <p>Mốc thời gian ưu tiên {@code deliveryDatetime} (ngày giao thực tế), thiếu thì
-     * lùi về {@code createdAt}, vì đơn cũ có thể chưa nhập ngày giao. Đơn CANCELLED bị
-     * loại vì không phát sinh quãng đường. Lọc {@code delivery_info_json} khác rỗng để
-     * không kéo về toàn bộ đơn không liên quan tài xế.
-     */
     @Query(value = """
             SELECT * FROM `order` o
             WHERE o.status <> 'CANCELLED'
@@ -333,10 +328,6 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             """, nativeQuery = true)
     List<Order> findWithDriversBetween(@Param("from") long from, @Param("to") long to);
 
-    /**
-     * Tổng tiền khách thanh toán dư (overpaidAmount) CHƯA ĐƯỢC HOÀN LẠI (chưa lập
-     * phiếu chi hoàn) — trong khoảng thời gian [from, to].
-     */
     @Query("""
             SELECT COALESCE(SUM(o.overpaidAmount), 0)
             FROM Order o
@@ -345,4 +336,183 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
               AND o.createdAt >= :from AND o.createdAt <= :to
             """)
     BigDecimal sumUnrefundedOverpaidBetween(@Param("from") long from, @Param("to") long to);
+
+    @Query("""
+            SELECT DISTINCT o.id, o.createdAt FROM Order o
+             WHERE EXISTS (
+                 SELECT 1 FROM OrderItem oi
+                  WHERE oi.order = o
+                    AND oi.notes IS NOT NULL
+                    AND LOCATE(:promoPrefix, oi.notes) = 1
+             )
+               AND (:from IS NULL OR o.createdAt >= :from)
+               AND (:to   IS NULL OR o.createdAt <= :to)
+               AND (:userId IS NULL OR o.user.id = :userId)
+               AND (:q IS NULL
+                    OR LOWER(o.orderCode)    LIKE LOWER(CONCAT('%', :q, '%'))
+                    OR LOWER(o.customerName) LIKE LOWER(CONCAT('%', :q, '%'))
+                    OR LOWER(o.customerPhone)LIKE LOWER(CONCAT('%', :q, '%')))
+             ORDER BY o.createdAt DESC
+            """)
+    List<Object[]> findOrderIdsWithPromoItems(
+            @Param("promoPrefix") String promoPrefix,
+            @Param("q") String q,
+            @Param("from") Long from,
+            @Param("to") Long to,
+            @Param("userId") Long userId);
+
+    @Query("SELECT DISTINCT o FROM Order o LEFT JOIN FETCH o.orderItems WHERE o.id IN :ids")
+    List<Order> findAllByIdInWithItems(@Param("ids") java.util.Collection<Long> ids);
+
+    @Query(value = """
+            SELECT DISTINCT o.user_id, COALESCE(u.full_name, u.username)
+              FROM `order` o
+              JOIN _user u ON u.id = o.user_id
+             WHERE EXISTS (
+                 SELECT 1 FROM order_item oi
+                  WHERE oi.order_id = o.id
+                    AND oi.notes IS NOT NULL
+                    AND LOCATE(:promoPrefix, oi.notes) = 1
+             )
+             ORDER BY 2
+            """, nativeQuery = true)
+    List<Object[]> findPromoOrderHandlersNative(@Param("promoPrefix") String promoPrefix);
+
+    @Query("""
+            SELECT o FROM Order o
+             WHERE o.pendingRefundAmount > 0
+               AND o.refundVoucherCode IS NULL
+               AND (:keyword = '' OR LOWER(o.orderCode) LIKE LOWER(CONCAT('%', :keyword, '%'))
+                    OR LOWER(o.customerName) LIKE LOWER(CONCAT('%', :keyword, '%'))
+                    OR o.customerPhone LIKE CONCAT('%', :keyword, '%'))
+             ORDER BY o.createdAt DESC
+            """)
+    List<Order> findPendingRefundOrders(@Param("keyword") String keyword,
+                                        org.springframework.data.domain.Pageable pageable);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PREVIEW HOA HỒNG (11/2026) — stat theo tháng cho SALES / ACCOUNTING
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * TỔNG DOANH THU THÁNG — Σ finalAmount các đơn tạo trong khoảng.
+     * Chỉ loại đơn HỦY (CANCELLED). Mọi status khác (CREATED / DELIVERING /
+     * PENDING_PAYMENT / COMPLETED, …) đều tính.
+     */
+    @Query("""
+            SELECT COALESCE(SUM(o.finalAmount), 0)
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.status <> com.nhatnam.server.enumtype.OrderStatus.CANCELLED
+            """)
+    BigDecimal sumFinalAmountCreatedInRange(@Param("from") long from,
+                                            @Param("to")   long to);
+
+    /** Như trên nhưng chỉ của 1 seller — dùng cho SALES per-row. */
+    @Query("""
+            SELECT COALESCE(SUM(o.finalAmount), 0)
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.user.id   = :userId
+              AND o.status <> com.nhatnam.server.enumtype.OrderStatus.CANCELLED
+            """)
+    BigDecimal sumFinalAmountCreatedInRangeByUser(@Param("from") long from,
+                                                  @Param("to")   long to,
+                                                  @Param("userId") Long userId);
+
+    /**
+     * DOANH THU ĐANG HOLD — Σ (finalAmount − paidAmount) của các đơn tạo trong
+     * khoảng mà CHƯA CHỐT (status NOT IN COMPLETED, CANCELLED).
+     *
+     * <p>Nghiệp vụ:
+     * <ul>
+     *   <li>COMPLETED còn chênh = kế toán xác nhận "bỏ số lẻ không thu" →
+     *       xem {@link #sumWaivedAmountCreatedInRange} (hiển thị riêng).</li>
+     *   <li>CANCELLED = đơn hủy, không tính.</li>
+     *   <li>Mọi status còn lại (CREATED / DELIVERING / PENDING_PAYMENT, …) +
+     *       còn chênh paidAmount → ĐANG HOLD.</li>
+     * </ul>
+     *
+     * <p>Luôn có: HOLD ≤ TỔNG DOANH THU THÁNG.
+     */
+    @Query("""
+            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.status NOT IN (com.nhatnam.server.enumtype.OrderStatus.COMPLETED,
+                                   com.nhatnam.server.enumtype.OrderStatus.CANCELLED)
+              AND o.finalAmount > o.paidAmount
+            """)
+    BigDecimal sumHoldAmountCreatedInRange(@Param("from") long from,
+                                           @Param("to")   long to);
+
+    @Query("""
+            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.user.id    = :userId
+              AND o.status NOT IN (com.nhatnam.server.enumtype.OrderStatus.COMPLETED,
+                                   com.nhatnam.server.enumtype.OrderStatus.CANCELLED)
+              AND o.finalAmount > o.paidAmount
+            """)
+    BigDecimal sumHoldAmountCreatedInRangeByUser(@Param("from") long from,
+                                                 @Param("to")   long to,
+                                                 @Param("userId") Long userId);
+
+    /**
+     * SỐ TIỀN BỎ QUA KHÔNG THU — đơn COMPLETED còn chênh (final > paid), coi
+     * như kế toán đã xác nhận "bỏ số lẻ". Đây KHÔNG tính vào doanh thu được
+     * chia hoa hồng, nhưng OWNER cần nhìn thấy để nắm tình hình.
+     */
+    @Query("""
+            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.status      = com.nhatnam.server.enumtype.OrderStatus.COMPLETED
+              AND o.finalAmount > o.paidAmount
+            """)
+    BigDecimal sumWaivedAmountCreatedInRange(@Param("from") long from,
+                                             @Param("to")   long to);
+
+    @Query("""
+            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.user.id    = :userId
+              AND o.status      = com.nhatnam.server.enumtype.OrderStatus.COMPLETED
+              AND o.finalAmount > o.paidAmount
+            """)
+    BigDecimal sumWaivedAmountCreatedInRangeByUser(@Param("from") long from,
+                                                   @Param("to")   long to,
+                                                   @Param("userId") Long userId);
+
+    // ── Backfill payment transaction — scan Order theo createdAt ────────────
+
+    /** Trả về id các order được tạo trong khoảng — dùng cho PaymentTransactionBackfillService. */
+    @Query("SELECT o.id FROM Order o WHERE o.createdAt >= :from AND o.createdAt < :to")
+    List<Long> findIdsCreatedInRange(@Param("from") long from,
+                                     @Param("to")   long to);
+
+    /**
+     * Tất cả user_id ĐÃ TẠO ít nhất 1 đơn trong khoảng, loại CANCELLED.
+     *
+     * <p>Dùng để mở rộng danh sách "được chia hoa hồng kinh doanh" bao gồm cả
+     * nhân viên NGOÀI phòng Kinh doanh (vd nhân viên Kho được phép tạo đơn):
+     * lương vẫn tính theo phòng của họ, nhưng thưởng doanh thu tính ở SALES.
+     */
+    @Query("""
+            SELECT DISTINCT o.user.id
+            FROM Order o
+            WHERE o.createdAt >= :from
+              AND o.createdAt <  :to
+              AND o.status <> com.nhatnam.server.enumtype.OrderStatus.CANCELLED
+            """)
+    List<Long> findDistinctOrderCreatorsInRange(@Param("from") long from,
+                                                @Param("to")   long to);
 }

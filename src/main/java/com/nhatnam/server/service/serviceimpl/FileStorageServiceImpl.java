@@ -36,6 +36,7 @@ public class FileStorageServiceImpl implements FileStorageService {
     private static final String PRODUCTION_IMAGE_PATH    = BASE_STORAGE_PATH + "/production-files";
     private static final String CERTIFICATE_FILE_PATH   = BASE_STORAGE_PATH + "/certificate";
     private static final String CUSTOMER_CONTRACT_PATH  = BASE_STORAGE_PATH + "/customer-contract";
+    private static final String FEEDBACK_IMAGE_PATH     = BASE_STORAGE_PATH + "/feedback";
 
     private static final List<String> ALLOWED_EXTENSIONS = Arrays.asList(
             "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"
@@ -60,6 +61,7 @@ public class FileStorageServiceImpl implements FileStorageService {
             Files.createDirectories(Paths.get(PRODUCTION_IMAGE_PATH));
             Files.createDirectories(Paths.get(CERTIFICATE_FILE_PATH));
             Files.createDirectories(Paths.get(CUSTOMER_CONTRACT_PATH));
+            Files.createDirectories(Paths.get(FEEDBACK_IMAGE_PATH));
         } catch (IOException e) {
             throw new RuntimeException("Could not create storage directories", e);
         }
@@ -92,6 +94,13 @@ public class FileStorageServiceImpl implements FileStorageService {
     @Override
     public String saveExpenseImage(MultipartFile file) throws IOException {
         return saveImage(file, EXPENSE_IMAGE_PATH, "expense-voucher", 1920, 1080);
+    }
+
+    @Override
+    public String saveFeedbackImage(MultipartFile file) throws IOException {
+        // 1920x1080 giống ảnh phiếu chi/thu — thoải mái cho ảnh chứng cứ (SP hỏng, bao bì rách…),
+        // vẫn resize xuống để không nặng khi list feedback load nhiều thumbnail.
+        return saveImage(file, FEEDBACK_IMAGE_PATH, "feedback", 1920, 1080);
     }
 
     @Override
@@ -183,8 +192,13 @@ public class FileStorageServiceImpl implements FileStorageService {
         double ratioH = (double) h / src.getHeight();
         double ratio  = Math.max(ratioW, ratioH);
 
-        int sw = (int) (src.getWidth()  * ratio);
-        int sh = (int) (src.getHeight() * ratio);
+        // Dùng Math.ceil để không bao giờ nhỏ hơn target sau khi ép int
+        int sw = (int) Math.ceil(src.getWidth()  * ratio);
+        int sh = (int) Math.ceil(src.getHeight() * ratio);
+
+        // An toàn: đảm bảo ít nhất bằng kích thước đích
+        sw = Math.max(sw, w);
+        sh = Math.max(sh, h);
 
         int imgType = hasAlpha ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB;
 
@@ -206,8 +220,10 @@ public class FileStorageServiceImpl implements FileStorageService {
         g.drawImage(src, 0, 0, sw, sh, null);
         g.dispose();
 
-        int x = Math.max(0, (sw - w) / 2);
-        int y = Math.max(0, (sh - h) / 2);
+        // Clamp tọa độ crop để không bao giờ vượt raster
+        int x = Math.max(0, Math.min((sw - w) / 2, sw - w));
+        int y = Math.max(0, Math.min((sh - h) / 2, sh - h));
+
         return tmp.getSubimage(x, y, w, h);
     }
 
@@ -355,6 +371,7 @@ public class FileStorageServiceImpl implements FileStorageService {
             case "order-receipt"        -> Paths.get(RECEIPT_FILE_PATH,        filename);
             case "certificate"          -> Paths.get(CERTIFICATE_FILE_PATH,    filename);
             case "customer-contract"    -> Paths.get(CUSTOMER_CONTRACT_PATH,   filename);
+            case "feedback"             -> Paths.get(FEEDBACK_IMAGE_PATH,      filename);
             case "production" -> {
                 // Path có thể nested: /images/production/batches/4/.../filename
                 // → resolve từ PRODUCTION_IMAGE_PATH + toàn bộ subpath sau "production/"

@@ -25,6 +25,21 @@ public class User implements UserDetails {
 
   private String username;
   private String fullName;
+
+  /**
+   * MÃ NHÂN VIÊN — hiển thị trên file chấm công chung của công ty để phân biệt
+   * nhanh khi hai nhân viên trùng họ tên. Nên là chuỗi ngắn, duy nhất và không
+   * đổi (ví dụ "NV001"). Có thể {@code null} với tài khoản OWNER/ADMIN hoặc nhân
+   * viên cũ chưa cấp mã; parser chấm công sẽ fallback về {@code fullName}.
+   *
+   * <p>Phase 1 (refactor tính lương 10/2026): thêm cột này để parser file chấm
+   * công chung có thể match an toàn — tên có dấu dễ nhập sai, mã nhân viên thì
+   * không. Khoá UNIQUE lỏng ở DB (NULL vẫn hợp lệ nhiều lần), ràng buộc duy
+   * nhất chỉ áp cho các giá trị khác NULL — xem {@code uk_user_employee_code}.
+   */
+  @Column(name = "employee_code", length = 40, unique = true)
+  private String employeeCode;
+
   private String password;
   private String email;
   private String phoneNumber;
@@ -86,6 +101,46 @@ public class User implements UserDetails {
   /** Chức vụ / vị trí công việc */
   private String position;
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // THÔNG TIN NGÂN HÀNG — dùng khi xuất file chi lương gửi ngân hàng
+  // ══════════════════════════════════════════════════════════════════════════
+  /**
+   * SỐ TÀI KHOẢN NGÂN HÀNG của nhân viên.
+   *
+   * <p>Chỉ dùng cho việc chi lương qua NH — điền vào cột "SỐ TÀI KHOẢN" của
+   * file "DANH SÁCH CHI LƯƠNG THÁNG mm/yyyy" ({@code BankPaymentExportService}).
+   * Không dùng cho bất kỳ tính năng đăng nhập / xác thực / thu chi nào khác.
+   *
+   * <p>Nullable — nhân viên chưa khai báo thì ô số tài khoản trong file để
+   * trống, HR điền tay trước khi gửi ngân hàng.
+   */
+  @Column(name = "bank_account_number", length = 50)
+  private String bankAccountNumber;
+
+  /**
+   * TÊN NGÂN HÀNG (mã / tên viết tắt như "VIETINBANK CN2", "VCB", "MB", …).
+   * Nullable — xem {@link #bankAccountNumber}.
+   */
+  @Column(name = "bank_name", length = 100)
+  private String bankName;
+
+  /**
+   * ĐANG NGHỈ THAI SẢN.
+   *
+   * <p>Trạng thái tạm dừng nhận lương KHÁC HẲN xoá / khoá tài khoản: nhân viên
+   * vẫn còn hồ sơ, vẫn đăng nhập được (nếu quản lý không khoá), nhưng bị
+   * loại khỏi file "DANH SÁCH CHI LƯƠNG" gửi ngân hàng
+   * ({@code BankPaymentExportService}). Khi nghỉ xong, HR chỉ cần bỏ cờ này,
+   * nhân viên tự động quay lại danh sách chi lương của tháng tiếp theo.
+   *
+   * <p>Cột riêng thay vì tái sử dụng {@code isLockAccount} vì hai mục đích
+   * khác nhau — khoá tài khoản chặn đăng nhập, nghỉ thai sản chỉ tạm dừng
+   * chuyển khoản.
+   */
+  @Column(name = "on_maternity_leave", nullable = false, columnDefinition = "bit(1) default 0")
+  @Builder.Default
+  private boolean onMaternityLeave = false;
+
   /**
    * NGÀY VÀO LÀM VIỆC (epoch millis, mốc 00:00 theo giờ VN) — căn cứ tính THÂM NIÊN.
    *
@@ -113,6 +168,30 @@ public class User implements UserDetails {
    */
   @Column(name = "date_of_birth")
   private Long dateOfBirth;
+
+  @Column(name = "prior_year_leave_balance")
+  private Double priorYearLeaveBalance;
+
+  @Column(name = "bonus_leave_days")
+  private Double bonusLeaveDays;
+
+  /**
+   * OFFSET cho cột "phép năm hiện tại" ở bảng "Quản lý phép".
+   *
+   * <p>Cột đó mặc định = {@code LeaveBalanceCalculator.entitledDaysFor()} —
+   * tự cộng dồn 1 ngày mỗi tháng đủ. Khi OWNER cần đè giá trị khác (vd. migrate
+   * từ hệ thống cũ), hệ thống lưu OFFSET = giá_trị_mong_muốn − giá_trị_auto.
+   *
+   * <p>Cách này để auto formula VẪN tự tăng đúng theo tháng, offset giữ nguyên,
+   * hiển thị tự lên 1 mỗi đầu tháng mà KHÔNG cần cronjob.
+   *
+   * <p>Ví dụ: 24/9/2026 auto = 8, OWNER nhập 8 → offset = 0. Nếu OWNER nhập 5 →
+   * offset = −3. 1/10/2026 auto = 9 → hiển thị = 9 + (−3) = 6.
+   *
+   * <p>Đơn vị: ngày (Double). Có thể có phần thập phân (nửa buổi = 0.5).
+   */
+  @Column(name = "entitled_offset_days")
+  private Double entitledOffsetDays;
 
   // ══════════════════════════════════════════════════════════════════════════
   // PASSCODE XEM LƯƠNG (6 số)
@@ -190,6 +269,25 @@ public class User implements UserDetails {
   @Enumerated(EnumType.STRING)
   @Column(name = "payroll_role", length = 40)
   private Role payrollRole;
+
+  /**
+   * NHẬN KPI hay không — dùng cho phòng Kế toán.
+   *
+   * <p>Nhân viên tổng hợp thuộc phòng kế toán nhưng không làm việc kế toán
+   * có thể được đặt {@code false} để không được chia KPI/bonus khi tính lương.
+   * {@code null} hoặc {@code true} = có nhận (mặc định).
+   */
+  @Column(name = "receive_kpi")
+  private Boolean receiveKpi;
+
+  /**
+   * NHẬN BONUS hay không — dùng cho phòng Kế toán.
+   *
+   * <p>Tương tự {@link #receiveKpi} nhưng kiểm soát riêng bonus.
+   * {@code null} hoặc {@code true} = có nhận (mặc định).
+   */
+  @Column(name = "receive_bonus")
+  private Boolean receiveBonus;
 
   @ManyToOne(fetch = FetchType.LAZY)
   @JoinColumn(name = "warehouse_id")

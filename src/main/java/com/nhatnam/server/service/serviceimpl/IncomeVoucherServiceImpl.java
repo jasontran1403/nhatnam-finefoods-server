@@ -6,6 +6,7 @@ import com.nhatnam.server.common.ResourceNotFoundException;
 import com.nhatnam.server.common.StaleOrderDataException;
 import com.nhatnam.server.dto.common.PageResponse;
 import com.nhatnam.server.dto.income.CreateIncomeVoucherRequest;
+import com.nhatnam.server.dto.income.EmployeeSuggestionDto;
 import com.nhatnam.server.dto.income.IncomeVoucherDto;
 import com.nhatnam.server.entity.IncomeItem;
 import com.nhatnam.server.entity.IncomeVoucherOrderAllocation;
@@ -23,6 +24,7 @@ import com.nhatnam.server.service.NotificationService;
 import com.nhatnam.server.service.OrderService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -47,6 +49,50 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
     private final ObjectMapper            objectMapper;
     private final OrderRepository         orderRepository;
     private final OrderService            orderService;
+
+    private static final Map<String, Integer> ROLE_ORDER;
+    static {
+        Map<String, Integer> m = new HashMap<>();
+        m.put("OWNER", 0);
+        m.put("ADMIN", 1);
+        m.put("SUPER_ACCOUNTANT", 2);
+        m.put("ACCOUNTANT", 3);
+        m.put("SUPER_SELLER", 4);
+        m.put("SELLER", 5);
+        m.put("SUPER_WAREHOUSE", 6);
+        m.put("WAREHOUSE", 7);
+        m.put("SUPER_FACTORY_WORKER", 8);
+        m.put("FACTORY_ACCOUNTANT", 9);
+        m.put("FACTORY_MANAGER", 10);
+        m.put("FACTORY_STAFF", 11);
+        m.put("FACTORY_PRODUCTION_WORKER", 12);
+        m.put("FACTORY_WORKER", 13);
+        ROLE_ORDER = Map.copyOf(m);
+    }
+
+    private static final Set<String> EXCLUDED_ROLES = Set.of(
+            "FACTORY_SECURITY", "SECURITY"
+    );
+
+    @Override
+    public List<EmployeeSuggestionDto> suggestEmployees(String keyword) {
+        List<User> users = userRepository.searchActiveByKeyword(
+                keyword.isEmpty() ? "" : keyword,
+                PageRequest.of(0, 100)
+        );
+        return users.stream()
+                .map(u -> new EmployeeSuggestionDto(
+                        u.getId(),
+                        u.getFullName(),
+                        u.getPayrollRole() != null ? u.getPayrollRole().name() : null,
+                        u.getPosition()
+                ))
+                .filter(u -> u.getPayrollRole() != null
+                        && !EXCLUDED_ROLES.contains(u.getPayrollRole().toUpperCase()))
+                .sorted(Comparator.comparingInt(u ->
+                        ROLE_ORDER.getOrDefault(u.getPayrollRole(), 99)))
+                .toList();
+    }
 
     // IncomeVoucherServiceImpl.java — chỉ hàm create(), thay thế toàn bộ hàm cũ
 
@@ -151,6 +197,7 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
         }
 
         // ── 2. Cập nhật thông tin phiếu + items ─────────────────────────────
+        if (req.getCustomerName() != null) voucher.setCustomerName(req.getCustomerName());
         if (req.getPayerName()  != null) voucher.setPayerName(req.getPayerName());
         if (req.getReason()     != null) voucher.setReason(req.getReason());
         if (req.getReceiptNumber() != null && !req.getReceiptNumber().isBlank())
@@ -630,6 +677,7 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
         IncomeVoucher voucher = IncomeVoucher.builder()
                 .voucherCode(generateCode())
                 .receiptNumber(req.getReceiptNumber().trim())
+                .customerName(req.getCustomerName())
                 .payerName(req.getPayerName())
                 .reason(req.getReason())
                 .createdByName(creatorName)
@@ -775,24 +823,35 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
         boolean hasRange = from != null && to != null;
 
         java.math.BigDecimal total;
+        java.math.BigDecimal offsetUsed;
         long count;
 
         if (hasQ && hasRange) {
-            total = voucherRepo.sumSearchWithDateRange(q.trim(), parseAmount(q), from, to);
-            count = voucherRepo.countSearchWithDateRange(q.trim(), parseAmount(q), from, to);
+            total      = voucherRepo.sumSearchWithDateRange(q.trim(), parseAmount(q), from, to);
+            offsetUsed = voucherRepo.sumOffsetUsedSearchWithDateRange(q.trim(), parseAmount(q), from, to);
+            count      = voucherRepo.countSearchWithDateRange(q.trim(), parseAmount(q), from, to);
         } else if (hasQ) {
-            total = voucherRepo.sumSearchAll(q.trim(), parseAmount(q));
-            count = voucherRepo.countSearchAll(q.trim(), parseAmount(q));
+            total      = voucherRepo.sumSearchAll(q.trim(), parseAmount(q));
+            offsetUsed = voucherRepo.sumOffsetUsedSearchAll(q.trim(), parseAmount(q));
+            count      = voucherRepo.countSearchAll(q.trim(), parseAmount(q));
         } else if (hasRange) {
-            total = voucherRepo.sumByDateRange(from, to);
-            count = voucherRepo.countByDateRange(from, to);
+            total      = voucherRepo.sumByDateRange(from, to);
+            offsetUsed = voucherRepo.sumOffsetUsedByDateRange(from, to);
+            count      = voucherRepo.countByDateRange(from, to);
         } else {
-            total = voucherRepo.sumAll();
-            count = voucherRepo.countAllVouchers();
+            total      = voucherRepo.sumAll();
+            offsetUsed = voucherRepo.sumOffsetUsedAll();
+            count      = voucherRepo.countAllVouchers();
         }
 
+        // Trừ phần dư đã cấn trừ: tổng doanh thu THỰC = Σ items − Σ offsetUsed.
+        // Nếu không trừ, phiếu nguồn A (3.3M) + phiếu con B (0.3M) sẽ bị tính 3.6M
+        // trong khi khách thực chỉ nộp 3.3M.
+        java.math.BigDecimal t = total      != null ? total      : java.math.BigDecimal.ZERO;
+        java.math.BigDecimal o = offsetUsed != null ? offsetUsed : java.math.BigDecimal.ZERO;
+
         return com.nhatnam.server.dto.income.IncomeVoucherSummaryDto.builder()
-                .totalAmount(total != null ? total : java.math.BigDecimal.ZERO)
+                .totalAmount(t.subtract(o))
                 .totalCount(count)
                 .build();
     }
@@ -975,11 +1034,15 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
             boolean alt = (i % 2 == 1);
 
             // Tính tổng tiền
-            BigDecimal total = v.getItems() == null ? BigDecimal.ZERO :
+            BigDecimal totalRaw = v.getItems() == null ? BigDecimal.ZERO :
                     v.getItems().stream()
                             .map(IncomeItem::getAmount)
                             .filter(Objects::nonNull)
                             .reduce(BigDecimal.ZERO, BigDecimal::add);
+            // Trừ phần đã CẤN TRỪ sang phiếu con để báo cáo khớp doanh thu thực.
+            BigDecimal offsetUsed = v.getOffsetUsedAmount() != null
+                    ? v.getOffsetUsedAmount() : BigDecimal.ZERO;
+            BigDecimal total = totalRaw.subtract(offsetUsed);
 
             // Parse linkedOrderCodes
             List<String> codes = parseJsonList(v.getLinkedOrderCodes());
@@ -1113,7 +1176,32 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
     @Override
     public String suggestNextReceiptNumber() {
         String latest = voucherRepo.findLatestReceiptNumber();
-        return String.valueOf(nextNumberWithWrap(latest));
+        if (latest == null || latest.isBlank()) {
+            return String.format("%05d", 1L); // Mặc định 00001
+        }
+
+        // Tách phần chữ và phần số
+        String prefix = latest.replaceAll("[0-9]", "");
+        String numberPart = latest.replaceAll("[^0-9]", "");
+
+        if (numberPart.isEmpty()) {
+            return String.format("%05d", 1L);
+        }
+
+        try {
+            long num = Long.parseLong(numberPart);
+            long nextNum = (num >= RECEIPT_MAX || num < 1) ? 1L : num + 1;
+            String formattedNumber = String.format("%05d", nextNum);
+
+            // Nếu có prefix thì giữ nguyên prefix + số đã format
+            if (!prefix.isEmpty()) {
+                return prefix + formattedNumber;
+            }
+            // Nếu chỉ có số, trả về số đã format
+            return formattedNumber;
+        } catch (NumberFormatException e) {
+            return String.format("%05d", 1L);
+        }
     }
 
     /** Tính số kế tiếp (quay vòng 1..RECEIPT_MAX) từ số phiếu gần nhất. */
@@ -1196,6 +1284,7 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
                 .id(v.getId())
                 .voucherCode(v.getVoucherCode())
                 .receiptNumber(v.getReceiptNumber())
+                .customerName(v.getCustomerName())
                 .payerName(v.getPayerName())
                 .reason(v.getReason())
                 .createdByName(v.getCreatedByName())
@@ -1218,8 +1307,16 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
                                 .build())
                         .toList())
                 .totalAmount(total)
+                .effectiveTotalAmount(total.subtract(
+                        v.getOffsetUsedAmount() != null ? v.getOffsetUsedAmount() : BigDecimal.ZERO))
                 .imageUrls(parseJsonList(v.getImageUrls()))
                 .overpay(buildOverpayInfo(v, total, buildAllocationMap(v)))
+                .offsetSourceVoucherId(v.getOffsetSourceVoucherId())
+                .offsetSourceReceiptNumber(
+                        v.getOffsetSourceVoucherId() == null ? null :
+                                voucherRepo.findById(v.getOffsetSourceVoucherId())
+                                        .map(IncomeVoucher::getReceiptNumber).orElse(null))
+                .offsetUsedAmount(v.getOffsetUsedAmount())
                 .createdAt(v.getCreatedAt())
                 .updatedAt(v.getUpdatedAt())
                 .build();
@@ -1234,6 +1331,147 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
      *
      * <p>Tên khách + mã phiếu chi hoàn lấy từ đơn CUỐI (nơi phần dư logic gắn vào).
      */
+    // ═════════════════════════════════════════════════════════════════════════
+    //  CẤN TRỪ — tạo phiếu thu MỚI từ phần dư của phiếu nguồn, cùng khách
+    // ═════════════════════════════════════════════════════════════════════════
+
+    @Override
+    @org.springframework.transaction.annotation.Transactional
+    public IncomeVoucherDto offsetOverpayToOrder(Long sourceVoucherId,
+                                                 Long actorUserId,
+                                                 Role actorRole,
+                                                 com.nhatnam.server.dto.income.OffsetIncomeVoucherRequest req) {
+        IncomeVoucher source = findOrThrow(sourceVoucherId);
+
+        // 1) Phần dư còn lại của nguồn = total − Σ alloc − offsetUsed
+        BigDecimal sourceTotal = source.getItems() == null ? BigDecimal.ZERO
+                : source.getItems().stream().map(IncomeItem::getAmount)
+                .filter(java.util.Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal sumAlloc = buildAllocationMap(source).values().stream()
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal usedOffset = source.getOffsetUsedAmount() != null
+                ? source.getOffsetUsedAmount() : BigDecimal.ZERO;
+        BigDecimal availableOverpay = sourceTotal.subtract(sumAlloc).subtract(usedOffset)
+                .setScale(0, RoundingMode.HALF_UP);
+        if (availableOverpay.compareTo(BigDecimal.ZERO) <= 0)
+            throw new BusinessException("Phiếu thu này không có phần dư để cấn trừ");
+
+        // 2) Validate đơn đích: tồn tại + CHƯA thu đủ + CÙNG KHÁCH với nguồn
+        String targetCode = req.getTargetOrderCode() == null ? "" : req.getTargetOrderCode().trim();
+        if (targetCode.isEmpty())
+            throw new BusinessException("Thiếu mã đơn đích");
+        com.nhatnam.server.entity.Order target = orderRepository.findByOrderCode(targetCode)
+                .orElseThrow(() -> new ResourceNotFoundException("Đơn hàng không tồn tại: " + targetCode));
+
+        BigDecimal targetFinal = target.getFinalAmount() != null ? target.getFinalAmount() : BigDecimal.ZERO;
+        BigDecimal targetPaid  = target.getPaidAmount()  != null ? target.getPaidAmount()  : BigDecimal.ZERO;
+        BigDecimal targetRemaining = targetFinal.subtract(targetPaid)
+                .setScale(0, RoundingMode.HALF_UP).max(BigDecimal.ZERO);
+        if (targetRemaining.compareTo(BigDecimal.ZERO) <= 0)
+            throw new BusinessException("Đơn " + targetCode + " đã thu đủ, không cần cấn trừ");
+
+        // Cùng khách: so sánh customerId trước; fallback theo tên nếu không có id.
+        if (!isSameCustomerAsSource(source, target))
+            throw new BusinessException("Đơn " + targetCode + " không cùng khách với phiếu thu nguồn");
+
+        // 3) Số tiền cấn trừ
+        boolean full = "FULL".equalsIgnoreCase(req.getHandling());
+        BigDecimal amount;
+        if (full) {
+            amount = availableOverpay.min(targetRemaining);
+        } else if ("PARTIAL".equalsIgnoreCase(req.getHandling())) {
+            if (req.getAmount() == null || req.getAmount().signum() <= 0)
+                throw new BusinessException("Nhập số tiền cấn trừ (PARTIAL)");
+            amount = req.getAmount().setScale(0, RoundingMode.HALF_UP);
+            if (amount.compareTo(availableOverpay) > 0)
+                throw new BusinessException("Số tiền cấn trừ vượt phần dư còn lại ("
+                        + availableOverpay.toPlainString() + ")");
+            if (amount.compareTo(targetRemaining) > 0)
+                throw new BusinessException("Số tiền cấn trừ vượt phần còn lại của đơn ("
+                        + targetRemaining.toPlainString() + ")");
+        } else {
+            throw new BusinessException("handling phải là FULL hoặc PARTIAL");
+        }
+
+        // 4) Build request tạo phiếu con. "FULL" ở đây chuyển thành lastOrderHandling
+        //    phù hợp với luồng applyCollectionToOrders:
+        //    - amount == targetRemaining → tự chuyển COMPLETED (dùng "PARTIAL" OK).
+        //    - amount < targetRemaining  → đơn còn PARTIAL (handling PARTIAL cũng ổn).
+        //    Chỉ dùng "FULL" khi owner muốn đánh dấu COMPLETED mà thu thiếu — ở đây
+        //    không áp dụng vì amount đã = min(…, targetRemaining).
+        String payerName = target.getCustomerName() != null ? target.getCustomerName()
+                : (source.getPayerName() != null ? source.getPayerName() : source.getCustomerName());
+
+        CreateIncomeVoucherRequest childReq = new CreateIncomeVoucherRequest();
+        childReq.setReceiptNumber(req.getReceiptNumber().trim());
+        childReq.setReason("Cấn trừ từ phiếu thu " + source.getReceiptNumber()
+                + " (" + source.getVoucherCode() + ")");
+        childReq.setCustomerName(target.getCustomerName());
+        childReq.setPayerName(payerName);
+        // Cấn trừ KHÔNG phải thu tiền mới → kiểu thanh toán ghi theo nguồn,
+        // nhưng bỏ bankName/bankRef để không nhầm là 1 giao dịch CK mới.
+        childReq.setPaymentType(source.getPaymentType() != null
+                ? source.getPaymentType().name() : "CASH");
+        childReq.setBankName(null);
+        childReq.setBankRef(null);
+        childReq.setLinkedOrderCodes(java.util.List.of(targetCode));
+        childReq.setCollectedAmount(amount);
+        childReq.setLastOrderHandling("PARTIAL");
+
+        CreateIncomeVoucherRequest.IncomeItemRequest line = new CreateIncomeVoucherRequest.IncomeItemRequest();
+        line.setItemName("Cấn trừ từ phiếu " + source.getReceiptNumber());
+        line.setAmount(amount);
+        line.setNote(null);
+        childReq.setItems(java.util.List.of(line));
+
+        // 5) Tạo phiếu con qua luồng chuẩn (có đầy đủ allocation + payment).
+        IncomeVoucherDto childDto = create(actorUserId, actorRole, childReq);
+
+        // 6) Gắn offsetSourceVoucherId + cập nhật offsetUsedAmount của nguồn.
+        IncomeVoucher child = findOrThrow(childDto.getId());
+        child.setOffsetSourceVoucherId(source.getId());
+        voucherRepo.save(child);
+
+        source.setOffsetUsedAmount(usedOffset.add(amount));
+        voucherRepo.save(source);
+
+        log.info("[IncomeOffset] Phiếu {} cấn trừ {}đ sang đơn {} (phiếu con {})",
+                source.getVoucherCode(), amount, targetCode, child.getVoucherCode());
+
+        return toDto(child);
+    }
+
+    /**
+     * So khớp khách của đơn đích với các đơn của phiếu nguồn — ưu tiên customerId,
+     * fallback về customerName chuẩn hoá (trim + lowercase).
+     */
+    private boolean isSameCustomerAsSource(IncomeVoucher source, com.nhatnam.server.entity.Order target) {
+        Long targetCustomerId = target.getCustomer() != null ? target.getCustomer().getId() : null;
+        String targetName = (target.getCustomerName() != null ? target.getCustomerName() : "")
+                .trim().toLowerCase();
+
+        List<String> codes = parseJsonList(source.getLinkedOrderCodes());
+        if (codes == null || codes.isEmpty()) {
+            // Phiếu không có đơn liên kết — fallback so sánh với customerName của phiếu
+            String src = (source.getCustomerName() != null ? source.getCustomerName() : "")
+                    .trim().toLowerCase();
+            return !src.isEmpty() && src.equals(targetName);
+        }
+        for (String c : codes) {
+            if (c == null || c.isBlank()) continue;
+            com.nhatnam.server.entity.Order o =
+                    orderRepository.findByOrderCode(c.trim()).orElse(null);
+            if (o == null) continue;
+            Long oid = o.getCustomer() != null ? o.getCustomer().getId() : null;
+            if (targetCustomerId != null && oid != null && oid.equals(targetCustomerId)) return true;
+            String oname = (o.getCustomerName() != null ? o.getCustomerName() : "")
+                    .trim().toLowerCase();
+            if (!targetName.isEmpty() && targetName.equals(oname)) return true;
+        }
+        return false;
+    }
+
     private IncomeVoucherDto.OverpayInfoDto buildOverpayInfo(
             IncomeVoucher v, BigDecimal voucherTotal,
             java.util.Map<String, BigDecimal> allocationMap) {
@@ -1242,7 +1480,10 @@ public class IncomeVoucherServiceImpl implements IncomeVoucherService {
 
         BigDecimal sumAllocated = allocationMap.values().stream()
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal over = voucherTotal.subtract(sumAllocated);
+        // Dư = tổng phiếu − Σ phân bổ − phần ĐÃ cấn trừ sang phiếu khác.
+        BigDecimal offsetUsed = v.getOffsetUsedAmount() != null
+                ? v.getOffsetUsedAmount() : BigDecimal.ZERO;
+        BigDecimal over = voucherTotal.subtract(sumAllocated).subtract(offsetUsed);
         if (over.compareTo(BigDecimal.ZERO) <= 0) return null;
 
         // Lấy thông tin khách + mã phiếu chi hoàn từ đơn cuối

@@ -83,17 +83,11 @@ public final class OrgCatalog {
     static {
         Map<String, Department> m = new LinkedHashMap<>();
 
-        // BAN LÃNH ĐẠO — tính lương TÁCH RIÊNG, không gộp vào bảng lương của bất
-        // kỳ bộ phận nào khác. Việc tách này do PayrollDepartment.MANAGEMENT lo:
-        // nó có bảng chấm công riêng, nút Hoàn tất riêng, và employeesOf() lọc
-        // theo role hưởng lương nên người ở đây không lọt sang bảng khác.
-        //
-        // Chức vụ ánh xạ sang chính role đăng nhập tương ứng, vì đó cũng là hai
-        // role duy nhất thuộc MANAGEMENT.
-        m.put("Quản lý cấp cao", new Department("Quản lý cấp cao", PayrollDepartment.MANAGEMENT, Role.ADMIN, List.of(
-                pos("Chủ Tịch",              Role.OWNER),
-                pos("Giám Đốc",              Role.ADMIN)
-        )));
+        // Phase 1 (10/2026): BAN LÃNH ĐẠO (OWNER / ADMIN) đã được gỡ khỏi hệ
+        // thống tính lương. Enum PayrollDepartment.MANAGEMENT không còn tồn tại
+        // nên entry "Quản lý cấp cao" bị xoá tại đây. OWNER/ADMIN vẫn giữ nguyên
+        // quyền quản trị, chỉ là không hiển thị trên các tab tính lương / phiếu
+        // lương / sơ đồ phòng ban nhận lương.
 
         // Hệ số chia thưởng KPI ghi kèm để đối chiếu — xem FactoryKpiService.ROLE_WEIGHTS
         m.put("Xưởng sản xuất", new Department("Xưởng sản xuất", PayrollDepartment.FACTORY, Role.FACTORY_PRODUCTION_WORKER, List.of(

@@ -249,8 +249,13 @@ public class CashflowService {
 
     private BigDecimal incomeTotal(IncomeVoucher iv) {
         if (iv.getItems() == null || iv.getItems().isEmpty()) return BigDecimal.ZERO;
-        return iv.getItems().stream().map(IncomeItem::getAmount)
+        BigDecimal sum = iv.getItems().stream().map(IncomeItem::getAmount)
                 .filter(Objects::nonNull).reduce(BigDecimal.ZERO, BigDecimal::add);
+        // Trừ phần đã CẤN TRỪ sang phiếu con. Nhờ vậy dòng tiền và báo cáo gộp
+        // không bị double-count khi phiếu A có dư sinh phiếu con B gắn đơn khác.
+        BigDecimal offsetUsed = iv.getOffsetUsedAmount() != null
+                ? iv.getOffsetUsedAmount() : BigDecimal.ZERO;
+        return sum.subtract(offsetUsed);
     }
     private BigDecimal expenseTotal(ExpenseVoucher ev) {
         if (ev.getItems() == null || ev.getItems().isEmpty()) return BigDecimal.ZERO;

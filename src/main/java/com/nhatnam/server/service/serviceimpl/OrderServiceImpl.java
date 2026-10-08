@@ -11,12 +11,12 @@ import com.nhatnam.server.enumtype.VatRate;
 import com.nhatnam.server.exception.PriceChangedException;
 import com.nhatnam.server.repository.*;
 import com.nhatnam.server.enumtype.Role;
-import com.nhatnam.server.service.CartHoldService;
-import com.nhatnam.server.service.NotificationService;
-import com.nhatnam.server.service.OrderService;
+import com.nhatnam.server.service.*;
 import com.nhatnam.server.entity.SellerKpi;
-import com.nhatnam.server.service.FifoDeductService;
 import com.nhatnam.server.repository.SellerKpiRepository;
+import com.nhatnam.server.utils.DeliveryZoneUtil;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -35,12 +35,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.Locale;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.nhatnam.server.service.AddressCatalogService;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class OrderServiceImpl implements OrderService {
+    @PersistenceContext
+    private EntityManager entityManager;
+
     private final ObjectMapper objectMapper;
     private final OrderRepository               orderRepository;
     private final ProductRepository             productRepository;
@@ -62,6 +64,8 @@ public class OrderServiceImpl implements OrderService {
     private final IngredientExpiryRepository    ingredientExpiryRepository;
     private final com.nhatnam.server.service.CustomerContractService customerContractService;
     private final OrderCodePrefixRepository     orderCodePrefixRepository;
+    // BUG FIX: race-safe stock layer
+    private final com.nhatnam.server.service.StockMutationService stockMutationService;
 
     private static final String RETAIL_GUEST_LABEL = "Khách vãng lai";
     private static final ZoneId TZ = ZoneId.of("Asia/Ho_Chi_Minh");
@@ -598,7 +602,7 @@ public class OrderServiceImpl implements OrderService {
                 fullyPaid
                         ? "Đơn " + saved.getOrderCode() + " đã thu đủ tiền trước — kho có thể giao hàng"
                         : "Đơn " + saved.getOrderCode() + " đã thu trước 1 phần bởi " + actorName
-                          + " (" + amount.toPlainString() + ") — chưa đủ để giao",
+                        + " (" + amount.toPlainString() + ") — chưa đủ để giao",
                 payload, actorUserId);
 
         return mapToResponse(saved);
@@ -638,6 +642,22 @@ public class OrderServiceImpl implements OrderService {
         if (order.getStatus() != OrderStatus.DELIVERING)
             throw new RuntimeException("Chỉ có thể chuyển sang 'Chờ thanh toán' từ trạng thái 'Đang giao'");
 
+        // ── ĐƠN 0đ (TOÀN KHUYẾN MÃI, KHÔNG PHÍ) → HOÀN THÀNH LUÔN ────────────
+        // Ví dụ điển hình: khách trả hàng khuyến mãi (Cty Rich sampling…) hoặc đơn
+        // tặng quà 100% không thu phí — final_amount = 0đ, không có gì để "chờ thu".
+        // Cho lên PENDING_PAYMENT sẽ làm đơn nằm lại trên bàn kế toán vô nghĩa và
+        // vẫn bị tính vào công nợ tuy không ai nợ ai đồng nào.
+        //
+        // Rule đúng theo nghiệp vụ:
+        //   final_amount = 0đ  → COMPLETED luôn (bất kể "Nhận tại kho" hay giao)
+        //   final_amount > 0đ  → luồng cũ (PENDING_PAYMENT chờ kế toán xác nhận)
+        //
+        // TÁCH khỏi isPaidInFullRounded để giữ đúng ngữ nghĩa hàm đó ("đã thu ĐỦ"
+        // đối với đơn có tiền thu) — với đơn 0đ, khái niệm "thu đủ" không áp dụng,
+        // ta chỉ đơn thuần bỏ qua bước chờ thanh toán.
+        BigDecimal finalAmt = order.getFinalAmount() != null ? order.getFinalAmount() : BigDecimal.ZERO;
+        boolean isZeroAmount = finalAmt.compareTo(BigDecimal.ZERO) == 0;
+
         // ── ĐƠN ĐÃ THU ĐỦ TIỀN → HOÀN THÀNH LUÔN ─────────────────────────────
         // Điển hình: khách bắt buộc THANH TOÁN TRƯỚC — tiền đã thu xong từ lúc đơn
         // còn đang chuẩn bị. Khi kho xác nhận đã giao xong thì không có gì để "chờ thu"
@@ -646,7 +666,7 @@ public class OrderServiceImpl implements OrderService {
         //
         // So sánh sau khi LÀM TRÒN CẢ HAI về hàng đơn vị đồng — final_amount có thể
         // còn số lẻ (VAT/chiết khấu), paid_amount là tiền thực thu (số nguyên).
-        if (isPaidInFullRounded(order)) {
+        if (isZeroAmount || isPaidInFullRounded(order)) {
             return markAsCompleted(orderId, actorName, actorUserId);
         }
 
@@ -704,6 +724,26 @@ public class OrderServiceImpl implements OrderService {
                 "Đơn " + saved.getOrderCode() + " đã hoàn thành & thanh toán đủ", payload, actorUserId);
         updateSellerKpi(saved);
         return mapToResponse(saved);
+    }
+
+    @Override
+    @Transactional
+    public void markAsCompletedNoFixedPaidAmount(Long orderId, String actorName, Long actorUserId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
+        assertNotCancelled(order);
+        if (order.getStatus() != OrderStatus.DELIVERING && order.getStatus() != OrderStatus.PENDING_PAYMENT)
+            throw new RuntimeException("Chỉ có thể hoàn thành từ 'Đang giao' hoặc 'Chờ thanh toán'");
+        order.setStatus(OrderStatus.COMPLETED);
+        order.setPaymentStatus(PaymentStatus.PAID);
+        order.setUpdatedAt(System.currentTimeMillis());
+        Order saved = orderRepository.save(order);
+        log(saved, "COMPLETED", actorName, "ACCOUNTANT", null);
+        String payload = "{\"orderId\":" + orderId + ",\"orderCode\":\"" + saved.getOrderCode() + "\"}";
+        notifyOrderUpdate(saved, "ORDER_COMPLETED",
+                "Đơn " + saved.getOrderCode() + " đã hoàn thành & thanh toán đủ", payload, actorUserId);
+        updateSellerKpi(saved);
+        mapToResponse(saved);
     }
 
     @Override
@@ -844,7 +884,7 @@ public class OrderServiceImpl implements OrderService {
 
     @Override
     @Transactional
-    public OrderResponse updatePaymentMethod(Long orderId, String paymentMethod, String actorName) {
+    public void updatePaymentMethod(Long orderId, String paymentMethod, String actorName) {
         Order order = orderRepository.findById(orderId)
                 .orElseThrow(() -> new RuntimeException("Không tìm thấy đơn hàng: " + orderId));
         assertNotCancelled(order);
@@ -855,7 +895,7 @@ public class OrderServiceImpl implements OrderService {
         order.setUpdatedAt(System.currentTimeMillis());
         Order saved = orderRepository.saveAndFlush(order);
         log(saved, "PAYMENT_METHOD_UPDATED", actorName, "ACCOUNTANT", "Đổi sang: " + paymentMethod);
-        return mapToResponse(saved);
+        mapToResponse(saved);
     }
 
     @Override
@@ -1023,8 +1063,6 @@ public class OrderServiceImpl implements OrderService {
                 order.setKpiUserId(newKpiUserId);
             }
 
-            log.info("[UPDATE_ORDER] orderId={} — customer changed to id={} name={}, KPI: {} -> {}",
-                    orderId, newCustomer.getId(), order.getCustomerName(), currentKpiUserId, newKpiUserId);
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -1040,13 +1078,10 @@ public class OrderServiceImpl implements OrderService {
                         Collectors.reducing(BigDecimal.ZERO, OrderStockDeduction::getQuantity, BigDecimal::add)
                 ));
 
-        Map<Long, OrderStockDeduction> existingDeductionByIngId = existingDeductions
-                .stream()
-                .collect(Collectors.toMap(
-                        d -> d.getIngredientStock().getIngredientId(),
-                        d -> d,
-                        (a, b) -> a
-                ));
+        // BUG FIX 3.1: XOÁ existingDeductionByIngId map. Trước đây map này chỉ
+        // giữ 1 record/ingredient, sau đó dùng để xoá các record khác → mất
+        // tracking cho các lô đã trừ. Bây giờ giữ nguyên tất cả deduction records
+        // của flow deduct/restore → cancel về sau phân bổ đúng lô.
 
         Map<Long, BigDecimal> newUsageMap = new LinkedHashMap<>();
         List<Map<Long, BigDecimal>> itemIngredientUsage = new ArrayList<>();
@@ -1077,61 +1112,49 @@ public class OrderServiceImpl implements OrderService {
                     deltaMap.put(ingId, delta);
             }
         } else {
-            log.warn("[UPDATE_ORDER] orderId={} — Không có OrderStockDeduction records. Deduct toàn bộ newUsage={} như tạo mới.", orderId, newUsageMap);
-            deltaMap.putAll(newUsageMap);
+            // BUG FIX 3.2 (double-deduct silent):
+            // Trước: fallback deltaMap.putAll(newUsageMap) → trừ toàn bộ như đơn mới
+            //         → nhưng đơn ĐÃ trừ kho lúc tạo → trừ 2 lần, chỉ log warn.
+            // Sau: throw để admin phát hiện dữ liệu bất thường (deduction records
+            //      bị xoá do bug khác hoặc thao tác thủ công).
+            throw new BusinessException(String.format(
+                    "Đơn hàng #%d không có bản ghi trừ kho — không thể sửa an toàn. " +
+                            "Vui lòng kiểm tra dữ liệu (bảng order_stock_deduction có thể bị xoá).",
+                    orderId));
         }
 
         Map<Long, BigDecimal> ingredientUnitCostMap = new LinkedHashMap<>();
         List<WarehouseReceiptItem> receiptItems = new ArrayList<>();
 
-        for (Map.Entry<Long, BigDecimal> entry : deltaMap.entrySet()) {
+        // BUG FIX (deadlock guard): sort ingredientId ASC
+        List<Map.Entry<Long, BigDecimal>> sortedDelta = deltaMap.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .toList();
+
+        for (Map.Entry<Long, BigDecimal> entry : sortedDelta) {
             Long ingId = entry.getKey();
             BigDecimal delta = entry.getValue();
 
             Ingredient ing = ingredientRepository.findById(ingId)
                     .orElseThrow(() -> new RuntimeException("Ingredient not found: " + ingId));
-            IngredientStock stock = ingredientStockRepository
-                    .findByIngredientIdAndWarehouseId(ingId, warehouseId)
-                    .orElseThrow(() -> new RuntimeException(String.format(
-                            "Nguyên liệu '%s' chưa được cấu hình tồn kho cho kho '%s'",
-                            ing.getName(), warehouse.getName())));
-
-            BigDecimal before = stock.getStockQuantity();
 
             if (delta.compareTo(BigDecimal.ZERO) > 0) {
-                if (stock.getStockQuantity().compareTo(delta) < 0)
-                    throw new BusinessException(String.format(
-                            "Không đủ tồn kho '%s' tại kho '%s' (còn: %s, cần thêm: %s %s)",
-                            ing.getName(), warehouse.getName(),
-                            stock.getStockQuantity(), delta, ing.getUnit()));
+                // BUG FIX 3.3 (race): atomic decrease thay cho check-modify-write.
+                StockMutationResult mut = stockMutationService.decrease(
+                        ingId, warehouseId, delta, now);
 
-                BigDecimal after = before.subtract(delta).setScale(3, RoundingMode.HALF_UP);
-                stock.setStockQuantity(after);
-                stock.setUpdatedAt(now);
-                ingredientStockRepository.save(stock);
-
+                // BUG FIX 3.1: XOÁ đoạn code xoá deduction records "trừ 1 keepId".
+                // Trước: xoá tất cả deduction của ingredient này trừ 1 record đầu
+                //         → mất tracking các lô đã trừ.
+                // Sau: KHÔNG xoá gì. FIFO deduct sẽ tự tạo deduction records MỚI
+                //      cho các lô mới trừ (+delta). Deduction cũ giữ nguyên → tổng
+                //      quantity = tổng của cả cũ + mới, tracking chính xác từng lô.
                 BigDecimal costDeducted = fifoDeductService.deduct(order.getId(), warehouse, ing, delta, now);
-
-                Long keepId = existingDeductionByIngId.containsKey(ingId)
-                        ? existingDeductionByIngId.get(ingId).getId()
-                        : null;
-                orderStockDeductionRepository.findByOrderId(orderId)
-                        .stream()
-                        .filter(d -> d.getIngredientStock().getIngredientId().equals(ingId))
-                        .filter(d -> keepId == null || !d.getId().equals(keepId))
-                        .forEach(d -> {
-                            log.info("[UPDATE_ORDER] orderId={} — deleted fifo-created deduction id={} ingId={} qty={}",
-                                    orderId, d.getId(), ingId, d.getQuantity());
-                            orderStockDeductionRepository.delete(d);
-                        });
 
                 BigDecimal unitCost = BigDecimal.ZERO;
                 if (costDeducted.compareTo(BigDecimal.ZERO) > 0)
                     unitCost = costDeducted.divide(delta, 6, RoundingMode.HALF_UP);
                 ingredientUnitCostMap.put(ingId, unitCost);
-
-                log.info("[UPDATE_ORDER] orderId={} ingId={} — deducted delta={}, costDeducted={}, stock: {} → {}",
-                        orderId, ingId, delta, costDeducted, before, after);
 
                 receiptItems.add(WarehouseReceiptItem.builder()
                         .ingredientId(ing.getId())
@@ -1139,16 +1162,19 @@ public class OrderServiceImpl implements OrderService {
                         .ingredientUnitSnapshot(ing.getUnit())
                         .ingredientImageUrlSnapshot(ing.getImageUrl())
                         .quantity(delta.negate())
-                        .quantityBefore(before).quantityAfter(before.subtract(delta).setScale(3, RoundingMode.HALF_UP))
+                        .quantityBefore(mut.getBefore()).quantityAfter(mut.getAfter())
                         .difference(delta.negate()).build());
 
             } else {
+                // Delta < 0: bán bớt → hoàn kho
                 BigDecimal restore = delta.abs();
-                BigDecimal after = before.add(restore).setScale(3, RoundingMode.HALF_UP);
-                stock.setStockQuantity(after);
-                stock.setUpdatedAt(now);
-                ingredientStockRepository.save(stock);
 
+                // BUG FIX 3.3 (race): atomic increase
+                StockMutationResult mut = stockMutationService.increase(
+                        ingId, warehouseId, restore, now);
+
+                // restorePartialStock: hoàn từng lô theo deduction records HIỆN TẠI
+                // (không consolidated) → phân bổ đúng lô nào đã trừ bao nhiêu.
                 restorePartialStock(order.getId(), ingId, restore, now);
                 ingredientUnitCostMap.put(ingId, BigDecimal.ZERO);
 
@@ -1158,8 +1184,8 @@ public class OrderServiceImpl implements OrderService {
                         .ingredientUnitSnapshot(ing.getUnit())
                         .ingredientImageUrlSnapshot(ing.getImageUrl())
                         .quantity(restore)
-                        .quantityBefore(before).quantityAfter(after)
-                        .difference(after.subtract(before)).build());
+                        .quantityBefore(mut.getBefore()).quantityAfter(mut.getAfter())
+                        .difference(mut.getAfter().subtract(mut.getBefore())).build());
             }
         }
 
@@ -1181,50 +1207,17 @@ public class OrderServiceImpl implements OrderService {
         order.getOrderItems().clear();
         orderRepository.saveAndFlush(order);
 
-        for (Long ingId : existingDeductionByIngId.keySet()) {
-            if (!newUsageMap.containsKey(ingId)) {
-                orderStockDeductionRepository.delete(existingDeductionByIngId.get(ingId));
-                log.info("[UPDATE_ORDER] orderId={} — removed deduction record ingId={}", orderId, ingId);
-            }
-        }
-
-        for (Map.Entry<Long, BigDecimal> entry : newUsageMap.entrySet()) {
-            Long ingId = entry.getKey();
-            BigDecimal totalQty = entry.getValue();
-            if (totalQty.compareTo(BigDecimal.ZERO) <= 0) continue;
-
-            BigDecimal unitCost = ingredientUnitCostMap.getOrDefault(ingId, BigDecimal.ZERO);
-
-            if (existingDeductionByIngId.containsKey(ingId)) {
-                OrderStockDeduction existing = orderStockDeductionRepository
-                        .findById(existingDeductionByIngId.get(ingId).getId())
-                        .orElse(null);
-
-                if (existing != null) {
-                    existing.setQuantity(totalQty);
-                    if (unitCost.compareTo(BigDecimal.ZERO) > 0) {
-                        existing.setCostPrice(unitCost);
-                    }
-                    orderStockDeductionRepository.save(existing);
-                } else {
-                    IngredientStock st = ingredientStockRepository
-                            .findByIngredientIdAndWarehouseId(ingId, warehouseId)
-                            .orElseThrow(() -> new RuntimeException("Stock not found: " + ingId));
-                    orderStockDeductionRepository.save(OrderStockDeduction.builder()
-                            .orderId(orderId).ingredientStock(st)
-                            .quantity(totalQty).costPrice(unitCost).createdAt(now).build());
-                }
-            } else {
-                IngredientStock st = ingredientStockRepository
-                        .findByIngredientIdAndWarehouseId(ingId, warehouseId)
-                        .orElseThrow(() -> new RuntimeException("Stock not found: " + ingId));
-                orderStockDeductionRepository.save(OrderStockDeduction.builder()
-                        .orderId(orderId).ingredientStock(st)
-                        .quantity(totalQty).costPrice(unitCost).createdAt(now).build());
-                log.info("[UPDATE_ORDER] orderId={} — inserted deduction ingId={} qty={} unitCost={}",
-                        orderId, ingId, totalQty, unitCost);
-            }
-        }
+        // BUG FIX 3.1: XOÁ toàn bộ khối rebuild consolidate.
+        // Trước: xoá deduction cho ingredient bị remove khỏi đơn (dùng
+        //         existingDeductionByIngId), sau đó rebuild MỘT record per
+        //         ingredient với totalQty + unitCost trung bình.
+        //         → mất tracking chính xác từng lô.
+        // Sau: KHÔNG động vào deduction records. Flow đã đúng ở loop delta phía trên:
+        //   - Delta > 0 → FIFO deduct tự tạo record MỚI cho từng lô mới trừ
+        //   - Delta < 0 → restorePartialStock tự update/xoá record cho lô hoàn
+        //   - Ingredient bị remove hoàn toàn → delta = 0 - oldQty = -oldQty,
+        //     nhánh delta < 0 đã restore hết + xoá record.
+        // Deduction records giữ đúng lot-level → cancel về sau phân bổ chính xác.
 
         for (int i = 0; i < orderItems.size(); i++) {
             OrderItem item = orderItems.get(i);
@@ -1238,11 +1231,16 @@ public class OrderServiceImpl implements OrderService {
 
         int discountRate = order.getDiscountRate() != null ? order.getDiscountRate() : 0;
 
+        // ── FIX: dùng effectiveQty cho BOX khi tính item discount ──
         BigDecimal itemDiscountTotal = BigDecimal.ZERO;
         for (OrderItem oi : orderItems) {
             int pct = oi.getDiscountPercent() != null ? oi.getDiscountPercent() : 0;
             if (pct == 0) continue;
-            BigDecimal lineGross = oi.getUnitPrice().multiply(oi.getQuantity());
+            BigDecimal effectiveQty = oi.getQuantity();
+            if (oi.getUnitsPerBox() != null && oi.getUnitsPerBox() > 0) {
+                effectiveQty = oi.getQuantity().multiply(BigDecimal.valueOf(oi.getUnitsPerBox()));
+            }
+            BigDecimal lineGross = oi.getUnitPrice().multiply(effectiveQty);
             itemDiscountTotal = itemDiscountTotal.add(
                     lineGross.multiply(BigDecimal.valueOf(pct))
                             .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP));
@@ -1267,8 +1265,8 @@ public class OrderServiceImpl implements OrderService {
 
         BigDecimal afterDiscount = subtotal.subtract(discountAmount);
         BigDecimal[] vatResult   = calcVatForItems(orderItems, subtotal, afterDiscount);
-        BigDecimal exclusiveVat  = vatResult[0];
-        BigDecimal totalVat      = vatResult[1];
+        BigDecimal exclusiveVat  = vatResult[0];   // ← FIX: VAT ngoài giá (cộng vào finalAmount)
+        BigDecimal totalVat      = vatResult[1];   //        tổng VAT (lưu DB hiển thị)
 
         BigDecimal surcharge;
         String surchargeDetail;
@@ -1287,11 +1285,11 @@ public class OrderServiceImpl implements OrderService {
         order.setSubtotal(subtotal);
         order.setDiscountRate(discountRate);
         order.setDiscountAmount(discountAmount);
-        order.setVatAmount(totalVat);
+        order.setVatAmount(totalVat);              // lưu tổng VAT (inclusive + exclusive) để hiển thị
         order.setTotalAmount(afterDiscount);
         order.setSurcharge(surcharge);
-        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge)
-                .setScale(0, RoundingMode.HALF_UP)); // VND không có lẻ — làm tròn nguyên để khớp số tiền thực thu
+        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge)    // ← FIX: chỉ cộng exclusive VAT
+                .setScale(0, RoundingMode.HALF_UP));
         order.setSurchargeDetail(surchargeDetail);
 
         // ── FIX: ĐƠN ĐÃ THU TIỀN TRƯỚC MÀ BỊ SỬA LẠI ─────────────────────────
@@ -1376,12 +1374,7 @@ public class OrderServiceImpl implements OrderService {
                 .stream()
                 .filter(d -> d.getIngredientStock().getIngredientId().equals(ingredientId))
                 .sorted(Comparator.comparingLong(OrderStockDeduction::getId).reversed())
-                .collect(Collectors.toList());
-
-        log.info("[RESTORE_PARTIAL] orderId={} ingId={} restoreQty={} — found {} deduction records: {}",
-                orderId, ingredientId, restoreQty, deductions.size(),
-                deductions.stream().map(d -> "id=" + d.getId() + " qty=" + d.getQuantity())
-                        .collect(Collectors.joining(", ")));
+                .toList();
 
         BigDecimal remaining = restoreQty;
         for (OrderStockDeduction d : deductions) {
@@ -1412,11 +1405,12 @@ public class OrderServiceImpl implements OrderService {
             }
             if (d.getCostPrice() != null && d.getCostPrice().compareTo(BigDecimal.ZERO) > 0) {
                 BigDecimal costToRestore = d.getCostPrice().multiply(canRestore).setScale(2, RoundingMode.HALF_UP);
-                BigDecimal newCost = (stock.getTotalCostValue() != null
-                        ? stock.getTotalCostValue() : BigDecimal.ZERO).add(costToRestore);
-                stock.setTotalCostValue(newCost);
-                stock.setUpdatedAt(now);
-                ingredientStockRepository.save(stock);
+                // BUG FIX (race lost update cost): atomic addCostValue thay cho RMW.
+                // stockQuantity đã được cộng atomic ở caller (updateOrderItems),
+                // ở đây chỉ cần cộng cost.
+                stockMutationService.addCostValue(
+                        stock.getIngredientId(), stock.getWarehouse().getId(),
+                        costToRestore, now);
             }
 
             if (canRestore.compareTo(d.getQuantity()) >= 0)
@@ -1559,7 +1553,6 @@ public class OrderServiceImpl implements OrderService {
 
         Long kpiUserId = resolveKpiUserId(user, finalCustomer, request.getIncludeKpi());
         order.setKpiUserId(kpiUserId);
-        log.info("[KPI] order={} creator={} role={} kpiUserId={}", orderCode, userId, user.getRole(), kpiUserId);
 
         Order savedOrder = orderRepository.save(order);
 
@@ -1580,26 +1573,29 @@ public class OrderServiceImpl implements OrderService {
         Map<Long, BigDecimal> ingredientUnitCostMap = new LinkedHashMap<>();
         List<WarehouseReceiptItem> receiptItems = new ArrayList<>();
 
-        for (Map.Entry<Long, BigDecimal> entry : ingredientUsageMap.entrySet()) {
+        // BUG FIX 1.2 (race lost update stockQuantity) + DEADLOCK GUARD:
+        // sort theo ingredientId ASC → khi nhiều đơn cùng lúc trừ nhiều
+        // ingredient chung, chúng lock cùng thứ tự → không deadlock chéo.
+        List<Map.Entry<Long, BigDecimal>> sortedEntries = ingredientUsageMap.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .toList();
+
+        for (Map.Entry<Long, BigDecimal> entry : sortedEntries) {
             Ingredient ing = ingredientRepository.findById(entry.getKey())
                     .orElseThrow(() -> new RuntimeException("Ingredient not found: " + entry.getKey()));
-            IngredientStock stock = ingredientStockRepository
-                    .findByIngredientIdAndWarehouseId(ing.getId(), warehouseId)
-                    .orElseThrow(() -> new RuntimeException(String.format(
-                            "Nguyên liệu '%s' chưa được cấu hình tồn kho cho kho '%s'",
-                            ing.getName(), warehouse.getName())));
             BigDecimal needed = entry.getValue();
-            if (stock.getStockQuantity().compareTo(needed) < 0)
-                throw new BusinessException(String.format(
-                        "Không đủ tồn kho '%s' tại kho '%s' (còn: %s, cần: %s %s)",
-                        ing.getName(), warehouse.getName(),
-                        stock.getStockQuantity(), needed, ing.getUnit()));
 
-            BigDecimal before = stock.getStockQuantity();
-            BigDecimal after  = before.subtract(needed).setScale(3, RoundingMode.HALF_UP);
-            stock.setStockQuantity(after);
-            stock.setUpdatedAt(now);
-            ingredientStockRepository.save(stock);
+            // BUG FIX 1.2: dùng atomic decrease thay cho check-modify-write.
+            // Trước: 2 seller cùng đọc snapshot=15, cùng check pass, cùng save 5
+            //         → mất 10kg trong kho vật lý.
+            // Sau: 1 câu UPDATE atomic WITH stock_quantity >= needed → MySQL
+            //      serialize, chỉ 1 request thành công nếu không đủ hàng.
+            //      Nếu 0 → throw InsufficientStockException với thông tin
+            //      chi tiết cho FE hiển thị inline.
+            StockMutationResult mut = stockMutationService.decrease(
+                    ing.getId(), warehouseId, needed, now);
+            BigDecimal before = mut.getBefore();
+            BigDecimal after  = mut.getAfter();
 
             BigDecimal costDeducted = fifoDeductService.deduct(savedOrder.getId(), warehouse, ing, needed, now);
             BigDecimal unitCost = BigDecimal.ZERO;
@@ -1643,11 +1639,16 @@ public class OrderServiceImpl implements OrderService {
             warehouseReceiptRepository.save(receipt);
         }
 
+        // ── FIX: dùng effectiveQty cho BOX khi tính item discount ──
         BigDecimal itemDiscountTotal = BigDecimal.ZERO;
         for (OrderItem oi : orderItems) {
             int pct = oi.getDiscountPercent() != null ? oi.getDiscountPercent() : 0;
             if (pct == 0) continue;
-            BigDecimal lineGross = oi.getUnitPrice().multiply(oi.getQuantity());
+            BigDecimal effectiveQty = oi.getQuantity();
+            if (oi.getUnitsPerBox() != null && oi.getUnitsPerBox() > 0) {
+                effectiveQty = oi.getQuantity().multiply(BigDecimal.valueOf(oi.getUnitsPerBox()));
+            }
+            BigDecimal lineGross = oi.getUnitPrice().multiply(effectiveQty);
             itemDiscountTotal = itemDiscountTotal.add(
                     lineGross.multiply(BigDecimal.valueOf(pct))
                             .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP));
@@ -1672,8 +1673,9 @@ public class OrderServiceImpl implements OrderService {
 
         BigDecimal afterDiscount = subtotal.subtract(discountAmount);
         BigDecimal[] vatResult   = calcVatForItems(orderItems, subtotal, afterDiscount);
-        BigDecimal exclusiveVat  = vatResult[0];
-        BigDecimal totalVat      = vatResult[1];
+        BigDecimal exclusiveVat  = vatResult[0];   // ← FIX: VAT ngoài giá (cộng vào finalAmount)
+        BigDecimal totalVat      = vatResult[1];   //        tổng VAT (lưu DB hiển thị)
+
         BigDecimal surchargeVal = request.getSurchargeItems() != null && !request.getSurchargeItems().isEmpty()
                 ? calcSurchargeTotal(request.getSurchargeItems())
                 : (request.getSurcharge() != null ? request.getSurcharge() : BigDecimal.ZERO);
@@ -1682,10 +1684,10 @@ public class OrderServiceImpl implements OrderService {
 
         savedOrder.setSubtotal(subtotal);
         savedOrder.setDiscountAmount(discountAmount);
-        savedOrder.setVatAmount(totalVat);
+        savedOrder.setVatAmount(totalVat);              // lưu tổng VAT (inclusive + exclusive) để hiển thị
         savedOrder.setTotalAmount(afterDiscount);
-        savedOrder.setFinalAmount(afterDiscount.add(exclusiveVat).add(surchargeVal)
-                .setScale(0, RoundingMode.HALF_UP)); // VND không có lẻ — làm tròn nguyên để khớp số tiền thực thu
+        savedOrder.setFinalAmount(afterDiscount.add(exclusiveVat).add(surchargeVal)    // ← FIX: chỉ cộng exclusive
+                .setScale(0, RoundingMode.HALF_UP));
         savedOrder.setSurcharge(surchargeVal);
         savedOrder.getOrderItems().addAll(orderItems);
 
@@ -1718,31 +1720,76 @@ public class OrderServiceImpl implements OrderService {
         return BigDecimal.ZERO.setScale(2);
     }
 
-    private BigDecimal[] calcVatForItems(List<OrderItem> orderItems,
+    private BigDecimal[] calcVatForItems(List<OrderItem> items,
                                          BigDecimal subtotal, BigDecimal afterDiscount) {
-        BigDecimal exclusiveVat = BigDecimal.ZERO;
         BigDecimal totalVat     = BigDecimal.ZERO;
+        BigDecimal exclusiveVat = BigDecimal.ZERO;
 
-        for (OrderItem item : orderItems) {
-            int rate = item.getVatRate() == null ? 0 : item.getVatRate();
+        // Tính VAT cho từng item
+        for (OrderItem item : items) {
+            int rate = item.getVatRate() != null ? item.getVatRate() : 0;
             if (rate == 0) continue;
 
-            BigDecimal proportion = subtotal.compareTo(BigDecimal.ZERO) == 0 ? BigDecimal.ZERO
-                    : item.getSubtotal().divide(subtotal, 10, RoundingMode.HALF_UP);
-            BigDecimal itemAfterDisc = afterDiscount.multiply(proportion);
+            // ── FIX: tính effective quantity cho BOX products ──
+            BigDecimal effectiveQty = item.getQuantity();
+            if (item.getUnitsPerBox() != null && item.getUnitsPerBox() > 0) {
+                effectiveQty = item.getQuantity().multiply(BigDecimal.valueOf(item.getUnitsPerBox()));
+            }
+
+            // Tính lineGross dùng effectiveQty
+            BigDecimal lineGross = item.getUnitPrice().multiply(effectiveQty);
+            int itemDiscPct = item.getDiscountPercent() != null ? item.getDiscountPercent() : 0;
+            BigDecimal itemDiscount = itemDiscPct > 0
+                    ? lineGross.multiply(BigDecimal.valueOf(itemDiscPct))
+                    .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP)
+                    : BigDecimal.ZERO;
+
+            // Phần giảm giá cấp đơn (bill-level discount) vẫn chia tỷ trọng
+            BigDecimal itemDiscountTotal = BigDecimal.ZERO;
+            for (OrderItem oi : items) {
+                int pct = oi.getDiscountPercent() != null ? oi.getDiscountPercent() : 0;
+                if (pct == 0) continue;
+                BigDecimal effQty = oi.getQuantity();
+                if (oi.getUnitsPerBox() != null && oi.getUnitsPerBox() > 0) {
+                    effQty = oi.getQuantity().multiply(BigDecimal.valueOf(oi.getUnitsPerBox()));
+                }
+                BigDecimal lg = oi.getUnitPrice().multiply(effQty);
+                itemDiscountTotal = itemDiscountTotal.add(
+                        lg.multiply(BigDecimal.valueOf(pct))
+                                .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP));
+            }
+            BigDecimal subtotalAfterItemDisc = subtotal.subtract(itemDiscountTotal);
+            BigDecimal billDisc = subtotal.subtract(afterDiscount).subtract(itemDiscountTotal);
+            if (billDisc.compareTo(BigDecimal.ZERO) < 0) billDisc = BigDecimal.ZERO;
+
+            // Chia bill discount theo tỷ trọng (trên subtotal sau item discount)
+            BigDecimal billDiscForItem = BigDecimal.ZERO;
+            if (billDisc.compareTo(BigDecimal.ZERO) > 0 && subtotalAfterItemDisc.compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal itemAfterOwnDisc = lineGross.subtract(itemDiscount);
+                BigDecimal prop = itemAfterOwnDisc.divide(subtotalAfterItemDisc, 10, RoundingMode.HALF_UP);
+                billDiscForItem = billDisc.multiply(prop).setScale(2, RoundingMode.HALF_UP);
+            }
+
+            BigDecimal itemAfterDisc = lineGross.subtract(itemDiscount).subtract(billDiscForItem);
+            if (itemAfterDisc.compareTo(BigDecimal.ZERO) < 0) itemAfterDisc = BigDecimal.ZERO;
 
             BigDecimal itemVat;
             if ("EXCLUSIVE".equals(item.getVatMode())) {
+                // VAT ngoài giá → cộng thêm vào finalAmount
                 itemVat = itemAfterDisc.multiply(BigDecimal.valueOf(rate))
                         .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
                 exclusiveVat = exclusiveVat.add(itemVat);
             } else {
+                // VAT trong giá → chỉ hiển thị, KHÔNG cộng vào finalAmount
                 itemVat = itemAfterDisc.multiply(BigDecimal.valueOf(rate))
                         .divide(BigDecimal.valueOf(100 + rate), 2, RoundingMode.HALF_UP);
             }
             item.setVatAmount(itemVat);
             totalVat = totalVat.add(itemVat);
+
         }
+
+        // [0] = exclusiveVat (cộng vào finalAmount), [1] = totalVat (lưu DB hiển thị)
         return new BigDecimal[]{ exclusiveVat, totalVat };
     }
 
@@ -1952,6 +1999,8 @@ public class OrderServiceImpl implements OrderService {
                 .skuSnapshot(product.getSku())
                 .packagingDescriptionSnapshot(product.getPackagingDescription())
                 .maxDiscountRateSnapshot(product.getMaxDiscountRate())
+                .specificationSnapshot(product.getSpecification())
+                .misaCategorySnapshot(product.getMisaCategory())
                 // ── Quy cách bán ──
                 .saleType(itemReq.getSaleType() != null ? itemReq.getSaleType() : "RETAIL")
                 .unitsPerBox(unitsPerBoxSnap)
@@ -1966,7 +2015,9 @@ public class OrderServiceImpl implements OrderService {
                 .discountPercent(itemDiscountPct)
                 // ── VAT snapshot ──
                 .vatRate(vatRatePct)
-                .vatMode(product.getVatMode() != null ? product.getVatMode().name() : "INCLUSIVE")
+                .vatMode(itemReq.getVatMode() != null
+                        ? itemReq.getVatMode()
+                        : (product.getVatMode() != null ? product.getVatMode().name() : "INCLUSIVE"))
                 .vatAmount(BigDecimal.ZERO)
                 // ── Số lượng & tổng ──
                 .quantity(itemReq.getQuantity())
@@ -1977,6 +2028,7 @@ public class OrderServiceImpl implements OrderService {
 
         item.setOrderItemIngredients(
                 collectIngredients(item, ings, itemReq.getQuantity(), usageMap, unitsPerBoxSnap));
+
         return item;
     }
 
@@ -2047,12 +2099,15 @@ public class OrderServiceImpl implements OrderService {
                         .vatMode(item.getVatMode())
                         .quantity(item.getQuantity())
                         .subtotal(item.getSubtotal())
+                        .returnedQty(item.getReturnedQty())  // ← THÊM: để FE highlight SP hoàn/đổi
                         .notes(item.getNotes())
                         // snapshot extras (nếu OrderItemResponse có các field này)
                         .categorySnapshot(item.getCategorySnapshot())
                         .skuSnapshot(item.getSkuSnapshot())
                         .packagingDescriptionSnapshot(item.getPackagingDescriptionSnapshot())
                         .maxDiscountRateSnapshot(item.getMaxDiscountRateSnapshot())
+                        .specificationSnapshot(item.getSpecificationSnapshot())
+                        .misaCategorySnapshot(item.getMisaCategorySnapshot())
                         .tierPriceSnapshot(item.getTierPriceSnapshot())
                         .ingredientsUsed(item.getOrderItemIngredients().stream()
                                 .map(ii -> OrderResponse.IngredientUsed.builder()
@@ -2071,6 +2126,7 @@ public class OrderServiceImpl implements OrderService {
                 .customerId(order.getCustomer() != null ? order.getCustomer().getId() : null)
                 .customerName(resolveCustomerDisplayName(order.getCustomerName()))
                 .warehouseName(order.getWarehouseName())
+                .warehouseId(order.getWarehouseId())
                 .customerPhone(order.getCustomerPhone()).customerEmail(order.getCustomerEmail())
                 .shippingAddress(order.getShippingAddress()).subtotal(order.getSubtotal())
                 .discountRate(order.getDiscountRate()).discountAmount(order.getDiscountAmount())
@@ -2100,6 +2156,20 @@ public class OrderServiceImpl implements OrderService {
                         order.getPendingPaymentAt(), order.getCreatedAt(), order.getDebtDays()))
                 .vatBreakdown(calcVatBreakdown(order.getOrderItems()))
                 .surchargeDetail(order.getSurchargeDetail())
+                // ── Hoàn/Đổi SP ──────────────────────────────────────────────
+                .creditedFromSource(order.getCreditedFromSource())
+                .linkType(order.getLinkType())
+                .sourceOrderId(order.getSourceOrderId())
+                .sourceOrderCode(order.getSourceOrderCode())
+                .overpaidAmount(order.getOverpaidAmount())
+                .returnExchangeNote(order.getReturnExchangeNote())
+                .warehouseId(order.getWarehouseId())
+                .overpaidRefundVoucherCode(order.getOverpaidRefundVoucherCode())
+                .version(order.getVersion())
+                // ── Hoàn tiền (REFUND từ đơn gốc) ────────────────────────────
+                .pendingRefundAmount(order.getPendingRefundAmount())
+                .refundedAmount(order.getRefundedAmount())
+                .refundVoucherCode(order.getRefundVoucherCode())
                 .items(itemResponses).build();
     }
 
@@ -2250,33 +2320,38 @@ public class OrderServiceImpl implements OrderService {
             log.warn("[CANCEL] Không tìm thấy deduction records cho orderId={}", orderId);
             return;
         }
+
+        // BUG FIX (deadlock guard): sort deductions theo ingredientId ASC
+        // → 2 request cancel song song lock cùng thứ tự → không deadlock.
+        deductions.sort(java.util.Comparator.comparing(
+                d -> d.getIngredientStock().getIngredientId()));
+
         for (OrderStockDeduction d : deductions) {
             IngredientStock stock = d.getIngredientStock();
-            stock.setStockQuantity(stock.getStockQuantity().add(d.getQuantity()));
+            Long ingId = stock.getIngredientId();
+            Long whId  = stock.getWarehouse().getId();
+            BigDecimal qty = d.getQuantity();
+
+            // BUG FIX 4.1 (race lost update): atomic increase thay cho RMW.
+            // Trước: 2 người cùng cancel 2 đơn khác nhau cho cùng ingredient
+            //         → cả 2 đọc snapshot → cả 2 save → mất số hoàn của 1 request.
+            // Sau: 1 câu UPDATE atomic, cộng dồn đúng.
+            stockMutationService.increase(ingId, whId, qty, now);
+
+            // BUG FIX 4.1 (cost value race): atomic addCostValue thay cho RMW.
             if (d.getCostPrice() != null && d.getCostPrice().compareTo(BigDecimal.ZERO) > 0) {
-                BigDecimal costToRestore = d.getCostPrice().multiply(d.getQuantity())
+                BigDecimal costToRestore = d.getCostPrice().multiply(qty)
                         .setScale(2, RoundingMode.HALF_UP);
-                BigDecimal newCost = (stock.getTotalCostValue() != null
-                        ? stock.getTotalCostValue() : BigDecimal.ZERO).add(costToRestore);
-                stock.setTotalCostValue(newCost);
+                stockMutationService.addCostValue(ingId, whId, costToRestore, now);
             }
-            stock.setUpdatedAt(now);
-            ingredientStockRepository.save(stock);
 
             // HOÀN LÔ — luôn phải có, không được bỏ qua trường hợp nào.
-            //
-            //   Bản cũ chỉ hoàn lô khi d.getIngredientExpiry() != null, và bên
-            //   trong còn đòi thêm expiryDate/costPrice khác null mới tạo lô bù.
-            //   Mọi nhánh không thoả đều cộng tồn tổng mà bỏ quên lô ⇒ tồn tổng
-            //   nhiều hơn tổng lô, phần chênh không bao giờ xuất được vì FIFO
-            //   trừ theo lô. Đây là nguồn gốc các dòng lệch dạng
-            //   "Có tồn tổng nhưng không có lô nào".
             IngredientExpiry linked = d.getIngredientExpiry() != null
                     ? ingredientExpiryRepository.findById(d.getIngredientExpiry().getId()).orElse(null)
                     : null;
 
             if (linked != null) {
-                linked.setQuantity(linked.getQuantity().add(d.getQuantity()));
+                linked.setQuantity(linked.getQuantity().add(qty));
                 linked.setUpdatedAt(now);
                 ingredientExpiryRepository.save(linked);
             } else {
@@ -2287,11 +2362,10 @@ public class OrderServiceImpl implements OrderService {
                         .ingredientId(stock.getIngredientId())
                         .expiryDate(d.getExpiryDate())
                         .costPrice(d.getCostPrice() != null ? d.getCostPrice() : BigDecimal.ZERO)
-                        .quantity(d.getQuantity())
+                        .quantity(qty)
                         .createdAt(now).updatedAt(now).build());
             }
         }
-        log.info("[CANCEL] Đã hoàn kho {} deduction records cho orderId={}", deductions.size(), orderId);
     }
 
     private void notifyCancellation(Order order, Long actorUserId, String actorRole,
@@ -2364,6 +2438,19 @@ public class OrderServiceImpl implements OrderService {
         }
     }
 
+    /** Public accessor dùng cho OrderExchangeService khi tạo đơn đổi SP. */
+    public String generateOrderCodePublic() {
+        return generateOrderCode();
+    }
+
+    /**
+     * BUG FIX 1.1 (race order_code duplicate — tái hiện 100% trong test):
+     * Trước: dùng orderRepository.countByCreatedAtBetween(...) + 1 → 2 request
+     *         cùng đọc N → cùng sinh order_code với N+1 → 1 request fail với
+     *         "Duplicate entry" (SQL constraint violation).
+     * Sau: atomic incrementCounter trên bảng order_code_prefix → MySQL serialize
+     *      hoàn toàn, mỗi request lấy 1 số duy nhất.
+     */
     private String generateOrderCode() {
         int currentYear = LocalDate.now().getYear();
         OrderCodePrefix activePrefix = orderCodePrefixRepository.findByIsActiveTrue()
@@ -2373,12 +2460,18 @@ public class OrderServiceImpl implements OrderService {
             orderCodePrefixRepository.save(activePrefix);
             activePrefix = createNewPrefix(currentYear);
         }
-        long start = LocalDate.of(currentYear, 1, 1)
-                .atStartOfDay(ZoneId.systemDefault()).toEpochSecond() * 1000;
-        long end = LocalDate.of(currentYear + 1, 1, 1)
-                .atStartOfDay(ZoneId.systemDefault()).toEpochSecond() * 1000;
-        long count = orderRepository.countByCreatedAtBetween(start, end) + 1;
-        return String.format("%s-%05d", activePrefix.getPrefix(), count);
+
+        // Atomic increment — MySQL InnoDB giữ row lock cho tới commit,
+        // 2 request cùng gọi phải serialize.
+        orderCodePrefixRepository.incrementCounter(activePrefix.getId());
+
+        // Force reload counter từ DB (bỏ qua L1 cache của Hibernate).
+        // Không dùng findById(): entity đang managed nên L1 sẽ trả lại object cũ
+        // với counter chưa cập nhật → sinh mã trùng.
+        entityManager.refresh(activePrefix);
+        long counter = activePrefix.getCounter() != null ? activePrefix.getCounter() : 1L;
+
+        return String.format("%s-%05d", activePrefix.getPrefix(), counter);
     }
 
     private OrderCodePrefix createNewPrefix(int year) {

@@ -183,6 +183,14 @@ public class OrderAdminService {
                 .createdAt(o.getCreatedAt())
                 .updatedAt(o.getUpdatedAt())
                 .items(items)
+                // ── Hoàn/Đổi SP ─────────────────────────────────────────────
+                .linkType(o.getLinkType())
+                .sourceOrderId(o.getSourceOrderId())
+                .sourceOrderCode(o.getSourceOrderCode())
+                .returnExchangeNote(o.getReturnExchangeNote())
+                .pendingRefundAmount(o.getPendingRefundAmount() != null ? o.getPendingRefundAmount() : BigDecimal.ZERO)
+                .refundedAmount(o.getRefundedAmount() != null ? o.getRefundedAmount() : BigDecimal.ZERO)
+                .refundVoucherCode(o.getRefundVoucherCode())
                 // ── Tài xế: dùng deliveryInfo thay cho drivers ──
                 .deliveryInfo(parseDeliveryInfo(o.getDeliveryInfoJson()))
                 .logs(logs)

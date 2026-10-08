@@ -20,6 +20,9 @@ public class IncomeVoucher {
     @Column(nullable = false, unique = true)
     private String voucherCode;
 
+    @Column(name = "customer_name")
+    private String customerName;
+
     /** Tên người nộp tiền / đơn vị — có thể rỗng */
     @Column(length = 300)
     private String payerName;
@@ -93,6 +96,25 @@ public class IncomeVoucher {
 
     @Column(name = "image_urls", columnDefinition = "TEXT")
     private String imageUrls;
+
+    // ── CẤN TRỪ (overpay offset) ─────────────────────────────────────────────
+    /**
+     * ID phiếu thu NGUỒN mà phiếu này được "cấn trừ" từ phần dư. {@code null}
+     * nghĩa là phiếu thu bình thường (không phải phiếu con cấn trừ).
+     *
+     * <p>Khi bấm "Cấn trừ" trên phiếu A có phần dư → BE tạo phiếu B cho 1 đơn
+     * cùng khách của A, {@code B.offsetSourceVoucherId = A.id}, đồng thời
+     * {@code A.offsetUsedAmount += B.totalAmount} để phần dư của A giảm đi.
+     */
+    @Column(name = "offset_source_voucher_id")
+    private Long offsetSourceVoucherId;
+
+    /**
+     * Tổng số tiền ĐÃ CẤN TRỪ từ phiếu này sang các phiếu con. {@code null}/0 =
+     * chưa cấn trừ. Dùng khi tính phần dư: {@code over = total − Σalloc − offsetUsed}.
+     */
+    @Column(name = "offset_used_amount", precision = 15, scale = 2)
+    private java.math.BigDecimal offsetUsedAmount;
 
     @Column(name = "created_at", nullable = false)
     private Long createdAt;

@@ -10,22 +10,30 @@ import java.util.Set;
 /**
  * BỘ PHẬN TÍNH LƯƠNG.
  *
- * <p>Mỗi bộ phận có bảng chấm công / lịch nghỉ RIÊNG cho từng tháng. OWNER tải
- * lên từng file cho từng bộ phận, xử lý xong thì bấm "Hoàn tất" cho bộ phận đó.
+ * <p>Phase 1 refactor (10/2026): dùng CHUNG 1 file chấm công cho cả công ty.
+ * Enum này không còn dùng để phân mảnh file theo bộ phận (như trước); thay vào
+ * đó nó chỉ còn giữ thông tin "nhân viên này thuộc phòng nào" phục vụ hiển thị
+ * tab trên trang xem lương, và các bảng thưởng/KPI còn tính riêng theo bộ phận.
  *
  * <pre>
- *   MANAGEMENT Quản lý cấp cao — Chủ Tịch (OWNER) / Giám Đốc (ADMIN) · tính lương tách riêng
  *   FACTORY    Xưởng sản xuất  — role FACTORY_* + SUPER_FACTORY_WORKER  · CÓ thưởng KPI sản xuất
+ *   ACCOUNTING Kế toán         — role ACCOUNTANT / SUPER_ACCOUNTANT
  *   SALES      Kinh doanh      — role SELLER / SUPER_SELLER
  *   WAREHOUSE  Kho             — role WAREHOUSE / SUPER_WAREHOUSE
- *   ACCOUNTING Kế toán         — role ACCOUNTANT / SUPER_ACCOUNTANT
- *   DRIVER     Tài xế          — role DRIVER · KHÔNG có bảng chấm công (tính theo km chạy trong ngày)
+ *   DRIVER     Tài xế          — role DRIVER (từ Phase 1 trở đi dùng chấm công, không dùng odo)
  * </pre>
  *
+ * <h3>MANAGEMENT đã bị gỡ</h3>
+ * Trước đây có {@code MANAGEMENT} dành cho OWNER / ADMIN. Theo yêu cầu refactor,
+ * nhóm này không còn hiển thị trên UI tính lương và cũng không nằm trong bất kỳ
+ * tab nào. OWNER/ADMIN nay không thuộc {@link PayrollDepartment} nào — các truy
+ * vấn {@link #of(Role)} / {@link #resolvePayrollRole(Set)} sẽ trả {@code null}
+ * cho họ, đồng nghĩa họ không có phiếu lương trong hệ thống.
+ *
  * <h3>Thứ tự ưu tiên khi 1 nhân viên kiêm nhiều role</h3>
- * Danh sách {@link #values()} đã xếp theo ĐỘ ƯU TIÊN GIẢM DẦN. Ví dụ Trần Mộng
- * Thuỳ có cả {@code SELLER} và {@code WAREHOUSE} (quản lý 2 kho) thì bộ phận
- * nhận lương là {@code SALES} vì SALES đứng trước WAREHOUSE.
+ * Danh sách {@link #values()} đã xếp theo ĐỘ ƯU TIÊN GIẢM DẦN. Người có cả
+ * {@code SELLER} và {@code WAREHOUSE} (quản lý 2 kho) sẽ nhận lương ở
+ * {@code SALES} vì SALES đứng trước {@code WAREHOUSE}.
  *
  * <p>Muốn ép cứng khác quy tắc trên thì set cột {@code payroll_role} của bảng
  * {@code _user} — giá trị đó luôn được ưu tiên tuyệt đối.
@@ -33,55 +41,57 @@ import java.util.Set;
 @Getter
 public enum PayrollDepartment {
 
-    /**
-     * BAN QUẢN LÝ — tài khoản có role {@code OWNER} hoặc {@code ADMIN}.
-     *
-     * <p>Đặt ĐẦU DANH SÁCH nên có độ ưu tiên cao nhất: người vừa là OWNER vừa
-     * kiêm role khác (VD OWNER + SELLER) sẽ nhận lương ở đây, không rơi vào
-     * Kinh doanh. Đây là chủ đích — lương ban quản lý tính riêng, không trộn vào
-     * bảng lương của bộ phận mà họ kiêm nhiệm.
-     *
-     * <p>{@code attendanceBased = true} để dùng chung toàn bộ luồng upload bảng
-     * chấm công → hoàn tất như các bộ phận văn phòng khác. KHÔNG đặt {@code false}:
-     * cờ đó hiện đang đồng nghĩa với "tính lương theo số km" và sẽ đẩy nhóm này
-     * sang nhánh xử lý của tài xế.
-     */
-    MANAGEMENT("Quản lý cấp cao", false, true, List.of(
-            Role.OWNER,
-            Role.ADMIN
-    )),
-
     /** Xưởng sản xuất — bộ phận DUY NHẤT có bảng "Thưởng KPI sản xuất". */
     FACTORY("Xưởng sản xuất", true, true, List.of(
             Role.FACTORY_MANAGER,
             Role.SUPER_FACTORY_WORKER,
             Role.FACTORY_ACCOUNTANT,
             Role.FACTORY_STAFF,
+            // FIX (10/2026): Thêm FACTORY_PACKAGING_WORKER vào bộ phận Xưởng.
+            // Trước đó role này đã được định nghĩa trong Role.java và FactoryKpi
+            // Service (hệ số 1.2) nhưng BỊ QUÊN ở enum này ⇒ allPayrollRoles()
+            // không chứa nó ⇒ CompanyAttendanceService.allPayrollEmployees()
+            // bỏ sót nhân viên đóng gói ⇒ resolveUser trả null khi parse file
+            // chấm công ⇒ Ngô Thị Mỹ Hạnh (và bất kỳ ai thuần đóng gói) không
+            // có AttendanceEntry ⇒ preview lương 0 công + Chuyên cần dòng rỗng.
+            // Đặt NGAY SAU Trợ lý / Kế toán xưởng, trước CNSX — khớp thứ tự
+            // KPI trong FactoryKpiService (hệ số 1.2 ngang Trợ lý).
+            Role.FACTORY_PACKAGING_WORKER,
             Role.FACTORY_PRODUCTION_WORKER,
             Role.FACTORY_WORKER,
             Role.FACTORY_SECURITY
     )),
 
-    /** Kế toán. */
+    /**
+     * Kế toán — Phase 1: theo CHẤM CÔNG CHUNG (không còn mặc định full công như
+     * các phiên bản trước).
+     */
     ACCOUNTING("Kế toán", false, true, List.of(
             Role.SUPER_ACCOUNTANT,
             Role.ACCOUNTANT
     )),
 
-    /** Kinh doanh. */
+    /**
+     * Kinh doanh — Phase 1: theo CHẤM CÔNG CHUNG (không còn mặc định full công
+     * cơ bản như trước). KPI/bonus vẫn tính riêng qua calcSalesKpi / calcSalesBonus.
+     */
     SALES("Kinh doanh", false, true, List.of(
             Role.SUPER_SELLER,
             Role.SELLER
     )),
 
-    /** Kho. */
+    /** Kho — Phase 1: theo CHẤM CÔNG CHUNG. */
     WAREHOUSE("Kho", false, true, List.of(
             Role.SUPER_WAREHOUSE,
             Role.WAREHOUSE
     )),
 
-    /** Tài xế — không chấm công, tính theo số km chạy mỗi ngày. */
-    DRIVER("Tài xế", false, false, List.of(
+    /**
+     * Tài xế — Phase 1: dùng CHẤM CÔNG CHUNG, KHÔNG còn tính theo số km (odo).
+     * Phụ cấp xăng xe vẫn giữ như quy trình cũ nhưng không còn ảnh hưởng đến
+     * ngày công nữa.
+     */
+    DRIVER("Tài xế", false, true, List.of(
             Role.DRIVER
     ));
 
@@ -91,7 +101,7 @@ public enum PayrollDepartment {
     /** Có bảng "Thưởng KPI sản xuất" hay không (chỉ Xưởng). */
     private final boolean kpiBonus;
 
-    /** Có upload bảng chấm công / lịch nghỉ hay không (Tài xế thì không). */
+    /** Có upload bảng chấm công / lịch nghỉ hay không. Phase 1: tất cả = true. */
     private final boolean attendanceBased;
 
     /** Các role thuộc bộ phận, xếp theo độ ưu tiên giảm dần trong nội bộ bộ phận. */

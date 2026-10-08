@@ -46,7 +46,8 @@ public class UpdateExpenseVoucherRequest {
     @Data
     public static class ExpenseItemRequest {
         private Long id; // null = thêm mới
-        private Long categoryId;
+        private Long categoryId;   // bắt buộc khi NCC ngoài
+        private String itemName;   // bắt buộc khi nhân viên ([NN])
         private BigDecimal amount;
         private String note;
     }

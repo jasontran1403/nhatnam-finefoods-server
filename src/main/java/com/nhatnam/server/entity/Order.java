@@ -235,4 +235,95 @@ public class Order {
      */
     @Column(name = "overpaid_refund_voucher_code", length = 100)
     private String overpaidRefundVoucherCode;
+
+    /** ID đơn hàng trên Misa (sandbox: fake UUID) */
+    @Column(name = "misa_order_id", length = 200)
+    private String misaOrderId;
+
+    /** Mã đơn hàng Misa (sandbox: fake code) */
+    @Column(name = "misa_order_code", length = 100)
+    private String misaOrderCode;
+
+    /** Thời điểm tạo đơn Misa (epoch ms) */
+    @Column(name = "misa_order_created_at")
+    private Long misaOrderCreatedAt;
+
+    /** JSON payload đã gửi lên MISA cho đơn hàng (để review/debug/retry) */
+    @Column(name = "misa_order_payload", columnDefinition = "LONGTEXT")
+    private String misaOrderPayload;
+
+    /** JSON response từ MISA cho đơn hàng */
+    @Column(name = "misa_order_response", columnDefinition = "LONGTEXT")
+    private String misaOrderResponse;
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // HOÀN / ĐỔI SẢN PHẨM
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * ID đơn hàng gốc mà đơn này được tạo để đổi/hoàn.
+     * Null nếu đây là đơn thông thường.
+     */
+    @Column(name = "source_order_id")
+    private Long sourceOrderId;
+
+    /**
+     * Mã đơn hàng gốc — lưu snapshot để hiển thị nhanh không cần join.
+     */
+    @Column(name = "source_order_code", length = 50)
+    private String sourceOrderCode;
+
+    /**
+     * Loại liên kết:
+     * EXCHANGE = đổi sản phẩm (tạo đơn mới thay thế).
+     * REFUND   = hoàn tiền (không tạo đơn mới, chỉ ghi note lên đơn gốc).
+     */
+    @Column(name = "link_type", length = 20)
+    private String linkType;
+
+    /**
+     * Số tiền đã thu/khấu trừ từ đơn gốc sang đơn này.
+     * Khi đổi SP: credited = tổng tiền sản phẩm đổi trong đơn gốc (theo giá đơn gốc).
+     * Được lưu vào paidAmount ngay khi tạo đơn.
+     */
+    @Column(name = "credited_from_source", precision = 15, scale = 2)
+    private BigDecimal creditedFromSource;
+
+    /**
+     * Ghi chú hoàn/đổi sản phẩm — JSON mảng các dòng:
+     * [{productName, quantity, unitPrice, subtotal, note}]
+     * Lưu trên đơn GỐC để track lịch sử hoàn/đổi từng lần.
+     */
+    @Column(name = "return_exchange_note", columnDefinition = "TEXT")
+    private String returnExchangeNote;
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // HOÀN TIỀN (REFUND) — chỉ áp dụng với đơn có linkType = null (đơn gốc có hoàn tiền)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Số tiền đã hoàn lại cho khách qua phiếu chi.
+     * Khi tạo phiếu chi hoàn tiền, trừ paidAmount và cộng refundedAmount.
+     * NULL / ZERO = chưa hoàn tiền.
+     */
+    @Builder.Default
+    @Column(name = "refunded_amount", precision = 15, scale = 2)
+    private BigDecimal refundedAmount = BigDecimal.ZERO;
+
+    /**
+     * Mã phiếu chi hoàn tiền (REFUND) đã tạo.
+     * Được set khi kế toán tạo phiếu chi qua bulk refund disbursement.
+     * NULL = chưa tạo phiếu chi hoàn tiền.
+     */
+    @Column(name = "refund_voucher_code", length = 100)
+    private String refundVoucherCode;
+
+    /**
+     * Số tiền cần hoàn cho khách theo đơn hoàn/đổi (tính bởi processRefund).
+     * Được ghi nhận khi kế toán thực hiện hoàn tiền từ đơn gốc.
+     * Dùng để kế toán lọc các đơn cần tạo phiếu chi hoàn.
+     */
+    @Builder.Default
+    @Column(name = "pending_refund_amount", precision = 15, scale = 2)
+    private BigDecimal pendingRefundAmount = BigDecimal.ZERO;
 }

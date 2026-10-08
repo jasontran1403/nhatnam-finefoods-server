@@ -37,6 +37,12 @@ public class CreateCompleteProductRequest {
      */
     private Integer unitsPerBox;
 
+    /** Quy cách (gr/đơn vị): 500, 424, 410, 210, 1000 — chỉ khi unit ≠ Kg */
+    private Integer specification;
+
+    /** Danh mục MISA: Kem, Xúc xích bò, Xúc xích heo, Xúc xích gà */
+    private String misaCategory;
+
     // ── Khung giá sỉ ──────────────────────────────────────────────
     private List<TierItem> tiers;
 

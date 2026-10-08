@@ -33,6 +33,12 @@ public class ProductResponse {
     /** Số đơn vị / thùng. null hoặc 0 = không hỗ trợ bán thùng. */
     private Integer unitsPerBox;
 
+    /** Quy cách (gr/đơn vị): 500, 424, 410, 210, 1000 */
+    private Integer specification;
+
+    /** Danh mục MISA: Kem, Xúc xích bò, Xúc xích heo, Xúc xích gà */
+    private String misaCategory;
+
     private Long createdAt;
     private Long updatedAt;
 

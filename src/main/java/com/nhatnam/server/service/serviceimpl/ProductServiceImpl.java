@@ -116,6 +116,8 @@ public class ProductServiceImpl implements ProductService {
                 .maxDiscountRate(request.getMaxDiscountRate() != null ? request.getMaxDiscountRate() : 0)
                 .unitsPerBox(request.getUnitsPerBox() != null && request.getUnitsPerBox() > 0
                         ? request.getUnitsPerBox() : null)
+                .specification(request.getSpecification())
+                .misaCategory(request.getMisaCategory())
                 .priceTiers(new ArrayList<>())
                 .build();
         product = productRepository.save(product);
@@ -173,6 +175,8 @@ public class ProductServiceImpl implements ProductService {
                 ? VatMode.valueOf(request.getVatMode().toUpperCase()) : VatMode.INCLUSIVE);
         product.setUnitsPerBox(request.getUnitsPerBox() != null && request.getUnitsPerBox() > 0
                 ? request.getUnitsPerBox() : null);
+        product.setSpecification(request.getSpecification());
+        product.setMisaCategory(request.getMisaCategory());
 
         String categoryName = resolveCategoryName(request);
         if (categoryName != null && !categoryName.isBlank()) product.setCategory(categoryName);
@@ -351,6 +355,8 @@ public class ProductServiceImpl implements ProductService {
                 .vatMode(product.getVatMode() != null ? product.getVatMode().name() : VatMode.INCLUSIVE.name())
                 .vatRate(product.getVatRate() != null ? product.getVatRate().getPercentage() : 0)
                 .maxDiscountRate(product.getMaxDiscountRate()).unitsPerBox(product.getUnitsPerBox())
+                .specification(product.getSpecification())
+                .misaCategory(product.getMisaCategory())
                 .createdAt(product.getCreatedAt()).updatedAt(product.getUpdatedAt())
                 .priceTiers(tierResponses).ingredients(ingredientItems)
                 .build();

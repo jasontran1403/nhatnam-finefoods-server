@@ -31,7 +31,7 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/admin/driver-odometer")
 @RequiredArgsConstructor
-@PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+@PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN', 'SUPER_WAREHOUSE', 'WAREHOUSE')")
 public class DriverOdometerReportController {
 
     private final DriverOdometerReportService service;

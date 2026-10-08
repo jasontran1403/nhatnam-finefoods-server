@@ -2,11 +2,15 @@ package com.nhatnam.server.service;
 
 import com.nhatnam.server.dto.common.PageResponse;
 import com.nhatnam.server.dto.income.CreateIncomeVoucherRequest;
+import com.nhatnam.server.dto.income.EmployeeSuggestionDto;
 import com.nhatnam.server.dto.income.IncomeVoucherDto;
 import com.nhatnam.server.enumtype.Role;
 import org.springframework.data.domain.Pageable;
 
+import java.util.List;
+
 public interface IncomeVoucherService {
+    List<EmployeeSuggestionDto> suggestEmployees(String keyword);
     IncomeVoucherDto create(Long createdByUserId, Role creatorRole, CreateIncomeVoucherRequest req);
 
     /**
@@ -48,4 +52,18 @@ public interface IncomeVoucherService {
     byte[] exportReport(Long from, Long to, String exportedBy, String paymentType) throws Exception;
     /** Gợi ý số phiếu thu kế tiếp = số lớn nhất hiện có (phần số, bỏ ký tự chữ) + 1 */
     String suggestNextReceiptNumber();
+
+    /**
+     * Cấn trừ phần dư của phiếu nguồn sang 1 đơn CÙNG KHÁCH. Tạo 1 phiếu thu
+     * MỚI cho đơn đó; đồng thời tăng {@code offsetUsedAmount} của phiếu nguồn
+     * để phần dư của nguồn giảm tương ứng.
+     *
+     * <p>Validate: phiếu nguồn phải có phần dư &gt; 0; đơn đích phải thuộc cùng
+     * khách; số tiền ≤ min(dư còn lại, phần còn lại của đơn). Trả về phiếu thu
+     * MỚI vừa tạo.
+     */
+    IncomeVoucherDto offsetOverpayToOrder(Long sourceVoucherId,
+                                          Long actorUserId,
+                                          com.nhatnam.server.enumtype.Role actorRole,
+                                          com.nhatnam.server.dto.income.OffsetIncomeVoucherRequest req);
 }

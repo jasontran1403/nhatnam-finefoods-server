@@ -28,16 +28,16 @@ public class ProductionService {
 
     private static final ZoneId VN = ZoneId.of("Asia/Ho_Chi_Minh");
 
-    private final FactoryMaterialRepository  materialRepo;
-    private final FactoryProductRepository   productRepo;
+    private final FactoryMaterialRepository materialRepo;
+    private final FactoryProductRepository productRepo;
     private final ProductionRecipeRepository recipeRepo;
     private final BatchStepTemplateRepository stepTemplateRepo;
-    private final MachineRepository          machineRepo;
-    private final ProductionBatchRepository  batchRepo;
-    private final UserRepository             userRepo;
+    private final MachineRepository machineRepo;
+    private final ProductionBatchRepository batchRepo;
+    private final UserRepository userRepo;
     // Cầu nối FactoryProduct → Ingredient (kho bán hàng) — xem comment ở FactoryProduct.ingredientId
-    private final IngredientRepository       ingredientRepo;
-    private final NotificationService        notificationService;
+    private final IngredientRepository ingredientRepo;
+    private final NotificationService notificationService;
     private final FactoryMaterialStockRepository factoryMaterialStockRepository;
     private final FactoryMaterialCategoryRepository factoryMaterialCategoryRepo;
     private final FactoryMaterialSubCategoryRepository factoryMaterialSubCategoryRepo;
@@ -419,12 +419,12 @@ public class ProductionService {
     /**
      * Tắt/mở 1 biến thể sản xuất (soft delete — không xoá cứng vì các lệnh sản
      * xuất/mẻ đã dùng biến thể này vẫn cần giữ liên kết để xem lại lịch sử).
-     *
+     * <p>
      * Khi TẮT (active=false): đổi tên thêm tiền tố "SOFTDELETED_" để giải phóng
      * tên gốc — cho phép tạo biến thể MỚI với tên trùng tên đã bị tắt, vì check
      * trùng tên (existsByFactoryProduct_IdAndNameIgnoreCase...) chỉ tính theo
      * tên hiện tại trong DB, không loại trừ theo isActive.
-     *
+     * <p>
      * Khi MỞ LẠI (active=true): tự bỏ tiền tố để khôi phục tên gốc — NHƯNG chỉ
      * khi tên gốc đó chưa bị 1 biến thể khác (đang active) chiếm; nếu đã bị
      * chiếm, báo lỗi rõ ràng để người dùng tự đổi tên trước khi mở lại, tránh
@@ -572,7 +572,7 @@ public class ProductionService {
     }
 
     private String generateBatchCode() {
-        String date   = LocalDate.now(VN).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        String date = LocalDate.now(VN).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         String prefix = "BATCH-" + date + "-";
         long seq = batchRepo.countByBatchCodePrefix(prefix) + 1;
         return prefix + String.format("%04d", seq);

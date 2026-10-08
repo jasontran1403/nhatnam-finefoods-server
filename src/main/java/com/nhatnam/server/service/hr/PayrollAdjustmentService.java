@@ -46,6 +46,15 @@ public class PayrollAdjustmentService {
     private final PayrollDepartmentResolver deptResolver;
     private final com.nhatnam.server.repository.AdjustmentImportFileRepository importFileRepo;
 
+    /**
+     * Phase 2: inject lazy để chặn upload thưởng/phụ cấp khi tháng đã CALCULATED
+     * hoặc PUBLISHED. Lazy vì {@code CompanyAttendanceService} cũng tham chiếu
+     * ngược (gián tiếp) → tránh circular ở lúc khởi tạo bean.
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    @org.springframework.context.annotation.Lazy
+    private CompanyAttendanceService companyAttendanceService;
+
     /** Kết quả import, trả về cho FE hiển thị. */
     @Data @Builder
     public static class ImportResult {
@@ -187,11 +196,18 @@ public class PayrollAdjustmentService {
 
     @Transactional
     public void clear(int month, int year, Type type, String department) {
+        // Phase 2: không cho xoá thưởng/phụ cấp đã bị đưa vào bảng lương đã tính.
+        companyAttendanceService.assertCanUploadAdjustments(month, year);
+
         List<MonthlyAdjustment> all = adjustmentRepo.findByMonthAndYearAndType(month, year, type);
         if (department == null || department.isBlank()) {
-            adjustmentRepo.deleteAll(all);
+            // Giữ nguyên khoản AUTO_* để lifecycle "Mở lại" xoá riêng (clear MANUAL ở đây).
+            adjustmentRepo.deleteAll(all.stream()
+                    .filter(a -> a.getSource() != MonthlyAdjustment.Source.AUTO_OT)
+                    .toList());
         } else {
             adjustmentRepo.deleteAll(all.stream()
+                    .filter(a -> a.getSource() != MonthlyAdjustment.Source.AUTO_OT)
                     .filter(a -> a.getDepartment() == null || department.equals(a.getDepartment()))
                     .toList());
         }
@@ -229,6 +245,11 @@ public class PayrollAdjustmentService {
      */
     @Transactional
     public ImportResult importBonus(MultipartFile file, int month, int year, String department) {
+        // Phase 2: chặn ngay nếu lương tháng đã được tính (CALCULATED/PUBLISHED).
+        // Thông báo lỗi tiếng Việt sẽ hiển thị thẳng ở FE, nhắc OWNER phải Mở
+        // lại tháng trước khi upload thưởng.
+        companyAttendanceService.assertCanUploadAdjustments(month, year);
+
         List<String> warnings = new ArrayList<>();
         List<String> errors = new ArrayList<>();
         List<MonthlyAdjustment> batch = new ArrayList<>();
@@ -313,6 +334,25 @@ public class PayrollAdjustmentService {
                                     ? "Thiếu ID nhân viên"
                                     : "Không tìm thấy nhân viên ID " + parsedId + " trong database")
                             .build());
+                    continue;
+                }
+
+                // Bỏ qua tài khoản đã bị KHOÁ / XOÁ MỀM — không được nhận thưởng
+                // (đưa vào unmatched để OWNER thấy dòng đã bị loại và biết lý do).
+                if (u.isLockAccount() || u.isDeleted()) {
+                    unmatchedItems.add(UnmatchedItem.builder()
+                            .rowNumber(r + 1)
+                            .rawName(rawName != null ? rawName.trim() : u.getFullName())
+                            .rawIdString(rawId != null ? rawId.trim() : String.valueOf(u.getId()))
+                            .label(label)
+                            .amount(amount > 0 ? amount : null)
+                            .reason(u.isDeleted()
+                                    ? "Nhân viên đã bị xoá — không tính thưởng"
+                                    : "Tài khoản đang bị khoá — không tính thưởng")
+                            .build());
+                    log.info("[Adjustment] Bỏ qua thưởng \"{}\" cho {} (id={}): {}.",
+                            label, u.getFullName(), u.getId(),
+                            u.isDeleted() ? "đã xoá" : "đang bị khoá");
                     continue;
                 }
 
@@ -401,6 +441,9 @@ public class PayrollAdjustmentService {
     /** Xoá ĐÚNG MỘT khoản thưởng của kỳ (chỉ trong bộ phận nếu chỉ định). */
     @Transactional
     public void clearBonusLabel(int month, int year, String label, String department) {
+        // Phase 2: không cho xoá khoản thưởng khi tháng đã CALCULATED/PUBLISHED.
+        companyAttendanceService.assertCanUploadAdjustments(month, year);
+
         if (label == null || label.isBlank())
             throw new IllegalArgumentException("Chưa chỉ định khoản thưởng cần xoá.");
         String trimmedLabel = label.trim();
@@ -529,6 +572,9 @@ public class PayrollAdjustmentService {
 
     @Transactional
     public ImportResult importAllowance(MultipartFile file, int month, int year, String department) {
+        // Phase 2: chặn khi lương đã CALCULATED/PUBLISHED — xem importBonus.
+        companyAttendanceService.assertCanUploadAdjustments(month, year);
+
         List<String> warnings = new ArrayList<>();
         List<String> errors = new ArrayList<>();
         List<MonthlyAdjustment> batch = new ArrayList<>();

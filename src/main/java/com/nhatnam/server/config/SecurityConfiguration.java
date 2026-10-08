@@ -93,6 +93,7 @@ public class SecurityConfiguration {
                                         Role.FACTORY_PRODUCTION_WORKER.name(), Role.FACTORY_STAFF.name(),
                                         OWNER.name(), ADMIN.name(), SUPERADMIN.name(),
                                         SUPER_ACCOUNTANT.name(), ACCOUNTANT.name())
+                                .requestMatchers("/api/tools/**").authenticated()
                                 .requestMatchers("/api/factory-accountant/**").hasAnyRole(Role.FACTORY_ACCOUNTANT.name(), OWNER.name(), ADMIN.name(), SUPERADMIN.name())
                                 .requestMatchers("/api/expense-vouchers/**").hasAnyRole(SUPER_ACCOUNTANT.name(), SUPER_WAREHOUSE.name(), ADMIN.name(), OWNER.name(), ACCOUNTANT.name())
 

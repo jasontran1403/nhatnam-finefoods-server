@@ -1279,6 +1279,11 @@ public class OperatorController {
                         m.put("imageUrl",        p.getImageUrl());
                         m.put("isActive",        p.getIsActive());
                         m.put("unitsPerBox",     p.getUnitsPerBox());
+                        m.put("conversionUnit",   p.getConversionUnit());
+                        m.put("conversionFactor", p.getConversionFactor());
+                        m.put("sku",              p.getSku());
+                        m.put("specification",    p.getSpecification());
+                        m.put("misaCategory",     p.getMisaCategory());
 
                         List<Map<String, Object>> tiers = priceTierRepository
                                 .findByProductIdSortedAsc(p.getId())
@@ -1313,5 +1318,62 @@ public class OperatorController {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR,
                     e.getMessage()));
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // SKU SUGGESTION
+    // ════════════════════════════════════════════════════════════════
+
+    @GetMapping("/products/suggest-sku")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> suggestSku(
+            @RequestParam(required = false) String name,
+            @RequestParam(required = false) String category) {
+        try {
+            String prefix = _buildSkuPrefix(name, category);
+            // Find next available number
+            List<String> existing = productRepository.findSkusByPrefix(prefix + "-");
+            int maxNum = 0;
+            for (String sku : existing) {
+                String suffix = sku.substring(prefix.length() + 1);
+                try { int n = Integer.parseInt(suffix); if (n > maxNum) maxNum = n; }
+                catch (Exception ignored) {}
+            }
+            String suggested = prefix + "-" + String.format("%05d", maxNum + 1);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("sku", suggested);
+            result.put("prefix", prefix);
+            result.put("nextNumber", maxNum + 1);
+            return ResponseEntity.ok(ApiResponse.success(result, "OK"));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    private String _buildSkuPrefix(String productName, String categoryName) {
+        // 1. Keyword từ tên sản phẩm: lấy từ đầu tiên có nghĩa (≥2 ký tự)
+        String nameKey = _removeVietnamese(productName);
+        String[] words = nameKey.split("\\s+");
+        String firstWord = "PRD";
+        for (String w : words) {
+            if (w.length() >= 2) { firstWord = w.length() > 5 ? w.substring(0, 5) : w; break; }
+        }
+
+        // 2. Category keyword: bỏ dấu, bỏ space, bỏ ký tự đặc biệt, tối đa 15 ký tự
+        String catKey = _removeVietnamese(categoryName).replaceAll("\\s+", "").replaceAll("[^A-Z0-9]", "");
+        if (catKey.length() > 15) catKey = catKey.substring(0, 15);
+        if (catKey.isEmpty()) catKey = "GEN";
+
+        return firstWord + "-" + catKey;
+    }
+
+    private String _removeVietnamese(String str) {
+        if (str == null || str.isBlank()) return "";
+        return java.text.Normalizer.normalize(str, java.text.Normalizer.Form.NFD)
+                .replaceAll("[\\u0300-\\u036f]", "")
+                .replaceAll("đ", "d").replaceAll("Đ", "D")
+                .toUpperCase()
+                .replaceAll("[^A-Z0-9 ]", "")
+                .trim();
     }
 }

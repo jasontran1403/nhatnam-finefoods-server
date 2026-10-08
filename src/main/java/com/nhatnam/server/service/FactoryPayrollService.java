@@ -8,6 +8,7 @@ import com.nhatnam.server.dto.hr.HrDtos.SalaryBreakdownDto;
 import com.nhatnam.server.dto.hr.HrDtos.SalaryRequest;
 import com.nhatnam.server.utils.PayrollTaxCalculator;
 import com.nhatnam.server.entity.*;
+import com.nhatnam.server.entity.MonthlyAdjustment;
 import com.nhatnam.server.enumtype.PayrollDepartment;
 import com.nhatnam.server.enumtype.Role;
 import com.nhatnam.server.repository.*;
@@ -16,8 +17,12 @@ import com.nhatnam.server.service.attendance.AttendanceExcelParser.DayRecord;
 import com.nhatnam.server.service.attendance.AttendanceExcelParser.EmployeeBlock;
 import com.nhatnam.server.service.attendance.AttendanceExceptionParser;
 import com.nhatnam.server.service.hr.EmployeeRequestService;
+import com.nhatnam.server.utils.LeaveBalanceCalculator;
 import com.nhatnam.server.service.hr.HrService;
 import com.nhatnam.server.service.hr.PayrollDepartmentResolver;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.AccountingShare;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.UserWeight;
 import com.nhatnam.server.utils.SeniorityCalculator;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -88,6 +93,13 @@ public class FactoryPayrollService {
     public static final LocalTime SHIFT_START = LocalTime.of(8, 0);
     public static final LocalTime SHIFT_END = LocalTime.of(17, 0);
 
+    /**
+     * Giờ tan ca của nhân viên PART-TIME (chỉ làm buổi sáng).
+     * Dùng khi tự động điền giờ ra cho ngày cuối tháng — file chấm công lấy
+     * vào ngày cuối tháng nên thường thiếu giờ ra của chính hôm đó.
+     */
+    public static final LocalTime PART_TIME_END = LocalTime.of(12, 0);
+
     public static final int STANDARD_SHIFT_MINUTES =
             (int) java.time.Duration.between(SHIFT_START, SHIFT_END).toMinutes();
 
@@ -116,10 +128,15 @@ public class FactoryPayrollService {
     private final PayrollDepartmentResolver deptResolver;
     private final DriverKmService driverKmService;
     private final HrService hrService;
+    private final MonthlyAdjustmentRepository monthlyAdjustmentRepo;
+    private final DriverRepository driverRepo;
     /** Bản CHỐT thâm niên của kỳ — ghi khi OWNER bấm "Hoàn tất". */
     private final EmployeeSeniorityRepository seniorityRepo;
     /** Nguồn sự thật cho ưu đãi từ ĐƠN NHÂN VIÊN đã được OWNER duyệt. */
     private final com.nhatnam.server.service.hr.EmployeeRequestService employeeRequestService;
+    private final OfficeBonusResultRepository officeBonusResultRepo;
+    private final PaymentTransactionRepository paymentTransactionRepo;
+    private final OrderRepository orderRepository;
 
     @PostConstruct
     void initStorage() {
@@ -181,7 +198,8 @@ public class FactoryPayrollService {
         YearMonth current = YearMonth.now(VN);
         List<PeriodOptionDto> result = new ArrayList<>();
 
-        for (int i = 1; i <= MONTHS_LOOKBACK; i++) {
+        // BẮT ĐẦU TỪ i = 0 (bao gồm tháng hiện tại)
+        for (int i = 0; i <= MONTHS_LOOKBACK; i++) {
             YearMonth ym = current.minusMonths(i);
             AttendanceSheet s = department == null ? null
                     : sheetRepo.findByMonthAndYearAndDepartment(
@@ -197,6 +215,7 @@ public class FactoryPayrollService {
         }
         return result;
     }
+
 
     /**
      * Các tháng được phép thao tác trên trang Bảng chấm công của OWNER:
@@ -233,11 +252,14 @@ public class FactoryPayrollService {
      */
     @Transactional
     public MyPayslipDto getMyPayslip(User user, int month, int year) {
-        validatePastPeriod(month, year);
+        // ── THAY validatePastPeriod BẰNG validateViewPeriod ──
+        PayrollDepartment dept = deptResolver.departmentOf(user);
+        validateViewPeriod(month, year, dept);
 
         String label = periodLabel(month, year);
         Role payrollRole = deptResolver.payrollRoleOf(user);
-        PayrollDepartment dept = PayrollDepartment.of(payrollRole);
+        // Lưu ý: dept đã có ở trên, không cần gọi lại
+        // PayrollDepartment dept = PayrollDepartment.of(payrollRole); // ← XÓA DÒNG NÀY
 
         MyPayslipDto.MyPayslipDtoBuilder b = MyPayslipDto.builder()
                 .month(month).year(year).periodLabel(label)
@@ -263,20 +285,138 @@ public class FactoryPayrollService {
                 .findByMonthAndYearAndDepartment(month, year, dept).orElse(null);
 
         if (sheet == null || !sheet.isFinalized()) {
-            return b.status("PROCESSING").build();
+            return b.status("PROCESSING").kpiStatus("NONE").build();
         }
+
+        // Xác định trạng thái KPI — tách riêng khỏi lương
+        String kpiStatus = sheet.isKpiFinalized() ? "READY" : "PENDING";
+        b.kpiStatus(kpiStatus);
 
         b.attendanceUploadedAt(sheet.getUploadedAt())
                 .finalizedAt(sheet.getFinalizedAt());
 
+        // ── KINH DOANH và KẾ TOÁN: FULL lương, chấm công CHỈ để tính phụ cấp cơm ──
+        //
+        // Lương = 100% lương cơ bản bất kể số ngày đi làm.
+        // Cơm   = 30.000đ × mealDays:
+        //           - Có file chấm công → đọc mealDays từ AttendanceEntry (số ngày có vào).
+        //           - Không có file → mặc định = standardWorkdays của tháng (full cơm).
+        //
+        // Thưởng doanh thu: hiển thị thêm sau khi bonusFinalized = true (bước 3).
+        //
+        // ── TRIỂN KHAI SAU ─────────────────────────────────────────────────────
+        // Nếu muốn tính lương theo ngày công (prorate):
+        //   double std = attendance.getStandardDays();
+        //   double act = attendance.getActualDays();
+        //   byAttendance = base * act / std;
+        // Hiện tại: byAttendance = base (full lương).
+        // ─────────────────────────────────────────────────────────────────────
+        if (dept == PayrollDepartment.SALES || dept == PayrollDepartment.ACCOUNTING) {
+            // Đọc attendance để hiển thị ngày công / mealDays trên phiếu (nếu có file)
+            if (sheet != null && dept.isAttendanceBased()) {
+                double defaultStd = sheet.getStandardDays() != null
+                        ? sheet.getStandardDays()
+                        : standardWorkdaysOf(month, year);
+                AttendanceEntry entry = entryRepo.findByUserAndPeriod(user.getId(), month, year).orElse(null);
+                if (entry != null) {
+                    AttendanceSummaryDto att = buildAttendanceSummary(entry, month, year, defaultStd);
+                    b.attendance(att);
+                }
+            }
+
+            // Lương full — HrService đọc mealDays từ AttendanceEntry (hoặc full nếu null)
+            SalaryBreakdownDto detail = hrService.getSalaryBreakdownForUser(user.getId(), month, year);
+            b.salaryDetail(detail);
+
+            // Thưởng doanh thu: chỉ hiển thị khi bonusFinalized = true
+            long bonusAmount = 0L;
+            if (sheet != null && sheet.isBonusFinalized()) {
+                Long bonus = officeBonusResultRepo.sumBonusForUser(month, year, dept, user.getId());
+                bonusAmount = bonus != null ? bonus : 0L;
+            }
+            b.kpiBonus(bonusAmount);
+
+            long base      = detail != null ? nz(detail.getBaseSalary()) : 0L;
+            long allowance = detail != null ? nz(detail.getAllowance())   : 0L;
+            long fixedBonus = detail != null ? nz(detail.getEffectiveBonus()) : 0L;
+            long netPay    = detail != null ? nz(detail.getNetSalary())   : 0L;
+
+            return b.status(detail != null ? "READY" : "NO_SALARY")
+                    .baseSalary(base)
+                    .salaryByAttendance(base)   // full lương, không prorate theo công
+                    .allowance(allowance)
+                    .fixedBonus(fixedBonus)
+                    .totalPay(netPay + bonusAmount)
+                    .build();
+        }
+
         // ── Bộ phận Tài xế: không có chấm công, thay bằng km theo ngày ────────
+        // Lương cơ bản hiện ngay khi finalized; xăng + thưởng chỉ hiện khi kpiFinalized.
+        //
+        // [FIX 2026] Đổi từ hrService.getSalaryBreakdownForUser() sang
+        //   driverSalaryDetail() để phiếu lương của TÀI XẾ có đủ:
+        //     · Phụ cấp cơm trưa (30k × ngày điểm danh ODO)
+        //     · Tiền xăng + Thưởng đơn hàng gộp thành "Thưởng KPI — đạt 100%"
+        //     · Card chi tiết Thưởng KPI (gas/xe máy/xe tải) render dưới phiếu.
+        //   Trước khi KPI finalized: gas/orderBonus vẫn bằng 0 (do gasPrice / bonus
+        //   unit price = null → driverKpi100 = 0), driver chỉ thấy base + meal.
+        //   Sau khi KPI finalized: đầy đủ như trên.
         AttendanceSummaryDto attendance = null;
         if (!dept.isAttendanceBased()) {
             DriverMonthDto dm = driverKmService.monthOf(user, month, year);
-            fillDriverSalary(dm, sheet, true);
+            fillDriverSalary(dm, sheet, true);  // true = chỉ tính bonus khi kpiFinalized
+
+            // Nếu KPI chưa hoàn tất → truyền sheet KHÔNG có driverGasPrice/bonus
+            // sang driverSalaryDetail để driverKpi100 = 0. driverSalaryDetail đã tự
+            // đọc từ sheetRepo nên nếu OWNER chưa nhập giá xăng thì driverKpi100 = 0
+            // tự nhiên — không cần rẽ nhánh.
+            SalaryBreakdownDto driverDetail;
+            try {
+                driverDetail = driverSalaryDetail(user.getId(), month, year);
+            } catch (Exception ex) {
+                log.warn("[MyPayslip] Không lấy được driverSalaryDetail cho user {}: {}",
+                        user.getId(), ex.getMessage());
+                driverDetail = hrService.getSalaryBreakdownForUser(user.getId(), month, year);
+            }
+
+            // Khi KPI CHƯA hoàn tất → ẩn phần Thưởng KPI 100% (gas + orderBonus)
+            // trên phiếu, giữ nguyên lương cơ bản + phụ cấp cơm. Card chi tiết
+            // cũng ẩn (bỏ driverOrderBonusDetail).
+            if (driverDetail != null && !sheet.isKpiFinalized()) {
+                driverDetail.setDriverOrderBonus(0L);
+                driverDetail.setDriverOrderBonusDetail(null);
+                // Trừ phần bonus (gas + orderBonus) ra khỏi effectiveBonus và net
+                // để nhân viên chưa thấy trước khi OWNER chốt.
+                Long curBonus = driverDetail.getEffectiveBonus();
+                Long curBonusInput = driverDetail.getBonus();
+                if (curBonus != null && curBonus > 0) {
+                    long hide = curBonus;
+                    driverDetail.setEffectiveBonus(0L);
+                    driverDetail.setEffectiveBonusKpiOnly(0L);
+                    driverDetail.setBonus(0L);
+                    if (driverDetail.getNetSalary() != null)
+                        driverDetail.setNetSalary(Math.max(0L, driverDetail.getNetSalary() - hide));
+                    if (driverDetail.getNetSalaryExact() != null)
+                        driverDetail.setNetSalaryExact(Math.max(0L, driverDetail.getNetSalaryExact() - hide));
+                }
+                // curBonusInput không cần dùng — comment để giữ ngữ nghĩa rõ ràng
+                if (curBonusInput != null) { /* no-op */ }
+            }
+
+            b.salaryDetail(driverDetail);
+
+            long driverBaseSalary = driverDetail != null ? nz(driverDetail.getBaseSalary()) : 0L;
+            long driverAllowance  = driverDetail != null ? nz(driverDetail.getAllowance())  : 0L;
+            long driverBonus      = driverDetail != null ? nz(driverDetail.getEffectiveBonus()) : 0L;
+            long driverNet        = driverDetail != null ? nz(driverDetail.getNetSalary())  : 0L;
+
             return b.driver(dm)
-                    .status("READY")
-                    .totalPay(dm.getTotalSalary() != null ? dm.getTotalSalary() : 0L)
+                    .status(driverDetail != null ? "READY" : "NO_SALARY")
+                    .baseSalary(driverBaseSalary)
+                    .salaryByAttendance(driverBaseSalary) // tài xế full lương cơ bản
+                    .allowance(driverAllowance)
+                    .fixedBonus(driverBonus)
+                    .totalPay(driverNet)  // driverNet đã bao gồm base + meal + KPI 100%
                     .build();
         }
         if (dept.isAttendanceBased()) {
@@ -289,9 +429,9 @@ public class FactoryPayrollService {
             b.attendance(attendance);
         }
 
-        // ── Thưởng KPI sản xuất: CHỈ bộ phận Xưởng ───────────────────────────
+        // ── Thưởng KPI sản xuất: CHỈ bộ phận Xưởng, CHỈ khi KPI đã hoàn tất ───
         long kpiAmount = 0L;
-        if (dept.isKpiBonus()) {
+        if (dept.isKpiBonus() && sheet.isKpiFinalized()) {
             FactoryKpiBonus kpi = kpiService.getOrCompute(month, year);
             FactoryKpiBonusItem myItem = kpi.getItems().stream()
                     .filter(i -> i.getUser() != null && i.getUser().getId() == user.getId())
@@ -463,6 +603,8 @@ public class FactoryPayrollService {
                 .earlyMinutes(entry != null ? entry.getEarlyMinutes() : null)
                 .shiftStart(SHIFT_START.format(HHMM))
                 .shiftEnd(SHIFT_END.format(HHMM))
+                .leaveMinutesUsed(entry != null ? entry.getLeaveMinutesUsed() : null)
+                .leaveBalanceMinutesAfter(entry != null ? entry.getLeaveBalanceMinutesAfter() : null)
                 .days(days)
                 .build();
     }
@@ -504,8 +646,17 @@ public class FactoryPayrollService {
                         .hasLeaveFile(false)
                         .parsedRows(0).exceptionRows(0).leaveRows(0)
                         .finalized(false)
-                        // Tài xế không cần file nào nên luôn hoàn tất được
-                        .canFinalize(!department.isAttendanceBased())
+                        .kpiFinalized(false)
+                        .hasKpiBonus(true)
+                        .hasSalesBonus(department == PayrollDepartment.SALES || department == PayrollDepartment.ACCOUNTING)
+                        .bonusFinalized(false)
+                        // SALES, ACCOUNTING, WAREHOUSE, DRIVER: luôn canFinalize = true (xem
+                        // chú thích ở toSheetDto — Phase 7 đã gộp upload về company sheet).
+                        .canFinalize(!department.isAttendanceBased()
+                                || department == PayrollDepartment.SALES
+                                || department == PayrollDepartment.ACCOUNTING
+                                || department == PayrollDepartment.WAREHOUSE
+                                || department == PayrollDepartment.DRIVER)
                         .build());
     }
 
@@ -552,7 +703,36 @@ public class FactoryPayrollService {
                 .finalized(s.isFinalized())
                 .finalizedAt(s.getFinalizedAt())
                 .finalizedByName(s.getFinalizedByName())
-                .canFinalize(!d.isAttendanceBased() || s.getFilePath() != null)
+                // SALES, ACCOUNTING, WAREHOUSE, DRIVER: luôn canFinalize = true.
+                //
+                // FIX (10/2026 — Phase 7): sau khi gộp upload về CompanyPayrollPanel,
+                // file chấm công KHÔNG còn gắn theo bộ phận nữa — chỉ 1 file duy
+                // nhất gắn vào "company sheet" (dept = FACTORY sentinel). Nghĩa là
+                // sheet DRIVER / ACCOUNTING / SALES / WAREHOUSE per-dept KHÔNG BAO
+                // GIỜ có filePath → điều kiện cũ chặn tab DRIVER không load được
+                // bảng lương xem trước (triệu chứng: trang Tài xế chỉ hiện km +
+                // thưởng đơn, không có "Phiếu lương — Tài xế").
+                //
+                // Lifecycle "Hoàn tất / Mở lại" nay chạy ở CompanyPayrollPanel đầu
+                // trang nên cờ canFinalize ở đây chỉ còn một tác dụng duy nhất:
+                // cho FE biết CÓ nên gọi departmentPayroll để nạp bảng xem trước
+                // hay không. Trả true cho mọi dept trừ FACTORY — FACTORY vẫn cần
+                // file (và filePath của company sheet == filePath của sheet này
+                // vì cùng là FACTORY sentinel).
+                .canFinalize(!d.isAttendanceBased() || s.getFilePath() != null
+                        || d == PayrollDepartment.SALES || d == PayrollDepartment.ACCOUNTING
+                        || d == PayrollDepartment.WAREHOUSE
+                        || d == PayrollDepartment.DRIVER)
+                .kpiFinalized(s.isKpiFinalized())
+                .kpiFinalizedAt(s.getKpiFinalizedAt())
+                .kpiFinalizedByName(s.getKpiFinalizedByName())
+                // Tất cả bộ phận đều có thể có KPI/bonus
+                .hasKpiBonus(true)
+                // Bước 3 (thưởng doanh thu) chỉ dành cho SALES và ACCOUNTING
+                .bonusFinalized(s.isBonusFinalized())
+                .bonusFinalizedAt(s.getBonusFinalizedAt())
+                .bonusFinalizedByName(s.getBonusFinalizedByName())
+                .hasSalesBonus(d == PayrollDepartment.SALES || d == PayrollDepartment.ACCOUNTING)
                 .build();
     }
 
@@ -702,11 +882,27 @@ public class FactoryPayrollService {
             }
 
             usedBlocks.add(m.block());
+
+            // ── Xác định trạng thái part-time: ưu tiên snapshot cũ → hiện tại ──
+            //   Khi tính LẠI tháng cũ (VD T8), nếu đã có snapshot partTime trong
+            //   AttendanceEntry cũ thì dùng, không lấy từ EmployeeSalary hiện tại.
+            boolean isPartTime = false;
+            AttendanceEntry existingEntry = entryRepo.findByUserAndPeriod(u.getId(), month, year).orElse(null);
+            if (existingEntry != null && existingEntry.getPartTime() != null) {
+                isPartTime = existingEntry.getPartTime();
+            } else {
+                // Lần đầu tính: lấy từ EmployeeSalary hiện tại
+                var salaries = salaryRepo.findAllByUserIdOrderByCreatedAtDesc(u.getId());
+                if (!salaries.isEmpty() && Boolean.TRUE.equals(salaries.get(0).getPartTime())) {
+                    isPartTime = true;
+                }
+            }
+
             AttendanceEntry entry = buildEntry(sheet, u, m.block(), month, year, standardDays,
                     deptExceptions,
                     leavesByUser.getOrDefault(u.getId(), Map.of()),
                     requestEffects.getOrDefault(u.getId(), Map.of()),
-                    warnings);
+                    warnings, isPartTime);
             toSave.add(entry);
 
             matchedRows.add(MatchRowDto.builder()
@@ -760,12 +956,48 @@ public class FactoryPayrollService {
     }
 
     /** Dựng bản ghi chấm công của 1 nhân viên từ block đọc được. */
+    // ── HẰNG SỐ NGÀY PHÉP ──────────────────────────────────────────────────────
+
+    /** Số phút trong 1 ngày phép (8 tiếng = 480 phút). */
+    public static final int LEAVE_MINUTES_PER_DAY = 480;
+
+    /**
+     * Du di trễ/sớm (phút) cho bộ phận FACTORY và ACCOUNTING.
+     * Trong phạm vi này (5 phút trễ + 5 phút sớm) vẫn tính đủ công,
+     * không trừ ngày phép.
+     */
+    public static final int GRACE_MINUTES = 5;
+
+    /**
+     * BỘ PHẬN ĐƯỢC ÁP DỤNG LOGIC TRỪ VÀO NGÀY PHÉP trước khi trừ lương.
+     * (FACTORY và ACCOUNTING)
+     */
+    /**
+     * TRƯỚC Phase 6: chỉ FACTORY và ACCOUNTING trừ trễ/sớm vào phép.
+     *
+     * <p>PHASE 6 (10/2026): mở rộng cho CẢ 5 bộ phận — tất cả đều dùng quỹ
+     * phép để bù trừ TRỄ. Tuy nhiên, các bộ phận NGOÀI XƯỞNG (Kế toán, Sales,
+     * Kho, Tài xế) KHÔNG TRỪ về sớm nữa (chỉ trừ về sớm cho XƯỞNG). Xem
+     * logic phân biệt trong vòng lặp `buildEntry` — biến {@code deductEarly}.
+     */
+    private boolean isLeaveFirstDept(PayrollDepartment dept) {
+        return dept != null;   // Phase 6: tất cả bộ phận đều áp quỹ phép cho TRỄ.
+    }
+
+    /**
+     * PHASE 6: Chỉ XƯỞNG SX trừ về sớm. Kế toán / Sales / Kho / Tài xế không
+     * còn bị trừ về sớm (không trừ phép, không trừ lương).
+     */
+    private boolean deductEarlyLeave(PayrollDepartment dept) {
+        return dept == PayrollDepartment.FACTORY;
+    }
+
     private AttendanceEntry buildEntry(AttendanceSheet sheet, User user, EmployeeBlock block,
                                        int month, int year, double standardDays,
                                        Map<Integer, AttendanceException> deptExceptions,
                                        Map<Integer, AttendanceLeaveRequest> myLeaves,
                                        Map<Integer, com.nhatnam.server.service.hr.EmployeeRequestService.DayEffect> myEffects,
-                                       List<String> warnings) {
+                                       List<String> warnings, boolean isPartTime) {
         List<Map<String, Object>> daily = new ArrayList<>();
         double actualDays = 0;
         int presentDays = 0;
@@ -776,6 +1008,37 @@ public class FactoryPayrollService {
         // riêng để hiện lên phiếu lương, thay vì trộn hết vào actualDays.
         double paidLeaveDays = 0, unpaidLeaveDays = 0, mealDays = 0;
 
+        // ── NGÀY CUỐI THÁNG — tham chiếu để tự động fill giờ ra ─────────────
+        int lastDayOfMonth = java.time.YearMonth.of(year, month).lengthOfMonth();
+
+        // ── NGÀY PHÉP CÒN LẠI (phút) — dùng để bù trừ trễ/sớm cho FACTORY/ACCOUNTING ──
+        PayrollDepartment dept = deptResolver.departmentOf(user);
+        boolean applyLeaveFirst = isLeaveFirstDept(dept);
+        // PHASE 6: Chỉ FACTORY trừ về sớm. Các bộ phận khác bỏ qua
+        // số phút về sớm — không trừ phép, không trừ lương.
+        boolean deductEarly = deductEarlyLeave(dept);
+
+        // ── TỔNG PHÚT PHÉP GỐC (từ LeaveRequest đã duyệt) ──────────────────
+        // Lấy số phút phép gốc của năm — KHÔNG trừ leaveMinutesUsed cũ.
+        // leaveMinutesUsed sẽ được tính lại từ đầu trong vòng lặp bên dưới.
+        // Cách này đảm bảo: mở lại → tính lại → kết quả luôn đúng, không cộng dồn.
+        int leaveBalanceMinutes = 0;
+        if (applyLeaveFirst) {
+            try {
+                com.nhatnam.server.dto.hr.EmployeeRequestDtos.LeaveBalanceDto bal =
+                        employeeRequestService.leaveBalance(user.getId(), year);
+                double remainingDays = bal.getRemainingDays() != null ? bal.getRemainingDays() : 0.0;
+                // Giữ nguyên số phút (không làm tròn) để tránh thiệt cho nhân viên.
+                // CLAMP về ≥ 0: nếu quỹ đã âm (do đơn vượt quỹ hoặc dữ liệu test cũ)
+                // thì coi như hết phép — tuyệt đối không cho lần tính lương này
+                // trừ THÊM âm vào leaveMinutesUsed / leaveBalanceMinutesAfter.
+                leaveBalanceMinutes = (int) Math.max(0, remainingDays * LEAVE_MINUTES_PER_DAY);
+            } catch (Exception e) {
+                log.warn("[Attendance] Không lấy được ngày phép của {} để bù trừ: {}", user.getFullName(), e.getMessage());
+            }
+        }
+        int leaveMinutesUsed = 0; // tổng phút phép đã dùng bù trễ/sớm — tính lại từ đầu
+
         for (DayRecord d : block.getDays()) {
             if (d.getDate() == null) continue;
 
@@ -785,31 +1048,104 @@ public class FactoryPayrollService {
                 continue;
             }
 
-            DayPlan w = resolvePlan(d.getDate().getDayOfMonth(), deptExceptions, myLeaves, myEffects);
-            DayResult r = resolveDay(d, w);
-            actualDays  += r.value();
-            totalLate   += r.late();
-            totalEarly  += r.early();
+            // ── PHASE 6: TẤT CẢ ngày thiếu giờ ra → mặc định 17:00 ─────────
+            //
+            // Trước Phase 6 chỉ patch ngày CUỐI THÁNG; giờ patch cho MỌI ngày
+            // nhân viên có quẹt thẻ vào nhưng quên quẹt ra. Dùng cờ
+            // {@code "defaultedOut": true} trong dailyJson để UI xem chi tiết
+            // highlight được "ngày này thiếu giờ ra, hệ thống fill 17:00".
+            //
+            // Điều kiện áp dụng:
+            //   1. Là ngày đi làm (T2–T7, không phải CN)
+            //   2. Không phải ngày lễ được nghỉ
+            //   3. Có chấm công vào nhưng không có chấm công ra
+            DayRecord effectiveD = d;
+            boolean isWorkday = d.getDate().getDayOfWeek() != java.time.DayOfWeek.SUNDAY;
+            boolean isHoliday = isHolidayOff(d.getDate().getDayOfMonth(), deptExceptions);
+            boolean defaultedOut = false;
+            if (isWorkday && !isHoliday
+                    && d.hasPunch()
+                    && d.firstIn() != null
+                    && d.lastOut() == null) {
+                LocalTime defaultOut = isPartTime ? PART_TIME_END : SHIFT_END;
+                effectiveD = patchLastOut(d, defaultOut);
+                defaultedOut = true;
+            }
+
+            DayPlan w = resolvePlan(effectiveD.getDate().getDayOfMonth(), deptExceptions, myLeaves, myEffects);
+            DayResult r = resolveDay(effectiveD, w, isPartTime);
+
+            // ── YÊU CẦU 1: Trừ trễ/sớm vào ngày phép trước ──
+            // PHASE 6: Chỉ FACTORY trừ về sớm. Các bộ phận khác bỏ qua.
+            int adjustedLate  = r.late();
+            int adjustedEarly = deductEarly ? r.early() : 0;
+            double adjustedValue = r.value();
+
+            if (applyLeaveFirst && !isPartTime && r.late() + r.early() > 0
+                    && !"LEAVE".equals(r.type()) && !"UNPAID".equals(r.type())) {
+
+                // Du di 5 phút:
+                //   - Trễ/sớm ≤ GRACE_MINUTES → bỏ qua hoàn toàn, không phạt.
+                //   - Trễ/sớm > GRACE_MINUTES → phạt TOÀN BỘ số phút thực tế (không chỉ phần vượt).
+                //     Ví dụ: trễ 8 phút → phạt đúng 8 phút (không phải 8-5=3 phút).
+                int penaltyLate  = r.late()  > GRACE_MINUTES ? r.late()  : 0;
+                // PHASE 6: Kế toán / Sales / Kho / Tài xế không bị phạt về sớm.
+                int penaltyEarly = (deductEarly && r.early() > GRACE_MINUTES) ? r.early() : 0;
+                int totalPenaltyMinutes = penaltyLate + penaltyEarly;
+
+                // adjustedLate/Early = 0 khi trong ngưỡng du di, = số thực khi vượt
+                adjustedLate  = penaltyLate;
+                adjustedEarly = penaltyEarly;
+
+                if (totalPenaltyMinutes > 0) {
+                    // Trừ vào quỹ phép trước (giữ nguyên số phút, không làm tròn)
+                    int fromLeave = Math.min(totalPenaltyMinutes, leaveBalanceMinutes);
+                    leaveBalanceMinutes -= fromLeave;
+                    leaveMinutesUsed    += fromLeave;
+                    int remainPenalty    = totalPenaltyMinutes - fromLeave;
+
+                    // Phần vượt phép → trừ ngày công (giữ nguyên số thực, không làm tròn)
+                    if (remainPenalty > 0) {
+                        double deductFraction = (double) remainPenalty / LEAVE_MINUTES_PER_DAY;
+                        adjustedValue = Math.max(0.0, r.value() - deductFraction);
+                    }
+                }
+            }
+
+            actualDays  += adjustedValue;
+            totalLate   += adjustedLate;
+            totalEarly  += adjustedEarly;
             totalWorked += r.worked();
-            if (d.hasPunch())      presentDays++;
-            if (r.mealEligible())  mealDays++;
-            if (r.late()  > 0)     lateDays++;
-            if (r.early() > 0)     earlyDays++;
+            if (effectiveD.hasPunch())   presentDays++;
+            if (r.mealEligible())        mealDays++;
+            if (adjustedLate  > 0)       lateDays++;
+            if (adjustedEarly > 0)       earlyDays++;
 
             if ("LEAVE".equals(r.type()))  paidLeaveDays   += r.value();
             if ("UNPAID".equals(r.type())) unpaidLeaveDays += 1.0;
 
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("d", d.getDate().getDayOfMonth());
-            m.put("w", d.getWeekdayLabel());
-            m.put("v", round2(r.value()));
+            m.put("d", effectiveD.getDate().getDayOfMonth());
+            m.put("w", effectiveD.getWeekdayLabel());
+            m.put("v", round4(adjustedValue));
             m.put("t", r.type());
 
-            LocalTime in = d.firstIn(), out = d.lastOut();
+            LocalTime in = effectiveD.firstIn(), out = effectiveD.lastOut();
             if (in  != null) m.put("in",  in.format(HHMM));
             if (out != null) m.put("out", out.format(HHMM));
-            if (r.late()   > 0) m.put("late",   r.late());
-            if (r.early()  > 0) m.put("early",  r.early());
+            // PHASE 6: cờ cho UI biết giờ ra là FILL mặc định, không phải chấm thật.
+            if (defaultedOut) m.put("defaultedOut", true);
+            // PHASE 6b: cờ WFH để UI tô màu riêng (xanh lá) và show badge "Làm ở nhà".
+            //   Lấy từ DayEffect — merge() đã set wfh=true khi có đơn WORK_FROM_HOME
+            //   APPROVED_PAID cho ngày này.
+            {
+                var _effect = myEffects.get(effectiveD.getDate().getDayOfMonth());
+                if (_effect != null && _effect.wfh()) m.put("wfh", true);
+            }
+            if (adjustedLate  > 0) m.put("late",   adjustedLate);
+            if (adjustedEarly > 0) m.put("early",  adjustedEarly);
+            if (r.late()  != adjustedLate)  m.put("rawLate",  r.late());
+            if (r.early() != adjustedEarly) m.put("rawEarly", r.early());
             if (r.worked()   > 0) m.put("wk", r.worked());
             if (r.required() > 0) m.put("rq", r.required());
             if (r.note()   != null) m.put("ex", r.note());
@@ -817,9 +1153,9 @@ public class FactoryPayrollService {
             m.put("we", w.end().format(HHMM));
             if (w.deduction() > 0) m.put("dd", w.deduction());
 
-            if (d.getSessions() != null && !d.getSessions().isEmpty()) {
+            if (effectiveD.getSessions() != null && !effectiveD.getSessions().isEmpty()) {
                 List<Map<String, Object>> ss = new ArrayList<>();
-                for (AttendanceExcelParser.Session sess : d.getSessions()) {
+                for (AttendanceExcelParser.Session sess : effectiveD.getSessions()) {
                     Map<String, Object> sm = new LinkedHashMap<>();
                     if (sess.getIn()  != null) sm.put("in",  sess.getIn().format(HHMM));
                     if (sess.getOut() != null) sm.put("out", sess.getOut().format(HHMM));
@@ -842,11 +1178,13 @@ public class FactoryPayrollService {
                 .employeeCode(block.getEmployeeCode())
                 .sourceName(block.getEmployeeName())
                 .standardDays(standardDays)
-                .actualDays(round2(actualDays))
+                .actualDays(round4(actualDays))
                 .presentDays(presentDays)
                 .mealDays(round2(mealDays))
                 .leaveDays(round2(paidLeaveDays))
                 .unpaidDays(round2(unpaidLeaveDays))
+                .leaveMinutesUsed(leaveMinutesUsed)
+                .leaveBalanceMinutesAfter(leaveBalanceMinutes) // phút phép còn lại sau kỳ
                 .overtimeHours(0.0)
                 .lateCount(lateDays)
                 .lateMinutes(totalLate)
@@ -855,7 +1193,59 @@ public class FactoryPayrollService {
                 .machineTotalHours(block.getTotalHours())
                 .machineTotalWorkUnits(block.getTotalWorkUnits())
                 .dailyJson(dailyJson)
+                .partTime(isPartTime)
                 .build();
+    }
+
+    /**
+     * Tạo bản sao của DayRecord với giờ ra (lastOut) được patch về giờ chỉ định.
+     * Dùng cho ngày cuối tháng khi file chấm công thiếu giờ ra.
+     */
+    private DayRecord patchLastOut(DayRecord original, LocalTime defaultOut) {
+        if (original.getSessions() == null || original.getSessions().isEmpty()) return original;
+
+        List<AttendanceExcelParser.Session> patched = new ArrayList<>();
+        List<AttendanceExcelParser.Session> origSessions = original.getSessions();
+
+        for (int i = 0; i < origSessions.size(); i++) {
+            AttendanceExcelParser.Session s = origSessions.get(i);
+            if (i == origSessions.size() - 1 && s.getOut() == null && s.getIn() != null) {
+                // Patch giờ ra của session cuối cùng
+                patched.add(AttendanceExcelParser.Session.builder()
+                        .in(s.getIn()).out(defaultOut).build());
+            } else {
+                patched.add(s);
+            }
+        }
+
+        // Trả về DayRecord mới với sessions đã patch
+        return AttendanceExcelParser.DayRecord.builder()
+                .date(original.getDate())
+                .weekdayLabel(original.getWeekdayLabel())
+                .sessions(patched)
+                .symbol(original.getSymbol())
+                .lateMinutes(original.getLateMinutes())
+                .earlyMinutes(original.getEarlyMinutes())
+                .overtimeMinutes(original.getOvertimeMinutes())
+                .rawHours(original.getRawHours())
+                .rawWorkUnits(original.getRawWorkUnits())
+                .build();
+    }
+
+    /** Làm tròn về 4 chữ số thập phân (dùng cho ngày công có lẻ sau khi trừ phép). */
+    private static double round4(double v) {
+        return Math.round(v * 10000.0) / 10000.0;
+    }
+
+    /**
+     * Kiểm tra ngày có phải ngày lễ được nghỉ không.
+     * Ngày lễ = deptExceptions có type {@code FULL_DAY_OFF} cho ngày đó.
+     */
+    private static boolean isHolidayOff(int dayOfMonth,
+                                        Map<Integer, AttendanceException> deptExceptions) {
+        AttendanceException ex = deptExceptions.get(dayOfMonth);
+        return ex != null
+                && ex.getType() == com.nhatnam.server.enumtype.AttendanceExceptionType.FULL_DAY_OFF;
     }
 
     /**
@@ -889,9 +1279,9 @@ public class FactoryPayrollService {
                            double deduction,
                            boolean mealPaidLeave,
                            String label) {
-
-
-        int expectedMinutes() { return (int) java.time.Duration.between(start, end).toMinutes(); }
+        int expectedMinutes() {
+            return (int) java.time.Duration.between(start, end).toMinutes();
+        }
     }
 
     /** Bộ dựng {@link DayPlan} — gom nhiều nguồn ưu đãi cho cùng một ngày. */
@@ -903,9 +1293,6 @@ public class FactoryPayrollService {
         final List<String> labels = new ArrayList<>();
 
         DayPlan build() {
-            // Không phép LUÔN THẮNG có phép. Một ngày vừa dính đơn nghỉ không
-            // lương vừa dính ưu đãi khác thì vẫn về 0 công — nếu làm ngược lại,
-            // chồng thêm đơn sẽ trở thành cách lách quyết định đã ra.
             if (zeroDay) { fullCredit = false; minCredit = 0.0; mealPaidLeave = false; }
             LocalTime s = start, e = end;
             if (!s.isBefore(e)) { s = SHIFT_START; e = SHIFT_END; }
@@ -955,7 +1342,7 @@ public class FactoryPayrollService {
                 + (mark != null ? " (" + mark.format(HHMM) + ")" : ""));
 
         switch (type) {
-            case FULL_DAY_OFF -> { b.fullCredit = true; b.mealPaidLeave = true; }
+            case FULL_DAY_OFF -> { b.fullCredit = true; }
 
             // NGHỈ NỬA BUỔI — ca thu lại còn nửa kia, VÀ được mức sàn 0.5 công.
             // Đi làm nốt nửa còn lại thì tỉ lệ có mặt đạt 100% của ca đã thu nên
@@ -984,23 +1371,21 @@ public class FactoryPayrollService {
 
         if (eff.fullDayCredit()) {
             b.fullCredit = true;
-            // Nghỉ phép CÓ LƯƠNG vẫn hưởng phụ cấp cơm của ngày đó dù không quẹt thẻ.
-            if (eff.mealEligible()) b.mealPaidLeave = true;
+            // KHÔNG set mealPaidLeave: nghỉ phép có lương cũng không ăn cơm giữa
+            // ca. Phụ cấp cơm theo Thông tư 111/2013 chỉ áp cho ngày thực sự
+            // có mặt tại nơi làm việc.
         }
 
-        // Đi trễ / về sớm được duyệt: dời mốc ca. Lấy mốc CHẶT HƠN nếu lịch bộ
-        // phận đã dời sẵn, để hai ưu đãi không cộng dồn thành một ca quá ngắn.
         if (eff.shiftStart() != null) b.start = maxTime(b.start, eff.shiftStart());
         if (eff.shiftEnd() != null)   b.end   = minTime(b.end, eff.shiftEnd());
 
-        // Nghỉ ÍT HƠN 1 NGÀY: miễn có mặt trong khoảng giờ, KHÔNG dời mốc ca —
-        // nhờ vậy phần ca còn lại vẫn bị soi đi trễ / về sớm như thường.
         if (eff.excusedFrom() != null && eff.excusedTo() != null) {
             b.excusedFrom = minTime(b.excusedFrom, eff.excusedFrom());
             b.excusedTo   = maxTime(b.excusedTo, eff.excusedTo());
         }
 
         b.deduction += eff.deduction();
+        b.minCredit = Math.max(b.minCredit, eff.minCredit());
     }
 
     /**
@@ -1011,7 +1396,7 @@ public class FactoryPayrollService {
     private record DayResult(double value, String type, int late, int early,
                              int worked, int required, boolean mealEligible, String note) {}
 
-    private DayResult resolveDay(DayRecord d, DayPlan p) {
+    private DayResult resolveDay(DayRecord d, DayPlan p, boolean isPartTime) {
         // ── Nghỉ KHÔNG PHÉP: 0 công, 0 tiền cơm, bất kể máy ghi gì ────────────
         if (p.zeroDay())
             return new DayResult(0.0, "UNPAID", 0, 0, 0, 0, false, p.label());
@@ -1035,19 +1420,53 @@ public class FactoryPayrollService {
         if (firstIn == null || lastOut == null)
             return new DayResult(0.0, "MISSING", 0, 0, 0, 0, true, p.label());
 
+        // ── TỰ NHẬN NỬA BUỔI cho FULL-TIME (không có đơn nghỉ nửa buổi đã nộp) ──
+        //   Trường hợp thực tế: nhân viên chỉ đến làm buổi sáng (đi 8:14, về
+        //   12:30) hoặc chỉ buổi chiều, không nộp đơn xin nghỉ nửa buổi. Trước
+        //   đây tính 0 công vì worked < 4h; giờ cho 0.5 công nếu pattern rõ.
+        //
+        //   Điều kiện áp dụng — TẤT CẢ phải đúng:
+        //     - Full-time (part-time đã có logic 0.5 công riêng ở dưới)
+        //     - Ca là 8:00-17:00 chuẩn (chưa bị đơn khác dời)
+        //     - minCredit chưa được set (chưa có đơn nghỉ nửa buổi nào áp dụng)
+        //     - Pattern chấm công khớp SÁNG-ONLY hoặc CHIỀU-ONLY
+        //     - Làm ít nhất 2h trong nửa buổi tương ứng (chống lách bằng cách
+        //       quẹt thẻ 5 phút rồi về)
+        if (!isPartTime && p.minCredit() < 0.5
+                && p.start().equals(SHIFT_START) && p.end().equals(SHIFT_END)) {
+            p = autoDetectHalfDay(p, firstIn, lastOut);
+        }
+
         int late  = Math.max(0, minutesBetween(p.start(), firstIn));
         int early = Math.max(0, minutesBetween(lastOut, p.end()));
+
+        // ── Phần trùng LUNCH nằm TRONG CA — dùng cho cả hai phép tính bên dưới ──
+        //   Trước đây `presentDuringLunch` chỉ so với [12:00,13:00] mà không
+        //   biên với ca — khi ca bị rút còn 8:00-12:00 (nghỉ chiều / tự nhận),
+        //   một session ra lúc 12:30 sẽ bị TRỪ 30 phút lunch không có trong ca
+        //   → worked bị tụt ảo 30 phút. Nay dùng cùng giao [ca ∩ lunch] cho cả
+        //   `lunchAllowance` và `presentDuringLunch` để loại bug này.
+        LocalTime lunchInShiftStart = maxTime(p.start(), LUNCH_START);
+        LocalTime lunchInShiftEnd   = minTime(p.end(),   LUNCH_END);
+        boolean shiftContainsLunch = lunchInShiftStart != null
+                && lunchInShiftEnd != null
+                && lunchInShiftStart.isBefore(lunchInShiftEnd);
 
         int present = 0, presentDuringLunch = 0;
         if (d.getSessions() != null) {
             for (AttendanceExcelParser.Session ss : d.getSessions()) {
                 if (ss.getIn() == null || ss.getOut() == null) continue;
-                present            += overlapMinutes(ss.getIn(), ss.getOut(), p.start(), p.end());
-                presentDuringLunch += overlapMinutes(ss.getIn(), ss.getOut(), LUNCH_START, LUNCH_END);
+                present += overlapMinutes(ss.getIn(), ss.getOut(), p.start(), p.end());
+                if (shiftContainsLunch) {
+                    presentDuringLunch += overlapMinutes(ss.getIn(), ss.getOut(),
+                            lunchInShiftStart, lunchInShiftEnd);
+                }
             }
         }
 
-        int lunchAllowance = overlapMinutes(p.start(), p.end(), LUNCH_START, LUNCH_END);
+        int lunchAllowance = shiftContainsLunch
+                ? minutesBetween(lunchInShiftStart, lunchInShiftEnd)
+                : 0;
 
         // Khoảng giờ được miễn có mặt bị TRỪ KHỎI số phút phải làm. Phần trùng
         // với giờ nghỉ trưa đã bị trừ ở trên rồi nên không trừ lần nữa.
@@ -1061,25 +1480,98 @@ public class FactoryPayrollService {
         int required = Math.max(0, p.expectedMinutes() - lunchAllowance - excused);
         int worked   = Math.max(0, present - presentDuringLunch);
 
-        double value = 1.0;
-        if (required > 0) {
-            value = BigDecimal.valueOf(Math.min(worked, required))
-                    .divide(BigDecimal.valueOf(required), 6, RoundingMode.HALF_UP)
-                    .setScale(2, RoundingMode.FLOOR)
-                    .doubleValue();
-            value = clamp01(value);
+        // ── TÍNH CÔNG THEO SỐ GIỜ LÀM THỰC TẾ ────────────────────────────────
+        //
+        //   PART-TIME (ca chuẩn ~4 tiếng):
+        //     Có quẹt thẻ = 0.5 công. Đi trễ / về sớm KHÔNG trừ (chỉ tính KPI).
+        //     Ngưỡng tối thiểu 2 tiếng để loại trường hợp quẹt rồi đi về ngay.
+        //
+        //   FULL-TIME (ca chuẩn 8 tiếng):
+        //     ≥ 6 tiếng (360 phút)  → 1.0 công
+        //     ≥ 4 tiếng (240 phút)  → 0.5 công (làm nửa buổi)
+        //     < 4 tiếng             → 0 công
+        //
+        //   Đi trễ / về sớm CHỈ ghi nhận KPI, KHÔNG trừ lương.
+        double value;
+        if (isPartTime) {
+            // Part-time: quẹt thẻ + làm ít nhất 2 tiếng = 0.5 công
+            value = worked >= 120 ? 0.5 : 0.0;
+        } else if (worked >= 360) {
+            value = 1.0;
+        } else if (worked >= 240) {
+            value = 0.5;
+        } else {
+            value = 0.0;
         }
+
+        value = clamp01(value - p.deduction());
 
         // Mức sàn của ngày nghỉ nửa buổi áp cả khi có đi làm nhưng thiếu giờ.
         value = Math.max(value, p.minCredit());
-        value = clamp01(value - p.deduction());
 
-        // Có quẹt thẻ là có ăn cơm, kể cả hôm đó chỉ tính nửa công vì đi trễ.
-        return new DayResult(value, "WORK", late, early, worked, required, true, p.label());
+        // ── PHỤ CẤP CƠM: chỉ khi làm TỪ 6 TIẾNG trở lên ──────────────────
+        //   Dưới 6 tiếng (360 phút) không được phụ cấp cơm của ngày đó.
+        boolean mealEligible = worked >= 360;
+
+        // Type phản ánh đúng giá trị công: 1.0=WORK, 0.5=HALF, 0=OFF
+        String dayType = value >= 1.0 ? "WORK" : value > 0 ? "HALF" : "MISSING";
+        return new DayResult(value, dayType, late, early, worked, required, mealEligible, p.label());
     }
 
     private static double clamp01(double v) {
         return Math.max(0.0, Math.min(1.0, round2(v)));
+    }
+
+    /**
+     * TỰ NHẬN NỬA BUỔI cho FULL-TIME khi pattern chấm công rõ ràng chỉ sáng
+     * hoặc chỉ chiều — dùng khi nhân viên KHÔNG nộp đơn xin nghỉ nửa buổi
+     * (nếu có đơn thì {@code applyLegacy}/{@code applyEffect} đã set minCredit
+     * = 0.5 và caller đã bỏ qua auto-detect này).
+     *
+     * <p>Ngưỡng {@value #AUTO_HALF_MIN_WORK_MINUTES} phút = 2h trong nửa buổi:
+     * đủ để phân biệt "làm nửa buổi hợp lệ" với "quẹt thẻ rồi biến mất".
+     *
+     * @return DayPlan mới với ca ngắn còn nửa buổi và minCredit = 0.5 nếu
+     *         nhận được; hoặc DayPlan gốc nếu không khớp pattern.
+     */
+    private DayPlan autoDetectHalfDay(DayPlan p, LocalTime firstIn, LocalTime lastOut) {
+        // ── SÁNG-ONLY: vào trước 12:00, ra không sau 13:00 ─────────────────
+        if (firstIn.isBefore(LUNCH_START) && !lastOut.isAfter(LUNCH_END)) {
+            int workedMorning = overlapMinutes(firstIn, lastOut, SHIFT_START, LUNCH_START);
+            if (workedMorning >= AUTO_HALF_MIN_WORK_MINUTES) {
+                return new DayPlan(SHIFT_START, LUNCH_START,
+                        false, false,
+                        0.5,
+                        p.excusedFrom(), p.excusedTo(),
+                        p.deduction(),
+                        false, // không tính cơm cho nửa buổi
+                        joinLabel(p.label(), "Tự nhận nửa buổi sáng"));
+            }
+        }
+
+        // ── CHIỀU-ONLY: vào từ 12:00 trở đi (dù chưa hết trưa), ra sau 13:00 ──
+        if (!firstIn.isBefore(LUNCH_START) && lastOut.isAfter(LUNCH_END)) {
+            int workedAfternoon = overlapMinutes(firstIn, lastOut, LUNCH_END, SHIFT_END);
+            if (workedAfternoon >= AUTO_HALF_MIN_WORK_MINUTES) {
+                return new DayPlan(LUNCH_END, SHIFT_END,
+                        false, false,
+                        0.5,
+                        p.excusedFrom(), p.excusedTo(),
+                        p.deduction(),
+                        false,
+                        joinLabel(p.label(), "Tự nhận nửa buổi chiều"));
+            }
+        }
+
+        return p;
+    }
+
+    /** Ngưỡng tối thiểu để tự nhận nửa buổi — 120 phút = 2 tiếng. */
+    private static final int AUTO_HALF_MIN_WORK_MINUTES = 120;
+
+    private static String joinLabel(String existing, String add) {
+        if (existing == null || existing.isBlank()) return add;
+        return existing + " · " + add;
     }
 
     private static LocalTime minTime(LocalTime a, LocalTime b) {
@@ -1123,6 +1615,16 @@ public class FactoryPayrollService {
         Path root = attendanceRoot != null ? attendanceRoot : resolvePath(attendanceDir);
         return root.resolve("%02d_%d".formatted(month, year))
                 .resolve(department != null ? department.name() : PayrollDepartment.FACTORY.name());
+    }
+
+    /**
+     * Phase 2 public wrapper — cho {@code CompanyAttendanceService} tái sử dụng
+     * cùng logic lưu file đĩa, cùng cấu trúc thư mục {@code MM_YYYY/<DEPT>/}.
+     * Nội bộ (các method per-department cũ) vẫn gọi private {@code storeFile}.
+     */
+    public String storeAttendanceFile(MultipartFile file, int month, int year,
+                                      PayrollDepartment department, String prefix, List<String> warnings) {
+        return storeFile(file, month, year, department, prefix, warnings);
     }
 
     private String storeFile(MultipartFile file, int month, int year,
@@ -1407,8 +1909,9 @@ public class FactoryPayrollService {
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
-     * OWNER bấm "HOÀN TẤT" cho tháng + bộ phận.
-     * Từ lúc này nhân viên bộ phận đó xem được phiếu lương của tháng.
+     * OWNER bấm "HOÀN TẤT LƯƠNG" cho tháng + bộ phận.
+     * Từ lúc này nhân viên thấy lương cơ bản + phụ cấp.
+     * KPI / bonus vẫn hiển thị "Đang tính" cho đến khi gọi {@link #finalizeKpi}.
      */
     @Transactional
     public AttendanceSheetDto finalizePeriod(int month, int year,
@@ -1417,22 +1920,23 @@ public class FactoryPayrollService {
 
         AttendanceSheet sheet = sheetOf(month, year, department);
 
-        if (department.isAttendanceBased() && sheet.getFilePath() == null)
+        // SALES, ACCOUNTING và WAREHOUSE: file chấm công TUỲ CHỌN. Không có file
+        // thì HrService tự trả full lương cơ bản + phụ cấp cơm đủ công chuẩn.
+        // FACTORY: bắt buộc phải có file mới cho hoàn tất. (Phase 1: MANAGEMENT đã gỡ.)
+        boolean requireFile = department.isAttendanceBased()
+                && department != PayrollDepartment.SALES
+                && department != PayrollDepartment.ACCOUNTING
+                && department != PayrollDepartment.WAREHOUSE;
+        if (requireFile && sheet.getFilePath() == null)
             throw new IllegalArgumentException(
                     "Chưa có bảng chấm công của %s tháng %d/%d — không thể hoàn tất."
                             .formatted(department.getLabel(), month, year));
 
-        // Tài xế: bắt buộc đã nhập giá xăng + đơn giá thưởng trước khi Hoàn tất.
-        if (department == PayrollDepartment.DRIVER
-                && (sheet.getDriverGasPrice() == null || sheet.getDriverBonusUnitPrice() == null))
-            throw new IllegalArgumentException(
-                    "Vui lòng nhập giá xăng và đơn giá thưởng trước khi hoàn tất lương tài xế.");
-
-        // Tính lại lần cuối theo FILE MỚI NHẤT trước khi chốt
-        if (department.isAttendanceBased())
+        // Tính lại lần cuối theo FILE MỚI NHẤT trước khi chốt.
+        // SALES/ACCOUNTING: chỉ tính lại nếu có file (để cập nhật mealDays).
+        // Nếu không có file → HrService sẽ tính cơm mặc định = standardDays × 30.000.
+        if (department.isAttendanceBased() && sheet.getFilePath() != null)
             recalculateFromStoredSheet(month, year, department, new ArrayList<>());
-        if (department.isKpiBonus())
-            kpiService.recompute(month, year);
 
         sheet.setFinalized(true);
         sheet.setFinalizedAt(System.currentTimeMillis());
@@ -1440,104 +1944,91 @@ public class FactoryPayrollService {
         sheetRepo.save(sheet);
 
         // CHỐT THÂM NIÊN của kỳ.
-        //
-        //   Mốc đếm năm là NGÀY CUỐI CỦA KỲ LƯƠNG, KHÔNG phải lúc bấm nút: lương
-        //   chốt ngày 1 đầu tháng sau nhưng tính cho THÁNG TRƯỚC, lấy ngày bấm sẽ
-        //   cộng dôi phần thâm niên của những ngày ngoài kỳ.
-        //     Vào làm 29/02/2024 · kỳ T2/2026 · bấm 01/03/2026
-        //       mốc 01/03/2026 → 2 năm  ✗     mốc 28/02/2026 → 1 năm  ✓
         computeSeniority(month, year, department, actor);
 
-        log.info("[Attendance] HOÀN TẤT lương {} tháng {}/{} bởi {}",
+        log.info("[Attendance] HOÀN TẤT LƯƠNG {} tháng {}/{} bởi {}",
                 department, month, year, actor != null ? actor.getFullName() : "?");
         return toSheetDto(sheet);
     }
 
     /**
-     * TÍNH &amp; CHỐT THÂM NIÊN cho toàn bộ nhân viên của bộ phận trong kỳ.
+     * OWNER bấm "HOÀN TẤT KPI / THƯỞNG" cho tháng + bộ phận.
+     * Từ lúc này nhân viên thấy KPI và bonus.
      *
-     * <p>Chạy đúng một lần mỗi khi OWNER bấm "Hoàn tất". Với mỗi nhân viên:
-     * <pre>
-     *   mốc chốt = NGÀY CUỐI CỦA KỲ LƯƠNG (không phải ngày bấm nút)
-     *   số năm   = số năm TRÒN( ngày vào làm → mốc chốt ), LÀM TRÒN XUỐNG
-     *   %        = 0 nếu chưa đủ 1 năm, ngược lại min(số năm + 1, 10)
-     *   tiền     = lương cơ bản chuẩn × %
-     * </pre>
-     *
-     * <p><b>Vì sao mốc là cuối kỳ lương.</b> Lương chốt vào ngày 1 đầu tháng sau
-     * nhưng TÍNH CHO THÁNG TRƯỚC. Lấy ngày bấm nút thì nhân viên được cộng thêm
-     * thâm niên của những ngày không thuộc kỳ đang trả:
-     * <pre>
-     *   Vào làm 29/02/2024 · kỳ T2/2026 (01/02→28/02) · bấm Hoàn tất 01/03/2026
-     *     mốc 01/03/2026 → 2 năm  ✗ SAI
-     *     mốc 28/02/2026 → 1 năm  ✓ ĐÚNG (chưa tới ngày kỷ niệm)
-     * </pre>
-     * Nhờ vậy con số CHỈ phụ thuộc (ngày vào làm, kỳ lương): bấm Hoàn tất lúc nào,
-     * mở lại rồi chốt lại bao nhiêu lần, vẫn ra đúng một kết quả.
-     *
-     * <p>Kết quả ghi vào {@code employee_seniority} (upsert theo nhân viên + kỳ).
-     * Bản chốt giữ nguyên con số đã trả kể cả khi {@code workStartDate} bị sửa về
-     * sau — không có nó thì một lần chỉnh hồ sơ sẽ âm thầm đổi phụ cấp của những
-     * tháng đã trả xong.
-     *
-     * <p>Nhân viên CHƯA khai báo ngày vào làm vẫn được ghi một dòng 0 năm / 0% —
-     * để sổ có đủ mặt mọi người và nhìn ra ngay ai còn thiếu dữ liệu.
-     *
-     * @return số nhân viên đã chốt
+     * <p>Áp dụng đồng nhất cho mọi bộ phận — không phân biệt Xưởng / Tài xế / Kế toán.
+     * OWNER phải gọi {@link #finalizePeriod} trước, rồi mới gọi hàm này.
+     */
+    @Transactional
+    public AttendanceSheetDto finalizeKpi(int month, int year,
+                                          PayrollDepartment department, User actor) {
+        validatePastOrCurrentPeriod(month, year);
+
+        AttendanceSheet sheet = sheetOf(month, year, department);
+
+        // FIX (11/2026): KHÔNG còn bắt buộc hoàn tất Lương trước khi hoàn tất
+        // KPI/Thưởng — theo yêu cầu, Thưởng/KPI và Lương là 2 phần tách biệt
+        // (áp dụng chung cho FACTORY/ACCOUNTING/SALES/DRIVER).
+
+        // Tính lại KPI/bonus theo bộ phận
+        switch (department) {
+            case FACTORY -> {
+                // Xưởng: tính lại thưởng KPI sản xuất theo sản lượng
+                kpiService.recompute(month, year);
+            }
+            case DRIVER -> {
+                // Tài xế: tính phụ cấp xăng xe cho nhân viên ngoài bộ phận tài xế
+                // (giá xăng và đơn giá có thể null nếu chưa nhập — không bắt buộc)
+                if (sheet.getDriverGasPrice() != null || sheet.getDriverBonusUnitPrice() != null) {
+                    computeNonDriverFuelAllowance(month, year,
+                            sheet.getDriverGasPrice(),
+                            sheet.getDriverBonusUnitPrice(),
+                            sheet.getDriverTruckBonusUnitPrice());
+                }
+            }
+            case ACCOUNTING, SALES, WAREHOUSE -> {
+                // Các bộ phận khác: bonus đã được import qua file Excel (monthly_adjustment).
+                // Không cần tính lại — chỉ chốt cờ để nhân viên thấy.
+                log.info("[Attendance] Hoàn tất KPI/Thưởng {} tháng {}/{}: bonus từ file import.",
+                        department, month, year);
+            }
+        }
+
+        sheet.setKpiFinalized(true);
+        sheet.setKpiFinalizedAt(System.currentTimeMillis());
+        sheet.setKpiFinalizedByName(actor != null ? actor.getFullName() : null);
+        sheetRepo.save(sheet);
+
+        log.info("[Attendance] HOÀN TẤT KPI {} tháng {}/{} bởi {}",
+                department, month, year, actor != null ? actor.getFullName() : "?");
+        return toSheetDto(sheet);
+    }
+
+    /**
+     * Mở lại KPI/Thưởng — nhân viên quay về trạng thái "Đang tính thưởng".
+     * Không ảnh hưởng đến trạng thái lương đã hoàn tất.
+     */
+    @Transactional
+    public AttendanceSheetDto reopenKpi(int month, int year, PayrollDepartment department) {
+        AttendanceSheet sheet = sheetOf(month, year, department);
+        sheet.unfinalizeKpi();
+        sheetRepo.save(sheet);
+        log.info("[Attendance] MỞ LẠI KPI {} tháng {}/{}", department, month, year);
+        return toSheetDto(sheet);
+    }
+
+    /**
+     * [LEGACY] Chốt thâm niên của kỳ — đã tắt tính năng 2026 (xem body).
+     * Mốc đếm năm trước đây là NGÀY CUỐI CỦA KỲ LƯƠNG, không phải lúc bấm nút.
      */
     @Transactional
     public int computeSeniority(int month, int year, PayrollDepartment department, User actor) {
-
-        // Cuối kỳ lương — dùng chung một hàm với HrService để hai bên không bao
-        // giờ lệch định nghĩa "cuối tháng".
-        long referenceDate = HrService.endOfMonthMillis(month, year);
-
-        List<User> employees = deptResolver.employeesOf(department);
-        if (employees.isEmpty()) return 0;
-
-        // Nạp một lượt bản chốt cũ + lương của cả bộ phận thay vì hỏi lẻ từng người.
-        List<Long> userIds = employees.stream().map(User::getId).toList();
-        Map<Long, EmployeeSeniority> existing = seniorityRepo
-                .findByPeriodAndUserIds(month, year, userIds).stream()
-                .collect(Collectors.toMap(s -> s.getUser().getId(), s -> s, (a, b) -> a));
-
-        String actorName = actor != null ? actor.getFullName() : null;
-        long now = System.currentTimeMillis();
-        int count = 0;
-
-        for (User u : employees) {
-            // Lương cơ bản CHUẨN (mức đủ công trong hồ sơ) — gốc để nhân %.
-            long baseSalary = salaryRepo.findAllByUserIdOrderByCreatedAtDesc(u.getId())
-                    .stream().findFirst()
-                    .map(s -> s.getBaseSalary() != null ? s.getBaseSalary() : 0L)
-                    .orElse(0L);
-
-            int years   = SeniorityCalculator.years(u.getWorkStartDate(), referenceDate);
-            int percent = SeniorityCalculator.percentOf(years);
-            long amount = SeniorityCalculator.allowance(baseSalary, percent);
-
-            EmployeeSeniority row = existing.get(u.getId());
-            if (row == null) {
-                row = EmployeeSeniority.builder()
-                        .user(u).month(month).year(year)
-                        .build();
-            }
-            row.setWorkStartDate(u.getWorkStartDate());
-            row.setReferenceDate(referenceDate);
-            row.setYears(years);
-            row.setPercent(percent);
-            row.setBaseSalary(baseSalary);
-            row.setAmount(amount);
-            row.setComputedAt(now);
-            row.setComputedByName(actorName);
-
-            seniorityRepo.save(row);
-            count++;
-        }
-
-        log.info("[Seniority] Đã chốt thâm niên {} nhân viên — {} tháng {}/{}",
-                count, department, month, year);
-        return count;
+        // [ĐÃ BỎ 2026] Công ty ngừng dùng phụ cấp thâm niên → không cần chốt.
+        // Giữ hàm để nơi gọi (finalizePeriod) không phải đổi. Bản chốt cũ trong
+        // employee_seniority KHÔNG bị xóa — chỉ dừng tạo bản mới. Muốn khôi
+        // phục thì restore body cũ từ git.
+        log.debug("[Seniority] Bỏ qua chốt thâm niên (đã tắt tính năng) — {} tháng {}/{}",
+                department, month, year);
+        return 0;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1548,9 +2039,10 @@ public class FactoryPayrollService {
      * Điền các trường lương vào {@link DriverMonthDto} theo cấu hình trên sheet.
      * Chỉ trả lương xe máy (tương thích ngược cho màn hình cũ của tài xế).
      */
-    private void fillDriverSalary(DriverMonthDto dm, AttendanceSheet sheet, boolean requireFinalized) {
+    private void fillDriverSalary(DriverMonthDto dm, AttendanceSheet sheet, boolean requireKpiFinalized) {
         if (dm == null) return;
         boolean finalized = sheet != null && sheet.isFinalized();
+        boolean kpiFinalized = sheet != null && sheet.isKpiFinalized();
         dm.setFinalized(finalized);
 
         Long gasPrice = sheet != null ? sheet.getDriverGasPrice() : null;
@@ -1558,8 +2050,9 @@ public class FactoryPayrollService {
         dm.setGasPrice(gasPrice);
         dm.setBonusUnitPrice(bonusUnitPrice);
 
+        // Chỉ hiện tiền xăng + thưởng khi KPI đã hoàn tất (hoặc không yêu cầu)
         boolean canCompute = gasPrice != null && bonusUnitPrice != null
-                && (!requireFinalized || finalized);
+                && (!requireKpiFinalized || kpiFinalized);
         if (!canCompute) {
             dm.setFuelPay(null); dm.setBonusPay(null); dm.setTotalSalary(null);
             return;
@@ -1590,7 +2083,10 @@ public class FactoryPayrollService {
         Long bonusTruck = sheet != null ? sheet.getDriverTruckBonusUnitPrice() : null;
         boolean finalized = sheet != null && sheet.isFinalized();
 
-        List<User> drivers = deptResolver.employeesOf(PayrollDepartment.DRIVER);
+        // Bao gồm CẢ tài xế đang bị khoá tài khoản: lương tài xế = số km × giá
+        // xăng + số lượt × đơn giá, dựa trên công việc THỰC TẾ đã làm. Tài khoản
+        // bị khoá không phải lý do để trừ lương cho phần đã chạy.
+        List<User> drivers = deptResolver.employeesWithLockedOf(PayrollDepartment.DRIVER);
         List<DriverSalaryRowDto> rows = new ArrayList<>();
         long grand = 0;
 
@@ -1648,6 +2144,10 @@ public class FactoryPayrollService {
                     .build());
         }
 
+        // ── Nhân viên NGOÀI bộ phận Tài xế có hoạt động giao hàng ──────────
+        List<DriverSalaryRowDto> nonDriverRows = buildNonDriverRows(
+                month, year, gasPrice, bonusMoto, bonusTruck, drivers);
+
         return DriverPayrollConfigDto.builder()
                 .month(month).year(year)
                 .gasPrice(gasPrice)
@@ -1658,12 +2158,82 @@ public class FactoryPayrollService {
                 .finalizedByName(sheet != null ? sheet.getFinalizedByName() : null)
                 .grandTotalSalary(grand)
                 .rows(rows)
+                .nonDriverRows(nonDriverRows)
                 .build();
     }
 
     /**
+     * Dựng danh sách nhân viên NGOÀI bộ phận Tài xế nhưng có hoạt động giao hàng.
+     * Dữ liệu chỉ để HIỂN THỊ — khoản phụ cấp thực tế đã lưu ở MonthlyAdjustment.
+     */
+    private List<DriverSalaryRowDto> buildNonDriverRows(int month, int year,
+                                                        Long gasPrice, Long bonusMoto, Long bonusTruck,
+                                                        List<User> driverDeptUsers) {
+        Set<Long> driverDeptIds = driverDeptUsers.stream().map(User::getId).collect(Collectors.toSet());
+        List<Driver> allDrivers = driverRepo.findBySystemDriverFalseOrderByNameAsc();
+        List<DriverSalaryRowDto> result = new ArrayList<>();
+
+        for (Driver driver : allDrivers) {
+            if (driver.getUser() == null) continue;
+            User u = driver.getUser();
+            if (driverDeptIds.contains(u.getId())) continue;
+
+            DriverMonthDto dm = driverKmService.monthOf(u, month, year);
+            double km = dm.getTotalKm() != null ? dm.getTotalKm() : 0;
+            int tripsMoto = dm.getTotalTripsMotorbike() != null ? dm.getTotalTripsMotorbike() : 0;
+            int tripsTrk = dm.getTotalTripsTruck() != null ? dm.getTotalTripsTruck() : 0;
+
+            if (km <= 0 && tripsMoto <= 0 && tripsTrk <= 0) continue;
+
+            VehicleSubtotalDto moto = null;
+            long motoTotal = 0;
+            if (km > 0 || tripsMoto > 0) {
+                Long fuel = gasPrice != null ? Math.round(km * gasPrice) : null;
+                Long bonus = bonusMoto != null ? (long) tripsMoto * bonusMoto : null;
+                if (fuel != null && bonus != null) motoTotal = fuel + bonus;
+                moto = VehicleSubtotalDto.builder()
+                        .totalKm(km).totalTrips(tripsMoto)
+                        .fuelPay(fuel).bonusPay(bonus)
+                        .totalSalary(fuel != null && bonus != null ? motoTotal : null)
+                        .build();
+            }
+
+            VehicleSubtotalDto truck = null;
+            long truckTotal = 0;
+            if (tripsTrk > 0) {
+                Long bonus = bonusTruck != null ? (long) tripsTrk * bonusTruck : null;
+                if (bonus != null) truckTotal = bonus;
+                truck = VehicleSubtotalDto.builder()
+                        .totalTrips(tripsTrk)
+                        .bonusPay(bonus)
+                        .totalSalary(bonus != null ? truckTotal : null)
+                        .build();
+            }
+
+            Long grandTotal = null;
+            if ((moto == null || moto.getTotalSalary() != null)
+                    && (truck == null || truck.getTotalSalary() != null))
+                grandTotal = motoTotal + truckTotal;
+
+            result.add(DriverSalaryRowDto.builder()
+                    .userId(u.getId())
+                    .driverId(dm.getDriverId())
+                    .driverName(u.getFullName())
+                    .vehicleType(dm.getVehicleType())
+                    .motorbike(moto).truck(truck)
+                    .grandTotalSalary(grandTotal)
+                    .department(u.getDepartment())
+                    .position(u.getPosition())
+                    .nonDriver(true)
+                    .build());
+        }
+        return result;
+    }
+
+    /**
      * OWNER nhập / cập nhật giá xăng + đơn giá thưởng (xe máy & xe tải) cho tháng.
-     * Đổi giá gỡ luôn trạng thái Hoàn tất để OWNER kiểm tra rồi bấm Hoàn tất lại.
+     * Đổi giá chỉ gỡ trạng thái "Hoàn tất KPI" (không gỡ "Hoàn tất Lương"),
+     * vì giá xăng thuộc phần bonus/KPI, không phải lương cơ bản.
      */
     @Transactional
     public DriverPayrollConfigDto saveDriverPayrollConfig(int month, int year, Long gasPrice,
@@ -1682,10 +2252,123 @@ public class FactoryPayrollService {
         sheet.setDriverGasPrice(gasPrice);
         sheet.setDriverBonusUnitPrice(bonusUnitPrice);
         sheet.setDriverTruckBonusUnitPrice(truckBonusUnitPrice);
-        if (changed && sheet.isFinalized()) sheet.unfinalize();
+        // Đổi giá → gỡ KPI đã hoàn tất (không ảnh hưởng lương cơ bản)
+        if (changed && sheet.isKpiFinalized()) sheet.unfinalizeKpi();
         sheetRepo.save(sheet);
 
+        // Không tính lại phụ cấp xăng ngay — sẽ tính khi OWNER bấm "Hoàn tất KPI"
         return driverPayrollConfig(month, year);
+    }
+
+    /** Nhãn phụ cấp xăng xe tự động cho nhân viên ngoài bộ phận Tài xế. */
+    private static final String NON_DRIVER_FUEL_LABEL = "Phụ cấp xăng xe";
+    private static final String NON_DRIVER_DELIVERY_LABEL = "Phụ cấp giao hàng";
+
+    /**
+     * Tính phụ cấp xăng xe + phụ cấp giao hàng cho nhân viên KHÔNG thuộc bộ phận
+     * Tài xế nhưng có dữ liệu giao hàng (điểm danh ODO / đơn hàng) trong tháng.
+     *
+     * <p>Tách thành 2 khoản riêng biệt:
+     * <ul>
+     *   <li><b>Phụ cấp xăng xe</b>: tổng km × đơn giá xăng — chi phí xăng thực tế.</li>
+     *   <li><b>Phụ cấp giao hàng</b>: lượt xe máy × đơn giá + lượt xe tải × đơn giá — thưởng theo đơn.</li>
+     * </ul>
+     *
+     * Nhãn kèm chi tiết (km, số lượt) để nhân viên và OWNER đều thấy rõ cơ sở tính.
+     */
+    @Transactional
+    public void computeNonDriverFuelAllowance(int month, int year,
+                                              Long gasPrice, Long bonusMoto, Long bonusTruck) {
+        // Xoá khoản cũ của kỳ trước khi tính lại — cả 2 nhãn (dùng prefix vì label có chi tiết động)
+        monthlyAdjustmentRepo.deleteByPeriodTypeAndLabelPrefix(month, year,
+                MonthlyAdjustment.Type.ALLOWANCE, NON_DRIVER_FUEL_LABEL);
+        monthlyAdjustmentRepo.deleteByPeriodTypeAndLabelPrefix(month, year,
+                MonthlyAdjustment.Type.ALLOWANCE, NON_DRIVER_DELIVERY_LABEL);
+        // Xoá cả nhãn cũ (giao hàng) nếu còn tồn tại từ phiên bản trước
+        monthlyAdjustmentRepo.deleteByPeriodTypeAndLabelPrefix(month, year,
+                MonthlyAdjustment.Type.ALLOWANCE, "Phụ cấp xăng xe (giao hàng)");
+        monthlyAdjustmentRepo.flush();
+
+        if (gasPrice == null && bonusMoto == null && bonusTruck == null) return;
+
+        // Tìm tất cả Driver entity thật (không phải system driver)
+        List<Driver> allDrivers = driverRepo.findBySystemDriverFalseOrderByNameAsc();
+        Set<Long> driverDeptUserIds = deptResolver.employeesOf(PayrollDepartment.DRIVER)
+                .stream().map(User::getId).collect(Collectors.toSet());
+
+        long now = System.currentTimeMillis();
+        List<MonthlyAdjustment> toSave = new ArrayList<>();
+
+        for (Driver driver : allDrivers) {
+            if (driver.getUser() == null) continue;
+            User u = driver.getUser();
+            // Bỏ qua nhân viên thuộc bộ phận Tài xế — họ đã được tính ở bảng lương tài xế
+            if (driverDeptUserIds.contains(u.getId())) continue;
+
+            DriverMonthDto dm = driverKmService.monthOf(u, month, year);
+
+            double km = dm.getTotalKm() != null ? dm.getTotalKm() : 0;
+            int tripsMoto = dm.getTotalTripsMotorbike() != null ? dm.getTotalTripsMotorbike() : 0;
+            int tripsTrk = dm.getTotalTripsTruck() != null ? dm.getTotalTripsTruck() : 0;
+            int ordersMoto = dm.getTotalOrdersMotorbike() != null ? dm.getTotalOrdersMotorbike() : 0;
+            int ordersTrk = dm.getTotalOrdersTruck() != null ? dm.getTotalOrdersTruck() : 0;
+
+            // Chỉ tính nếu có hoạt động giao hàng trong tháng
+            if (km <= 0 && tripsMoto <= 0 && tripsTrk <= 0) continue;
+
+            PayrollDepartment dept = deptResolver.departmentOf(u);
+            String deptCode = dept != null ? dept.name() : null;
+
+            // ── Khoản 1: PHỤ CẤP XĂNG XE (km × giá xăng) ────────────────
+            long fuelPay = gasPrice != null ? Math.round(km * gasPrice) : 0L;
+            if (fuelPay > 0) {
+                String fuelLabel = NON_DRIVER_FUEL_LABEL
+                        + " (" + fmtNum(km) + " km × " + fmtNum(gasPrice) + "đ)";
+                toSave.add(MonthlyAdjustment.builder()
+                        .user(u)
+                        .month(month).year(year)
+                        .type(MonthlyAdjustment.Type.ALLOWANCE)
+                        .department(deptCode)
+                        .label(fuelLabel)
+                        .amount(fuelPay)
+                        .createdAt(now)
+                        .build());
+            }
+
+            // ── Khoản 2: PHỤ CẤP GIAO HÀNG (lượt × đơn giá thưởng) ──────
+            long bonusMotoAmt = bonusMoto != null ? (long) tripsMoto * bonusMoto : 0L;
+            long bonusTruckAmt = bonusTruck != null ? (long) tripsTrk * bonusTruck : 0L;
+            long deliveryPay = bonusMotoAmt + bonusTruckAmt;
+            if (deliveryPay > 0) {
+                String deliveryLabel = NON_DRIVER_DELIVERY_LABEL;
+                List<String> parts = new ArrayList<>();
+                if (tripsMoto > 0 && bonusMoto != null)
+                    parts.add(tripsMoto + " lượt xe máy × " + fmtNum(bonusMoto) + "đ");
+                if (tripsTrk > 0 && bonusTruck != null)
+                    parts.add(tripsTrk + " lượt xe tải × " + fmtNum(bonusTruck) + "đ");
+                if (!parts.isEmpty())
+                    deliveryLabel += " (" + String.join(" + ", parts) + ")";
+                toSave.add(MonthlyAdjustment.builder()
+                        .user(u)
+                        .month(month).year(year)
+                        .type(MonthlyAdjustment.Type.ALLOWANCE)
+                        .department(deptCode)
+                        .label(deliveryLabel)
+                        .amount(deliveryPay)
+                        .createdAt(now)
+                        .build());
+            }
+
+            log.info("[DriverFuel] {} ({}) — {}: {}km → xăng {}đ | moto {}lượt/{}đơn, tải {}lượt/{}đơn → giao hàng {}đ",
+                    u.getFullName(), u.getId(), deptCode, km, fuelPay,
+                    tripsMoto, ordersMoto, tripsTrk, ordersTrk, deliveryPay);
+        }
+
+        if (!toSave.isEmpty()) {
+            monthlyAdjustmentRepo.saveAll(toSave);
+            log.info("[DriverFuel] Đã lưu {} khoản phụ cấp cho nhân viên ngoài bộ phận Tài xế, tháng {}/{}",
+                    toSave.size(), month, year);
+        }
     }
 
     /**
@@ -1737,13 +2420,20 @@ public class FactoryPayrollService {
         long orderBonusTruck = bonusTruck != null ? (long) tripsTruck * bonusTruck : 0L;
         long orderBonus = orderBonusMoto + orderBonusTruck;
 
-        // Chi tiết thưởng đơn hàng để FE render 3 dòng (xe máy / xe tải / tổng).
+        // ── TỔNG "Thưởng KPI 100%" của tài xế ────────────────────────────────
+        //   Gom TIỀN XĂNG + THƯỞNG ĐƠN HÀNG (xe máy + xe tải) thành một dòng
+        //   duy nhất "Thưởng KPI — đạt 100%" trên phiếu lương, thay vì tách gas
+        //   ra allowances và orderBonus lên riêng. Card chi tiết bên dưới (do FE
+        //   render từ driverOrderBonusDetail) vẫn giữ đủ 3 hạng mục.
+        long driverKpi100 = gasAllowance + orderBonus; // = gas + moto + truck
+
         com.nhatnam.server.dto.hr.HrDtos.DriverOrderBonusDto orderBonusDetail = null;
-        if (orderBonus > 0) {
+        if (driverKpi100 > 0) {
             orderBonusDetail = com.nhatnam.server.dto.hr.HrDtos.DriverOrderBonusDto.builder()
                     .motorbikeTrips(tripsMoto).motorbikeAmount(orderBonusMoto)
                     .truckTrips(tripsTruck).truckAmount(orderBonusTruck)
-                    .totalAmount(orderBonus)
+                    .gasKm(km).gasPrice(gasPrice).gasAmount(gasAllowance)
+                    .totalAmount(driverKpi100)
                     .build();
         }
 
@@ -1774,31 +2464,26 @@ public class FactoryPayrollService {
             }
         }
 
-        // Chèn 2 khoản đặc thù tài xế Ở ĐẦU danh sách (hiển thị trước các phụ
-        // cấp khác — bám đúng thứ tự bạn mô tả).
-        // Cơm trưa & xăng xe theo Thông tư 111/2013: không tính vào thu nhập
-        // chịu thuế TNCN (trong định mức doanh nghiệp quy định).
+        // ── Chỉ giữ PHỤ CẤP CƠM TRƯA trong allowances ────────────────────────
+        //   Tiền xăng đã CHUYỂN sang "Thưởng KPI — đạt 100%" nên KHÔNG chèn vào
+        //   allowances nữa (nếu chèn sẽ bị đếm 2 lần).
+        //   Cơm trưa theo Thông tư 111/2013: không tính vào thu nhập chịu thuế
+        //   TNCN (trong định mức doanh nghiệp quy định).
         if (mealAllowance > 0)
             allowances.add(0, AllowanceItemDto.builder()
                     .label("Phụ cấp cơm trưa (" + mealDays + " ngày × 30.000)")
                     .amount(mealAllowance).taxable(false).build());
-        if (gasAllowance > 0)
-            allowances.add(mealAllowance > 0 ? 1 : 0, AllowanceItemDto.builder()
-                    .label("Phụ cấp xăng xe (" + fmtNum(km) + " km × " + fmtNum(gasPrice) + "đ)")
-                    .amount(gasAllowance).taxable(false).build());
 
         // ── Build request + gọi HR service để có breakdown chuẩn ─────────────
-        //   Thưởng đơn hàng (orderBonus) tách RIÊNG khỏi thưởng KPI — thưởng KPI
-        //   giữ nguyên cách của HR (bằng 0 cho tài xế trừ khi có cấu hình riêng),
-        //   còn orderBonus cộng thẳng vào net sau khi HR tính xong. Trong FE hiện
-        //   thành dòng "Thưởng đơn hàng" đứng trước "Thưởng KPI".
+        //   Truyền driverKpi100 là BONUS KHÔNG CHỊU THUẾ — HR tính GROSS/NET có
+        //   sẵn phần này rồi nên KHÔNG cộng lại ở dưới, tránh double count.
         SalaryRequest req = new SalaryRequest();
         req.setUserId(userId);
         req.setBaseSalary(baseSalary);
         req.setInsuranceSalary(insSalaryRaw);   // null = mặc định = baseSalary
         req.setDependents(dependents);
         req.setAllowances(allowances);
-        req.setBonus(0L);
+        req.setBonus(driverKpi100);
         req.setBonusTaxable(false);
         // Truyền month/year để HR service tự nạp phụ cấp/thưởng import từ
         // MonthlyAdjustment (Chuyên cần, Xăng xe kho…). Nhờ đó Chuyên cần hiển
@@ -1807,23 +2492,26 @@ public class FactoryPayrollService {
         req.setYear(year);
         SalaryBreakdownDto dto = hrService.previewSalary(req);
 
-        // Cộng thưởng đơn hàng (không tính thuế) vào lương thực nhận + đánh dấu
-        // driverOrderBonus cho FE hiển thị.
-        if (dto != null && orderBonus > 0) {
-            long curNet = dto.getNetSalary() != null ? dto.getNetSalary() : 0L;
-            dto.setNetSalary(curNet + orderBonus);
-            if (dto.getNetSalaryExact() != null)
-                dto.setNetSalaryExact(dto.getNetSalaryExact() + orderBonus);
+        // ── Ghi cờ để FE hiện dòng "Thưởng KPI — đạt 100%" + card chi tiết ──
+        //   HR đã gộp driverKpi100 vào effectiveBonus (do req.bonus truyền vào).
+        //   Ép kpiPercent = 100 cho tài xế — không phụ thuộc PayrollInputProvider —
+        //   để label "đạt 100%" luôn đúng. driverOrderBonus / Detail để FE render
+        //   thêm card "Chi tiết Thưởng KPI 100%" (xăng + xe máy + xe tải) bên dưới.
+        if (dto != null) {
+            dto.setKpiPercent(100.0);
+            dto.setDriverOrderBonus(driverKpi100);
+            if (orderBonusDetail != null) dto.setDriverOrderBonusDetail(orderBonusDetail);
         }
-        if (dto != null) dto.setDriverOrderBonus(orderBonus);
-        if (dto != null && orderBonusDetail != null) dto.setDriverOrderBonusDetail(orderBonusDetail);
         return dto;
     }
 
     private static String fmtNum(Number n) {
         if (n == null) return "0";
-        long v = n.longValue();
-        return String.format(java.util.Locale.GERMANY, "%,d", v);
+        double d = n.doubleValue();
+        if (d == Math.floor(d)) {
+            return String.format(java.util.Locale.GERMANY, "%,d", n.longValue());
+        }
+        return String.format(java.util.Locale.GERMANY, "%,.1f", d);
     }
 
     /** Mở lại tháng đã hoàn tất (nhân viên quay về trạng thái "Đang xử lý lương"). */
@@ -1849,18 +2537,24 @@ public class FactoryPayrollService {
         AttendanceSheet sheet = sheetRepo
                 .findByMonthAndYearAndDepartment(month, year, department).orElse(null);
 
-        List<User> employees = deptResolver.employeesOf(department);
+        // Bảng lương của bộ phận: LẤY CẢ nhân viên đang bị khoá tài khoản để
+        // vẫn tính đủ lương theo chấm công đã có (nhân viên có thể đi làm rồi
+        // mới bị khoá trong tháng). Phần THƯỞNG/KPI cho họ sẽ tự bằng 0 ở dưới
+        // (kpiByUser không có entry, HrService.getSalaryBreakdownForUser zero
+        // bonus khi user bị khoá).
+        List<User> employees = deptResolver.employeesWithLockedOf(department);
 
-        // ── KPI của tháng — chỉ bộ phận Xưởng ────────────────────────────────
+        // ── KPI của tháng — chỉ bộ phận Xưởng, CHỈ khi KPI đã hoàn tất ────────
         //
         // Dùng find() chứ KHÔNG getOrCompute(): màn hình này phải phân biệt được
         // "chưa tính KPI" với "đã tính, quỹ bằng 0". getOrCompute sẽ âm thầm tính
         // ngay khi ai đó mở trang, khiến trạng thái "chưa tính" không bao giờ tồn
         // tại và OWNER mất khả năng thấy mình còn thiếu bước nào.
-        // KPI được tính ở đúng hai chỗ có chủ đích: bấm "Hoàn tất" và bấm "Tính lại".
+        // KPI được tính ở đúng hai chỗ có chủ đích: bấm "Hoàn tất KPI" và bấm "Tính lại".
+        boolean kpiReady = sheet != null && sheet.isKpiFinalized();
         Map<Long, Long> kpiByUser = new HashMap<>();
         FactoryKpiBonus kpi = null;
-        if (department.isKpiBonus()) {
+        if (department.isKpiBonus() && kpiReady) {
             try {
                 kpi = kpiService.find(month, year).orElse(null);
                 if (kpi != null) {
@@ -1879,12 +2573,32 @@ public class FactoryPayrollService {
         for (User u : employees) {
             // Truyền kỳ lương để lương Xưởng được chia theo NGÀY CÔNG của tháng này
             SalaryBreakdownDto s = hrService.getSalaryBreakdownForUser(u.getId(), month, year);
+
+            // ── FIX (10/2026): LOẠI 2 NHÓM khỏi bảng phiếu lương preview ─────
+            //
+            //   (a) Nhân viên không có hồ sơ lương APPROVED. Trước đây các
+            //       dòng này hiện với 0đ + nhãn "chưa có hồ sơ lương" làm bảng
+            //       lộn xộn + bị cộng nhầm vào các export. Nay chỉ hiển thị
+            //       người đã có hồ sơ được duyệt.
+            //
+            //   (b) Nhân viên {@link PayrollDepartmentResolver#isAttendanceExempt}
+            //       — hiện là FACTORY_SECURITY (Bảo vệ Q9). Đây là đơn vị thuê
+            //       ngoài khoán trọn tháng, không nằm trong hệ thống lương công
+            //       ty: không có hồ sơ lương, không chấm công, không export
+            //       cùng với CBCNV khác.
+            //
+            //   NO_SALARY cũ (null status) và REJECTED đều bị loại — chỉ status
+            //   == "APPROVED" là qua. SalaryBreakdown của người không có hồ sơ
+            //   có status null, không phải "APPROVED" nên bị filter.
+            if (deptResolver.isAttendanceExempt(u)) continue;
+            if (s == null || !"APPROVED".equalsIgnoreCase(s.getStatus())) continue;
+
             AttendanceEntry e = department.isAttendanceBased()
                     ? entryRepo.findByUserAndPeriod(u.getId(), month, year).orElse(null)
                     : null;
 
             long kpiAmount = kpiByUser.getOrDefault(u.getId(), 0L);
-            boolean exempt = deptResolver.isAttendanceExempt(u);
+            boolean exempt = false;   // đã filter ở trên, giữ biến để tương thích code dưới
 
             DepartmentPayrollRowDto.DepartmentPayrollRowDtoBuilder rb = DepartmentPayrollRowDto.builder()
                     .userId(u.getId())
@@ -1923,17 +2637,40 @@ public class FactoryPayrollService {
             if (e != null) {
                 // Tính lại công chuẩn thay vì đọc số đã lưu — xem ghi chú ở
                 // buildAttendanceSummary về các bản ghi import trước khi sửa lỗi.
+                //
+                // FIX (10/2026): hiển thị actualDays từ SalaryBreakdown (đã
+                // bao gồm công lễ + ManualAttendanceOverrides), không phải
+                // entry.actualDays thô. Trước đây hai nguồn lệch nhau:
+                //   - Tiến Vinh: entry.actualDays = 19.5 (chấm công), nhưng
+                //     HrService dùng 21.5 (+ 2 công lễ) tính lương 5.142.635đ.
+                //     Preview hiện 19.5/26 nhưng tiền tính theo 21.5 → user
+                //     thấy "19.5 công sao được 5.1 triệu".
+                //   - Tuấn Tài: entry.actualDays = 18 nhưng override = 19.
+                // Giờ hiển thị số HrService đã dùng → tiền và công khớp nhau.
+                Double displayDays = (s != null && s.getActualWorkdays() != null)
+                        ? s.getActualWorkdays()
+                        : e.getActualDays();
                 rb.standardDays(standardWorkdaysOf(month, year))
-                        .actualDays(e.getActualDays())
+                        .actualDays(displayDays)
                         .presentDays(e.getPresentDays())
                         .lateCount(e.getLateCount()).lateMinutes(e.getLateMinutes())
                         .earlyCount(e.getEarlyCount()).earlyMinutes(e.getEarlyMinutes())
                         .employeeCode(e.getEmployeeCode());
             } else if (department.isAttendanceBased() && !exempt) {
-                // Bỏ trống với người được miễn chấm công — điền 0 sẽ khiến bảng
-                // trông như họ nghỉ cả tháng và bị trừ hết công.
-                rb.standardDays(standardWorkdaysOf(month, year))
-                        .actualDays(0.0).presentDays(0)
+                // SALES / ACCOUNTING / WAREHOUSE: file chấm công tuỳ chọn. Không có file
+                // thì HrService đã trả full lương + phụ cấp cơm đủ công chuẩn — cột
+                // "ngày công" cũng phải hiển thị đủ để bảng không mâu thuẫn với cột
+                // lương (0 công nhưng lương full trông như lỗi).
+                //
+                // FACTORY bắt buộc có file (Phase 1: MANAGEMENT đã gỡ), nên vào
+                // nhánh này chỉ khi nhân viên vắng toàn tháng → giữ 0 công.
+                double std = standardWorkdaysOf(month, year);
+                boolean fileOptional = department == PayrollDepartment.SALES
+                        || department == PayrollDepartment.ACCOUNTING
+                        || department == PayrollDepartment.WAREHOUSE;
+                rb.standardDays(std)
+                        .actualDays(fileOptional ? std : 0.0)
+                        .presentDays(fileOptional ? (int) Math.round(std) : 0)
                         .lateCount(0).lateMinutes(0).earlyCount(0).earlyMinutes(0);
             }
 
@@ -1942,6 +2679,30 @@ public class FactoryPayrollService {
                 DriverMonthDto dm = driverKmService.monthOf(u, month, year);
                 rb.totalKm(dm.getTotalKm()).totalOrders(dm.getTotalOrders());
             }
+
+            // ── netReceived — KHỚP với bank/salary export ─────────────────
+            //   = roundUpToThousand( baseSalary + Σ visible allowances )
+            //   Visible: tất cả allowance của breakdown trừ các khoản auto-
+            //   generated từ hỗ trợ giao hàng và (với tài xế) phụ cấp xăng xe.
+            long baseForNet = nz(s.getBaseSalary());
+            long allowanceSum = 0L;
+            if (s.getAllowances() != null) {
+                for (var a : s.getAllowances()) {
+                    if (a == null || a.getLabel() == null) continue;
+                    String label = a.getLabel();
+                    // Bỏ auto-generated km/giao hàng — khớp isAutoGeneratedDeliveryAllowance
+                    // ở BankPaymentExportService (keyword "km ×" / "lượt ×" trong nhãn).
+                    if (label.contains("km ×") || label.contains("lượt ×")) continue;
+                    // Tài xế: bỏ phụ cấp xăng xe (đã tính riêng ở file thưởng)
+                    String base = label.replaceAll("\\s*\\(.*\\)\\s*", "").trim();
+                    if (!department.isAttendanceBased()
+                            && "Phụ cấp xăng xe".equals(base)) continue;
+                    allowanceSum += nz(a.getAmount());
+                }
+            }
+            long net = com.nhatnam.server.utils.ManualAttendanceOverrides
+                    .roundUpToThousand(baseForNet + allowanceSum);
+            rb.netReceived(net);
 
             rows.add(rb.build());
         }
@@ -1960,16 +2721,17 @@ public class FactoryPayrollService {
                 .month(month).year(year).periodLabel(periodLabel(month, year))
                 .department(department.name()).departmentLabel(department.getLabel())
                 .finalized(sheet != null && sheet.isFinalized())
+                .kpiFinalized(sheet != null && sheet.isKpiFinalized())
                 .attendanceBased(department.isAttendanceBased())
                 .hasKpiBonus(department.isKpiBonus())
                 .employeeCount(rows.size())
                 .totalNetSalary(totalNet)
                 .totalGrossSalary(totalGross)
-                .totalKpiBonus(totalKpi)
-                .kpiComputed(kpi != null)
+                .totalKpiBonus(sheet != null && sheet.isKpiFinalized() ? totalKpi : 0L)
+                .kpiComputed(kpi != null && sheet != null && sheet.isKpiFinalized())
                 .rows(rows);
 
-        if (kpi != null) {
+        if (kpi != null && sheet != null && sheet.isKpiFinalized()) {
             out.kpiTotalOutputKg(kpi.getTotalOutputKg())
                     .kpiTotalOutputTon(kpi.getTotalOutputTon())
                     .kpiRatePerTon(kpi.getRatePerTon())
@@ -2106,14 +2868,29 @@ public class FactoryPayrollService {
     }
 
     /** Chặn xem/upload tháng hiện tại hoặc tương lai — chỉ cho tháng ĐÃ QUA. */
-    public void validatePastPeriod(int month, int year) {
+    public void validateViewPeriod(int month, int year, PayrollDepartment department) {
         YearMonth target = YearMonth.of(year, month);
         YearMonth current = YearMonth.now(VN);
-        if (!target.isBefore(current)) {
-            throw new IllegalArgumentException(
-                    "Chỉ xem/tải được các tháng đã kết thúc. Tháng %d/%d chưa hết.".formatted(month, year));
+
+        // Tháng đã qua → luôn cho phép
+        if (target.isBefore(current)) {
+            return;
         }
+
+        // Tháng hiện tại hoặc tương lai → chỉ cho phép nếu đã chốt
+        if (department != null) {
+            AttendanceSheet sheet = sheetRepo
+                    .findByMonthAndYearAndDepartment(month, year, department)
+                    .orElse(null);
+            if (sheet != null && sheet.isFinalized()) {
+                return; // Đã chốt → cho phép xem
+            }
+        }
+
+        throw new IllegalArgumentException(
+                "Tháng %d/%d chưa được chốt hoặc chưa kết thúc.".formatted(month, year));
     }
+
 
     /** Cho phép tháng hiện tại + quá khứ, chặn tương lai. */
     public void validateUploadPeriod(int month, int year) {
@@ -2193,4 +2970,650 @@ public class FactoryPayrollService {
                 .replaceAll("\\p{InCombiningDiacriticalMarks}+", "")
                 .replace('đ', 'd').replace('Đ', 'D');
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // KPI & BONUS PLACEHOLDER — KẾ TOÁN VÀ KINH DOANH
+    // ══════════════════════════════════════════════════════════════════════════
+
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // HOÀN TẤT / MỞ LẠI THƯỞNG DOANH THU (chỉ SALES và ACCOUNTING)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Tính và chốt thưởng doanh thu cho SALES hoặc ACCOUNTING.
+     *
+     * <p>Flow:
+     * <ol>
+     *   <li>Xác định khoảng thời gian = đầu/cuối tháng (giờ VN).</li>
+     *   <li>Query {@link PaymentTransactionRepository} lấy tổng tiền THỰC THU
+     *       trong khoảng đó (chỉ đơn PENDING_PAYMENT / COMPLETED).</li>
+     *   <li>Tính thưởng theo thang doanh thu.</li>
+     *   <li>Xoá {@link OfficeBonusResult} cũ (nếu có) rồi ghi mới.</li>
+     *   <li>Set {@code bonusFinalized = true} trên {@link AttendanceSheet}.</li>
+     * </ol>
+     *
+     * <h3>Thang thưởng</h3>
+     * <pre>
+     * R ≥ 100tr  → bonusUnit = 400.000đ / 100tr (nhân với số lần 100tr, phần lẻ nội suy)
+     * 70tr ≤ R &lt; 100tr → nội suy tuyến tính 0đ → 400.000đ (trong dải 70–100tr)
+     * R &lt; 70tr   → 0đ (triển khai sau)
+     * </pre>
+     *
+     * <h3>Phân chia</h3>
+     * <ul>
+     *   <li>ACCOUNTING: chia đều cho nhân viên có {@code receiveBonus = true}.</li>
+     *   <li>SALES: mỗi seller tính riêng từ doanh thu đơn của họ.</li>
+     * </ul>
+     *
+     * <p>Phải gọi sau khi đã {@link #finalizeKpi} (kpiFinalized = true).
+     */
+    @Transactional
+    public OfficeBonusSummaryDto finalizeBonus(int month, int year,
+                                               PayrollDepartment department, User actor) {
+        return finalizeBonus(month, year, department, actor, null);
+    }
+
+    /**
+     * Overload 11/2026: nhận đơn giá hoa hồng do OWNER nhập mỗi tháng.
+     * Xem {@link OfficeBonusCommissionUtil} cho công thức:
+     *   - SALES: per-seller, làm tròn LÊN 5.000.
+     *   - ACCOUNTING: pool chung chia theo trọng số (KTT=2, CV=1), unitShare
+     *     làm tròn XUỐNG 5.000, phần dư bỏ.
+     * Khi {@code unitPrice == null} → fallback công thức tier-based cũ (legacy).
+     */
+    @Transactional
+    public OfficeBonusSummaryDto finalizeBonus(int month, int year,
+                                               PayrollDepartment department,
+                                               User actor, Long unitPrice) {
+        validatePastOrCurrentPeriod(month, year);
+
+        if (department != PayrollDepartment.SALES && department != PayrollDepartment.ACCOUNTING)
+            throw new IllegalArgumentException(
+                    "Hoàn tất Thưởng chỉ áp dụng cho SALES và ACCOUNTING, không phải " + department.getLabel());
+
+        AttendanceSheet sheet = sheetOf(month, year, department);
+
+        // FIX (11/2026): KHÔNG còn bắt buộc hoàn tất Lương trước khi tính hoa
+        // hồng — theo yêu cầu, hoa hồng và lương là 2 phần tách biệt.
+        //
+        // Flow mới (unitPrice != null) cũng KHÔNG đòi finalizeKpi; chỉ chế độ
+        // legacy tier-based (unitPrice == null) mới cần — bỏ cả check này cho
+        // nhất quán.
+
+        if (unitPrice != null && unitPrice <= 0)
+            throw new IllegalArgumentException("Đơn giá hoa hồng phải > 0.");
+
+        // Biên tháng theo giờ VN — bao gồm 00:00 đầu tháng, exclusive đến đầu
+        // tháng kế. Nhờ đó đơn thu 06:00 ngày 1/9 VN được tính vào tháng 9.
+        java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+        long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+        long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+
+        long now = System.currentTimeMillis();
+        String actorName = actor != null ? actor.getFullName() : "system";
+
+        // Xoá kết quả cũ trước khi tính lại
+        officeBonusResultRepo.deleteByMonthAndYearAndDepartment(month, year, department);
+        officeBonusResultRepo.flush();
+
+        OfficeBonusResult result;
+        List<OfficeBonusItem> items = new ArrayList<>();
+
+        if (department == PayrollDepartment.ACCOUNTING) {
+            // Tất cả đơn trong tháng, không phân biệt người tạo
+            java.math.BigDecimal totalRev = paymentTransactionRepo.sumRevenueAllOrders(startMs, endMs);
+            if (totalRev == null) totalRev = java.math.BigDecimal.ZERO;
+            long txCount = paymentTransactionRepo.countTransactionsAllOrders(startMs, endMs);
+
+            // Lấy danh sách nhân viên kế toán có receiveBonus = true, SORT theo
+            // thứ tự chức vụ trong PayrollDepartment (KTT trước chuyên viên)
+            List<User> bonusEligible = deptResolver.employeesOf(PayrollDepartment.ACCOUNTING)
+                    .stream()
+                    .filter(u -> !Boolean.FALSE.equals(u.getReceiveBonus()))
+                    .sorted(Comparator.comparingInt(u -> roleSortOrderIn(PayrollDepartment.ACCOUNTING, u)))
+                    .toList();
+
+            long pool;
+            List<AccountingShare> shares;
+            if (unitPrice != null) {
+                // ── Flow MỚI (11/2026): chia theo trọng số, unitShare floor 5k ──
+                java.math.BigDecimal rawPool =
+                        OfficeBonusCommissionUtil.rawCommission(totalRev, unitPrice);
+                List<UserWeight> weights = bonusEligible.stream()
+                        .map(u -> new UserWeight(
+                                u.getId(),
+                                OfficeBonusCommissionUtil.accountingWeightOf(deptResolver.payrollRoleOf(u))))
+                        .toList();
+                shares = OfficeBonusCommissionUtil.splitAccountingPool(rawPool, weights);
+                pool = shares.stream().mapToLong(AccountingShare::bonusAmount).sum();
+            } else {
+                // ── LEGACY tier-based: chia đều cho tất cả, trọng số = 1 ──
+                long tierPool = calcBonusFromRevenue(totalRev);
+                long perPerson = bonusEligible.isEmpty() ? 0L
+                        : (tierPool / bonusEligible.size() / 100_000) * 100_000;
+                pool = perPerson * (long) bonusEligible.size();
+                final long pp = perPerson;
+                shares = bonusEligible.stream()
+                        .map(u -> new AccountingShare(u.getId(), pp, 1))
+                        .toList();
+            }
+
+            final java.math.BigDecimal finalTotalRev = totalRev;
+            final long finalTxCount = txCount;
+            result = OfficeBonusResult.builder()
+                    .month(month).year(year).department(department)
+                    .totalRevenue(finalTotalRev)
+                    .totalBonusPool(pool)
+                    .commissionUnitPrice(unitPrice)
+                    .transactionCount((int) finalTxCount)
+                    .computedAt(now).computedByName(actorName)
+                    .build();
+            result = officeBonusResultRepo.save(result);
+
+            Map<Long, AccountingShare> byUser = new HashMap<>();
+            for (AccountingShare s : shares) byUser.put(s.userId(), s);
+
+            for (User u : bonusEligible) {
+                AccountingShare s = byUser.get(u.getId());
+                OfficeBonusItem item = OfficeBonusItem.builder()
+                        .bonusResult(result)
+                        .user(u)
+                        .userFullName(u.getFullName())
+                        .roleLabel(deptResolver.roleLabelOf(u))
+                        .revenue(finalTotalRev)         // kế toán thấy doanh thu chung
+                        .bonusAmount(s != null ? s.bonusAmount() : 0L)
+                        .kpiPercent(100.0)              // KPI = 100% (snapshot)
+                        .transactionCount((int) finalTxCount)
+                        .build();
+                items.add(item);
+            }
+
+        } else {
+            // SALES — mỗi seller tính riêng từ đơn của mình.
+            // Danh sách bao gồm NV phòng KD + extras ngoài phòng có tạo đơn
+            // trong tháng (vd nhân viên Kho được phép tạo đơn).
+            List<User> sellers = buildSalesBonusEligible(startMs, endMs);
+            java.math.BigDecimal deptTotalRev = java.math.BigDecimal.ZERO;
+            long deptPool = 0L;
+            int  deptTxCount = 0;
+
+            result = OfficeBonusResult.builder()
+                    .month(month).year(year).department(department)
+                    .commissionUnitPrice(unitPrice)
+                    .computedAt(now).computedByName(actorName)
+                    .build();
+            result = officeBonusResultRepo.save(result);
+
+            for (User u : sellers) {
+                java.math.BigDecimal sellerRev = paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId());
+                if (sellerRev == null) sellerRev = java.math.BigDecimal.ZERO;
+                long sellerTx = paymentTransactionRepo.countTransactionsByUser(startMs, endMs, u.getId());
+
+                long sellerBonus;
+                if (unitPrice != null) {
+                    // Flow MỚI: raw × unitPrice / 100tr, ceil 5k
+                    sellerBonus = OfficeBonusCommissionUtil.salesCommission(sellerRev, unitPrice);
+                } else {
+                    // LEGACY: tier-based, floor 100k
+                    long raw = calcBonusFromRevenue(sellerRev);
+                    sellerBonus = (raw / 100_000) * 100_000;
+                }
+
+                deptTotalRev = deptTotalRev.add(sellerRev);
+                deptPool    += sellerBonus;
+                deptTxCount += (int) sellerTx;
+
+                OfficeBonusItem item = OfficeBonusItem.builder()
+                        .bonusResult(result)
+                        .user(u)
+                        .userFullName(u.getFullName())
+                        .roleLabel(deptResolver.roleLabelOf(u))
+                        .revenue(sellerRev)
+                        .bonusAmount(sellerBonus)
+                        .kpiPercent(100.0)
+                        .transactionCount((int) sellerTx)
+                        .build();
+                items.add(item);
+            }
+
+            // Cập nhật tổng vào result
+            result.setTotalRevenue(deptTotalRev);
+            result.setTotalBonusPool(deptPool);
+            result.setTransactionCount(deptTxCount);
+            result = officeBonusResultRepo.save(result);
+        }
+
+        // Lưu items
+        final OfficeBonusResult savedResult = result;
+        items.forEach(i -> i.setBonusResult(savedResult));
+        savedResult.getItems().addAll(items);
+        officeBonusResultRepo.save(savedResult);
+
+        // Chốt cờ bonus
+        sheet.setBonusFinalized(true);
+        sheet.setBonusFinalizedAt(now);
+        sheet.setBonusFinalizedByName(actorName);
+        sheetRepo.save(sheet);
+
+        log.info("[Payroll] HOÀN TẤT THƯỞNG {} tháng {}/{}: unitPrice={} pool={}đ bởi {}",
+                department, month, year, unitPrice, savedResult.getTotalBonusPool(), actorName);
+
+        return toOfficeBonusSummaryDto(savedResult);
+    }
+
+    /**
+     * Thứ tự sort theo chức vụ trong 1 bộ phận — dùng trong finalizeBonus +
+     * getOfficeBonusPreview để KTT luôn đứng trước chuyên viên, trưởng phòng
+     * trước nhân viên. Role không có → cuối bảng.
+     */
+    private int roleSortOrderIn(PayrollDepartment dept, User u) {
+        Role r = deptResolver.payrollRoleOf(u);
+        if (r == null) return Integer.MAX_VALUE;
+        int idx = dept.getRoles().indexOf(r);
+        return idx < 0 ? Integer.MAX_VALUE : idx;
+    }
+
+    /**
+     * Danh sách người được chia HOA HỒNG KINH DOANH trong 1 tháng:
+     * <ul>
+     *   <li>Nhân viên phòng Kinh doanh (có {@code receiveBonus != false}) —
+     *       luôn hiển thị dù trong tháng không có đơn.</li>
+     *   <li>Nhân viên NGOÀI phòng Kinh doanh (vd Kho) có TẠO ít nhất 1 đơn
+     *       trong tháng — lương vẫn tính theo phòng gốc, nhưng thưởng doanh
+     *       thu tính ở đây.</li>
+     * </ul>
+     *
+     * <p>Sort: SELLER theo thứ tự chức vụ (Trưởng phòng → NV), rồi đến extras
+     * (các bộ phận khác có tạo đơn) sort theo tên.
+     */
+    private List<User> buildSalesBonusEligible(long startMs, long endMs) {
+        // 1) SALES core — luôn có
+        List<User> salesCore = deptResolver.employeesOf(PayrollDepartment.SALES).stream()
+                .filter(u -> !Boolean.FALSE.equals(u.getReceiveBonus()))
+                .sorted(Comparator.comparingInt(u -> roleSortOrderIn(PayrollDepartment.SALES, u)))
+                .toList();
+        Set<Long> salesIds = salesCore.stream().map(User::getId).collect(java.util.stream.Collectors.toSet());
+
+        // 2) Extras — nhân viên ngoài SALES có tạo đơn trong tháng
+        //    Load tất cả qua findById và filter: khoá/xoá/no-dept/no-receive-bonus bị loại.
+        //    Người không có PayrollDepartment (OWNER/ADMIN/HR...) cũng loại — họ không
+        //    nhận thưởng doanh thu kể cả khi tạo đơn hộ.
+        List<Long> creatorIds = orderRepository.findDistinctOrderCreatorsInRange(startMs, endMs);
+        List<User> extras = creatorIds.stream()
+                .filter(id -> !salesIds.contains(id))
+                .map(id -> userRepo.findById(id).orElse(null))
+                .filter(java.util.Objects::nonNull)
+                .filter(u -> !u.isLockAccount())
+                .filter(u -> !u.isDeleted())
+                .filter(u -> !Boolean.FALSE.equals(u.getReceiveBonus()))
+                .filter(u -> deptResolver.departmentOf(u) != null)
+                .sorted(Comparator.comparing(u -> u.getFullName() != null ? u.getFullName() : ""))
+                .toList();
+
+        List<User> result = new ArrayList<>(salesCore);
+        result.addAll(extras);
+        return result;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PREVIEW HOA HỒNG — hoạt động cả khi CHƯA tính (11/2026)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Preview Thưởng/Hoa hồng cho SALES hoặc ACCOUNTING — trả CẢ khi chưa tính
+     * (bonusAmount = null) và sau khi đã tính.
+     *
+     * <h3>Trả về</h3>
+     * <ul>
+     *   <li>3 stat phòng: totalMonthOrderRevenue, totalCollectedRevenue,
+     *       totalHoldRevenue, transactionCount.</li>
+     *   <li>items[]: mỗi nhân viên 1 dòng, sort theo chức vụ.</li>
+     *   <li>lastCommissionUnitPrice: đơn giá tháng gần nhất đã có — FE dùng
+     *       làm placeholder ô input.</li>
+     * </ul>
+     */
+    @Transactional(readOnly = true)
+    public OfficeBonusPreviewDto getOfficeBonusPreview(int month, int year,
+                                                       PayrollDepartment department) {
+        if (department != PayrollDepartment.SALES && department != PayrollDepartment.ACCOUNTING)
+            throw new IllegalArgumentException("Preview chỉ cho SALES / ACCOUNTING");
+
+        java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+        long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+        long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+
+        // Kết quả đã tính (nếu có) — để lấy bonusAmount per user
+        OfficeBonusResult existing = officeBonusResultRepo
+                .findByMonthAndYearAndDepartment(month, year, department).orElse(null);
+        Map<Long, Long> bonusByUser = new HashMap<>();
+        if (existing != null) {
+            for (OfficeBonusItem it : existing.getItems())
+                bonusByUser.put(it.getUser().getId(), it.getBonusAmount());
+        }
+
+        // Danh sách nhân viên hiện trong bảng.
+        //   SALES: NV phòng KD + extras ngoài phòng có tạo đơn (vd NV Kho).
+        //   ACCOUNTING: NV phòng Kế toán có receiveBonus (giữ nguyên).
+        List<User> employees = department == PayrollDepartment.SALES
+                ? buildSalesBonusEligible(startMs, endMs)
+                : deptResolver.employeesOf(department).stream()
+                .filter(u -> !Boolean.FALSE.equals(u.getReceiveBonus()))
+                .sorted(Comparator.comparingInt(u -> roleSortOrderIn(department, u)))
+                .toList();
+
+        // ── STAT TRÊN LUÔN LẤY CÔNG TY — ACCOUNTING & SALES giống nhau ──
+        //
+        // FIX (11/2026): trước đây SALES tính dept-level = Σ per-seller nên
+        // thiếu đơn do user KHÔNG phải seller (vd kế toán/admin tạo đơn hộ)
+        // → chênh với ACCOUNTING. User muốn cả 2 tab hiển thị cùng 1 số ở
+        // card trên (toàn công ty), chỉ các dòng trong bảng mới per-seller.
+        java.math.BigDecimal deptMonthOrderRev =
+                nzBd(orderRepository.sumFinalAmountCreatedInRange(startMs, endMs));
+        java.math.BigDecimal deptCollectedRev  =
+                nzBd(paymentTransactionRepo.sumRevenueAllOrders(startMs, endMs));
+        java.math.BigDecimal deptHoldRev       =
+                nzBd(orderRepository.sumHoldAmountCreatedInRange(startMs, endMs));
+        java.math.BigDecimal deptWaivedRev     =
+                nzBd(orderRepository.sumWaivedAmountCreatedInRange(startMs, endMs));
+        int deptTxCount =
+                (int) paymentTransactionRepo.countTransactionsAllOrders(startMs, endMs);
+
+        List<OfficeBonusPreviewRowDto> rows = new ArrayList<>();
+        for (User u : employees) {
+            java.math.BigDecimal rowMonth, rowCollected, rowHold, rowWaived;
+            int rowTx;
+            if (department == PayrollDepartment.SALES) {
+                // Mỗi seller chỉ tính đơn do chính họ tạo (o.user.id = seller.id)
+                rowMonth     = nzBd(orderRepository.sumFinalAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                rowCollected = nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId()));
+                rowHold      = nzBd(orderRepository.sumHoldAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                rowWaived    = nzBd(orderRepository.sumWaivedAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                rowTx        = (int) paymentTransactionRepo.countTransactionsByUser(startMs, endMs, u.getId());
+            } else {
+                // ACCOUNTING — mỗi row thấy số của phòng
+                rowMonth     = deptMonthOrderRev;
+                rowCollected = deptCollectedRev;
+                rowHold      = deptHoldRev;
+                rowWaived    = deptWaivedRev;
+                rowTx        = deptTxCount;
+            }
+
+            rows.add(OfficeBonusPreviewRowDto.builder()
+                    .userId(u.getId())
+                    .userFullName(u.getFullName())
+                    .roleLabel(deptResolver.roleLabelOf(u))
+                    .roleSortOrder(roleSortOrderIn(department, u))
+                    .weight(department == PayrollDepartment.ACCOUNTING
+                            ? OfficeBonusCommissionUtil.accountingWeightOf(deptResolver.payrollRoleOf(u))
+                            : null)
+                    .totalMonthOrderRevenue(rowMonth)
+                    .totalCollectedRevenue(rowCollected)
+                    .totalHoldRevenue(rowHold)
+                    .totalWaivedRevenue(rowWaived)
+                    .transactionCount(rowTx)
+                    .bonusAmount(bonusByUser.get(u.getId()))
+                    .build());
+        }
+
+        return OfficeBonusPreviewDto.builder()
+                .month(month).year(year)
+                .department(department.name())
+                .departmentLabel(department.getLabel())
+                .totalMonthOrderRevenue(deptMonthOrderRev)
+                .totalCollectedRevenue(deptCollectedRev)
+                .totalHoldRevenue(deptHoldRev)
+                .totalWaivedRevenue(deptWaivedRev)
+                .transactionCount(deptTxCount)
+                .commissionCalculated(existing != null)
+                .commissionUnitPrice(existing != null ? existing.getCommissionUnitPrice() : null)
+                .lastCommissionUnitPrice(findLastCommissionUnitPrice(month, year, department))
+                .totalBonusPool(existing != null ? existing.getTotalBonusPool() : null)
+                .computedAt(existing != null ? existing.getComputedAt() : null)
+                .computedByName(existing != null ? existing.getComputedByName() : null)
+                .items(rows)
+                .build();
+    }
+
+    /**
+     * Đơn giá hoa hồng của THÁNG GẦN NHẤT có record cho bộ phận này (quét ngược
+     * tối đa 24 tháng), trước tháng {@code (year, month)}. {@code null} nếu
+     * chưa từng tính.
+     */
+    @Transactional(readOnly = true)
+    public Long findLastCommissionUnitPrice(int month, int year, PayrollDepartment department) {
+        java.time.YearMonth cursor = java.time.YearMonth.of(year, month);
+        for (int i = 0; i < 24; i++) {
+            cursor = cursor.minusMonths(1);
+            Optional<OfficeBonusResult> opt = officeBonusResultRepo
+                    .findByMonthAndYearAndDepartment(cursor.getMonthValue(), cursor.getYear(), department);
+            if (opt.isPresent() && opt.get().getCommissionUnitPrice() != null)
+                return opt.get().getCommissionUnitPrice();
+        }
+        return null;
+    }
+
+    private static java.math.BigDecimal nzBd(java.math.BigDecimal v) {
+        return v == null ? java.math.BigDecimal.ZERO : v;
+    }
+
+    /**
+     * Mở lại Thưởng doanh thu — nhân viên quay về "Đang tính thưởng".
+     * OfficeBonusResult không bị xoá cho đến khi OWNER bấm "Hoàn tất Thưởng" lần tiếp.
+     */
+    @Transactional
+    public AttendanceSheetDto reopenBonus(int month, int year, PayrollDepartment department) {
+        if (department != PayrollDepartment.SALES && department != PayrollDepartment.ACCOUNTING)
+            throw new IllegalArgumentException("Chỉ SALES / ACCOUNTING mới có bước Hoàn tất Thưởng.");
+        AttendanceSheet sheet = sheetOf(month, year, department);
+        sheet.unfinalizeBonus();
+        sheetRepo.save(sheet);
+        log.info("[Payroll] MỞ LẠI THƯỞNG {} tháng {}/{}", department, month, year);
+        return toSheetDto(sheet);
+    }
+
+    /** Đọc kết quả thưởng doanh thu đã tính (hoặc null nếu chưa tính). */
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
+    public OfficeBonusSummaryDto getOfficeBonusSummary(int month, int year, PayrollDepartment department) {
+        return officeBonusResultRepo.findByMonthAndYearAndDepartment(month, year, department)
+                .map(this::toOfficeBonusSummaryDto)
+                .orElse(null);
+    }
+
+    /**
+     * Tính thưởng từ doanh thu.
+     *
+     * <pre>
+     * R ≥ 100tr  → 400.000đ mỗi 100tr (tuyến tính), phần lẻ nội suy 70–100tr
+     * 70tr ≤ R &lt; 100tr → nội suy tuyến tính trong dải [70tr, 100tr] → [0, 400.000]
+     * R &lt; 70tr   → 0đ
+     * </pre>
+     */
+    static long calcBonusFromRevenue(java.math.BigDecimal revenue) {
+        if (revenue == null || revenue.compareTo(java.math.BigDecimal.ZERO) <= 0) return 0L;
+
+        final long UNIT  = 400_000L;          // thưởng mỗi 100tr
+        final long TIER1 = 100_000_000L;       // 100tr
+        final long LOW   =  70_000_000L;       //  70tr
+
+        long rev = revenue.setScale(0, java.math.RoundingMode.HALF_UP).longValue();
+
+        if (rev < LOW) return 0L;
+
+        if (rev < TIER1) {
+            // Nội suy tuyến tính [70tr → 0đ, 100tr → 400.000đ]
+            double ratio = (double)(rev - LOW) / (TIER1 - LOW);
+            return Math.round(ratio * UNIT);
+        }
+
+        // Tính số nguyên lần 100tr + phần lẻ nội suy
+        long full = rev / TIER1;          // số lần đủ 100tr
+        long rem  = rev % TIER1;          // phần lẻ
+
+        long bonusFull = full * UNIT;
+        long bonusRem  = 0L;
+        if (rem >= LOW) {
+            double ratio = (double)(rem - LOW) / (TIER1 - LOW);
+            bonusRem = Math.round(ratio * UNIT);
+        }
+        return bonusFull + bonusRem;
+    }
+
+    private OfficeBonusSummaryDto toOfficeBonusSummaryDto(OfficeBonusResult r) {
+        List<OfficeBonusItemDto> items = r.getItems().stream()
+                .map(i -> OfficeBonusItemDto.builder()
+                        .userId(i.getUser() != null ? i.getUser().getId() : null)
+                        .userFullName(i.getUserFullName())
+                        .roleLabel(i.getRoleLabel())
+                        .revenue(i.getRevenue())
+                        .bonusAmount(i.getBonusAmount())
+                        .kpiPercent(i.getKpiPercent())
+                        .transactionCount(i.getTransactionCount())
+                        .build())
+                .toList();
+
+        return OfficeBonusSummaryDto.builder()
+                .month(r.getMonth()).year(r.getYear())
+                .department(r.getDepartment().name())
+                .departmentLabel(r.getDepartment().getLabel())
+                .totalRevenue(r.getTotalRevenue())
+                .totalBonusPool(r.getTotalBonusPool())
+                .transactionCount(r.getTransactionCount())
+                .computedAt(r.getComputedAt())
+                .computedByName(r.getComputedByName())
+                .items(items)
+                .build();
+    }
+
+
+    /**
+     * Tính KPI cho phòng KẾ TOÁN trong kỳ tháng/năm.
+     *
+     * <p><b>TODO:</b> Triển khai logic KPI thực tế theo quy chế kế toán.
+     * Hiện trả về 100% cho mọi nhân viên kế toán.
+     *
+     * <p>Lưu ý: nhân viên kế toán có thể được đánh dấu không nhận KPI/bonus
+     * (field {@code receiveKpi}/{@code receiveBonus} trên User) — những người
+     * đó sẽ không được chia KPI/bonus khi tính toán.
+     *
+     * @param month  tháng tính lương
+     * @param year   năm tính lương
+     * @return map userId → kpiPercent (0–100)
+     */
+    public Map<Long, Double> calcAccountingKpi(int month, int year) {
+        List<User> employees = deptResolver.employeesOf(PayrollDepartment.ACCOUNTING);
+        Map<Long, Double> result = new LinkedHashMap<>();
+        for (User u : employees) {
+            // TODO: Tính KPI thực tế theo quy chế kế toán
+            // Bỏ qua nhân viên được đánh dấu không nhận KPI
+            Boolean rcvKpi = u.getReceiveKpi();
+            if (Boolean.FALSE.equals(rcvKpi)) continue;
+            result.put(u.getId(), 100.0);
+        }
+        return result;
+    }
+
+    /**
+     * Tính bonus cho phòng KẾ TOÁN trong kỳ tháng/năm.
+     *
+     * <p><b>TODO:</b> Triển khai logic bonus thực tế theo quy chế kế toán.
+     * Hiện trả về 0 cho mọi nhân viên kế toán.
+     *
+     * <p>Lưu ý: nhân viên tổng hợp hoặc có {@code receiveBonus = false}
+     * sẽ không được chia bonus.
+     *
+     * @param month      tháng tính lương
+     * @param year       năm tính lương
+     * @param bonusPool  tổng quỹ bonus cần phân chia
+     * @return map userId → bonusAmount
+     */
+    public Map<Long, Long> calcAccountingBonus(int month, int year, long bonusPool) {
+        // ── TRIỂN KHAI SAU ──────────────────────────────────────────────────
+        // Hiện tại thưởng kế toán được tính qua finalizeBonus() dựa trên doanh thu
+        // thực thu trong tháng. Hàm này giữ lại để tương thích các caller cũ.
+        // Nếu muốn dùng bonusPool thủ công thay vì doanh thu, triển khai tại đây.
+        // ────────────────────────────────────────────────────────────────────
+        List<User> employees = deptResolver.employeesOf(PayrollDepartment.ACCOUNTING);
+        Map<Long, Long> result = new LinkedHashMap<>();
+        List<User> eligible = employees.stream()
+                .filter(u -> !Boolean.FALSE.equals(u.getReceiveBonus()))
+                .toList();
+        if (eligible.isEmpty() || bonusPool <= 0) return result;
+        long perPerson = bonusPool / eligible.size();
+        perPerson = (perPerson / 100_000) * 100_000;    // làm tròn trăm nghìn
+        for (User u : eligible) result.put(u.getId(), perPerson);
+        return result;
+    }
+
+    /**
+     * Tính KPI cho phòng KINH DOANH trong kỳ tháng/năm.
+     *
+     * <p><b>TODO:</b> Triển khai logic KPI thực tế cho sale (doanh số,
+     * thu tiền, chăm sóc khách hàng…).
+     * Hiện trả về 100% cho mọi nhân viên kinh doanh.
+     *
+     * @param month  tháng tính lương
+     * @param year   năm tính lương
+     * @return map userId → kpiPercent (0–100)
+     */
+    public Map<Long, Double> calcSalesKpi(int month, int year) {
+        List<User> employees = deptResolver.employeesOf(PayrollDepartment.SALES);
+        Map<Long, Double> result = new LinkedHashMap<>();
+        for (User u : employees) {
+            // TODO: Tính KPI thực tế theo quy chế kinh doanh
+            result.put(u.getId(), 100.0);
+        }
+        return result;
+    }
+
+    /**
+     * Tính bonus cho phòng KINH DOANH trong kỳ tháng/năm.
+     *
+     * <p><b>TODO:</b> Triển khai logic bonus thực tế cho sale.
+     * Hiện trả về 0 cho mọi nhân viên kinh doanh.
+     *
+     * @param month      tháng tính lương
+     * @param year       năm tính lương
+     * @param bonusPool  tổng quỹ bonus cần phân chia
+     * @return map userId → bonusAmount
+     */
+    public Map<Long, Long> calcSalesBonus(int month, int year, long bonusPool) {
+        // ── TRIỂN KHAI SAU ──────────────────────────────────────────────────
+        // Hiện tại thưởng sale được tính qua finalizeBonus() dựa trên doanh thu
+        // cá nhân (PaymentTransaction của đơn do seller đó tạo).
+        // Hàm này giữ lại để tương thích các caller cũ.
+        // Nếu muốn dùng bonusPool tổng chia đều thay vì cá nhân, triển khai tại đây.
+        // ────────────────────────────────────────────────────────────────────
+        List<User> employees = deptResolver.employeesOf(PayrollDepartment.SALES);
+        Map<Long, Long> result = new LinkedHashMap<>();
+        if (employees.isEmpty() || bonusPool <= 0) return result;
+        long perPerson = bonusPool / employees.size();
+        perPerson = (perPerson / 100_000) * 100_000;    // làm tròn trăm nghìn
+        for (User u : employees) result.put(u.getId(), perPerson);
+        return result;
+    }
+
+    public void validatePastPeriod(int month, int year) {
+        YearMonth target = YearMonth.of(year, month);
+        YearMonth current = YearMonth.now(VN);
+
+        // Tháng đã qua → cho phép
+        if (target.isBefore(current)) {
+            return;
+        }
+
+        // Tháng hiện tại → kiểm tra đã chốt chưa
+        if (target.equals(current)) {
+            // Kiểm tra xem có bộ phận nào đã chốt cho tháng này chưa
+            boolean anyFinalized = sheetRepo.existsByMonthAndYearAndFinalizedTrue(month, year);
+            if (anyFinalized) {
+                return; // Có ít nhất 1 bộ phận đã chốt → cho phép xem
+            }
+        }
+
+        throw new IllegalArgumentException(
+                "Chỉ xem/tải được các tháng đã kết thúc. Tháng %d/%d chưa hết hoặc chưa được chốt."
+                        .formatted(month, year));
+    }
+
 }

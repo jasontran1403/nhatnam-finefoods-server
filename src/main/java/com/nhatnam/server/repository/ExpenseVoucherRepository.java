@@ -258,4 +258,38 @@ public interface ExpenseVoucherRepository extends JpaRepository<ExpenseVoucher, 
             "AND COALESCE(v.effectiveAt, v.createdAt) BETWEEN :from AND :to ORDER BY COALESCE(v.effectiveAt, v.createdAt) ASC")
     List<ExpenseVoucher> findApprovedByEffectiveBetween(@Param("status") ExpenseVoucher.VoucherStatus status,
                                                         @Param("from") Long from, @Param("to") Long to);
+
+    /**
+     * Tổng tiền ứng lương đã duyệt cho 1 nhân viên trong 1 tháng.
+     * Dùng để kiểm tra hạn mức ứng (tối đa = lương cơ bản) và hiển thị
+     * trên phiếu lương cuối tháng.
+     *
+     * @param userId  ID nhân viên
+     * @param month   "YYYY-MM"
+     * @param status  thường là APPROVED
+     */
+    @Query("""
+        SELECT COALESCE(SUM(i.amount), 0)
+        FROM ExpenseVoucher v
+        JOIN v.items i
+        WHERE v.salaryAdvanceUserId = :userId
+          AND v.salaryAdvanceMonth = :month
+          AND v.status = :status
+        """)
+    BigDecimal sumSalaryAdvance(@Param("userId") Long userId,
+                                @Param("month") String month,
+                                @Param("status") ExpenseVoucher.VoucherStatus status);
+
+    /**
+     * Tất cả phiếu ứng lương (đã duyệt + chờ duyệt) cho 1 nhân viên trong 1 tháng.
+     * Dùng để hiển thị lịch sử ứng lương trên phiếu lương.
+     */
+    @Query("""
+        SELECT v FROM ExpenseVoucher v
+        WHERE v.salaryAdvanceUserId = :userId
+          AND v.salaryAdvanceMonth = :month
+        ORDER BY v.createdAt DESC
+        """)
+    List<ExpenseVoucher> findSalaryAdvancesByUserAndMonth(@Param("userId") Long userId,
+                                                          @Param("month") String month);
 }

@@ -538,15 +538,34 @@ public final class PayrollTaxCalculator {
      * lệch nhau khiến nhân viên nghỉ hơn một ngày vẫn hiện "đủ công", và tỉ lệ
      * ngày công dùng chia thưởng KPI bị đội lên trên 100%.
      *
-     * <p>Ngày lễ chưa được trừ ở đây — khai báo nghỉ lễ nằm ở bảng ngoại lệ chấm
-     * công của từng bộ phận, tác động vào số công THỰC TẾ chứ không vào công chuẩn.
+     * <p><b>[2026] Ngày lễ ĐÃ ĐƯỢC TRỪ</b> — trước đây chỉ tính trừ CN. Điều
+     * đó khiến tháng có nghỉ lễ (VD tháng 9/2026 có 1–2/9 Quốc khánh) mọi
+     * người bị công chuẩn = 26 trong khi thực tế chỉ 24 ngày làm được → bị
+     * tính là nghỉ thiếu 2 công, lương pro-rata bị hụt. Đồng thời phụ cấp
+     * cơm ở nhánh fallback (SALES/ACCOUNTING/WAREHOUSE) cũng dôi ra 2 ngày
+     * sai luật (nghỉ lễ không đi làm thì không có bữa ăn giữa ca).
+     *
+     * <p>Danh sách ngày lễ do {@link VietnameseHolidays} quản lý. Hiện là hằng
+     * số; sau này sẽ chuyển sang bảng {@code company_holiday} do HR upload.
      */
     public static double standardWorkdaysOf(int month, int year) {
         java.time.YearMonth ym = java.time.YearMonth.of(year, month);
         double total = 0;
         for (int d = 1; d <= ym.lengthOfMonth(); d++) {
-            if (java.time.LocalDate.of(year, month, d).getDayOfWeek() == java.time.DayOfWeek.SUNDAY)
-                continue;
+            java.time.LocalDate date = java.time.LocalDate.of(year, month, d);
+            if (date.getDayOfWeek() == java.time.DayOfWeek.SUNDAY) continue;
+            total += 1.0;
+        }
+        return total;
+    }
+
+    public static double mealEligibleDaysOf(int month, int year) {
+        java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+        double total = 0;
+        for (int d = 1; d <= ym.lengthOfMonth(); d++) {
+            java.time.LocalDate date = java.time.LocalDate.of(year, month, d);
+            if (date.getDayOfWeek() == java.time.DayOfWeek.SUNDAY) continue;
+            if (VietnameseHolidays.isHoliday(date)) continue;
             total += 1.0;
         }
         return total;
@@ -579,10 +598,48 @@ public final class PayrollTaxCalculator {
         // cũng chỉ tính tối đa 100% — tăng ca trả riêng.
         if (actualDays >= standardDays) return standardSalary;
 
-        return BigDecimal.valueOf(dailyRate(standardSalary, standardDays))
-                .multiply(BigDecimal.valueOf(actualDays))
-                .setScale(0, RoundingMode.HALF_UP)
-                .longValue();
+        // FIX (10/2026 v2): làm tròn LÊN bội số 5.000đ gần nhất theo yêu cầu
+        // mới. Trước đó làm tròn 5đ (lẻ 5.501.425); chốt lại cho đẹp, mọi phiếu
+        // lương sẽ ra số tròn nghìn chẵn.
+        //   Ví dụ: 6.219.000 × 21 / 26 = 5.023.038,46... → 5.025.000đ.
+        //          8.500.000 × 19 / 26 = 6.211.538,46... → 6.215.000đ.
+        //          6.219.000 × 23 / 26 = 5.501.423,08... → 5.505.000đ.
+        //
+        // KHÔNG dùng đơn giá-ngày đã HALF_UP (hụt 1-2đ sẽ tích luỹ ở kết quả
+        // cuối). Chia thẳng rồi mới làm tròn 1 lần duy nhất.
+        return ceilToMultipleOf5000(
+                BigDecimal.valueOf(standardSalary)
+                        .multiply(BigDecimal.valueOf(actualDays))
+                        .divide(BigDecimal.valueOf(standardDays), 2, RoundingMode.HALF_UP)
+                        .doubleValue());
+    }
+
+    /**
+     * Làm tròn LÊN bội số 5.000đ gần nhất.
+     * <pre>
+     *   5.023.038,46 → 5.025.000
+     *   6.211.538,46 → 6.215.000
+     *   5.000.000    → 5.000.000  (đã là bội số)
+     *   5.000.001    → 5.005.000
+     * </pre>
+     */
+    public static long ceilToMultipleOf5000(double v) {
+        if (v <= 0) return 0L;
+        long c = (long) Math.ceil(v - 1e-9);
+        long r = c % 5000L;
+        return r == 0 ? c : c + (5000L - r);
+    }
+
+    /**
+     * @deprecated giữ cho tương thích gọi cũ nếu có; chuyển sang
+     *             {@link #ceilToMultipleOf5000(double)} là chính sách mới.
+     */
+    @Deprecated
+    public static long ceilToMultipleOf5(double v) {
+        if (v <= 0) return 0L;
+        long c = (long) Math.ceil(v - 1e-9);
+        long r = c % 5L;
+        return r == 0 ? c : c + (5L - r);
     }
 
     public static long dailyRate(long standardSalary) {

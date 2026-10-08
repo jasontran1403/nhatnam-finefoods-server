@@ -58,6 +58,32 @@ public class ProductBatchItem {
     @Column(name = "units_per_box")
     private Integer unitsPerBox;
 
+    /**
+     * Đơn vị quy đổi (VD: "kg") — dùng khi tạo đơn Misa.
+     * Null = không có quy đổi.
+     */
+    @Column(name = "conversion_unit", length = 50)
+    private String conversionUnit;
+
+    /**
+     * Quy cách quy đổi: 1 đơn vị gốc = bao nhiêu đơn vị quy đổi.
+     * VD: 1 hộp = 0.454 kg → conversionFactor = 0.454
+     */
+    @Column(name = "conversion_factor", precision = 10, scale = 3)
+    private BigDecimal conversionFactor;
+
+    /** SKU — mã hàng ngắn */
+    @Column(name = "sku", length = 100)
+    private String sku;
+
+    /** Quy cách (gr/đơn vị): 500, 424, 410, 210, 1000 */
+    @Column(name = "specification")
+    private Integer specification;
+
+    /** Danh mục MISA: Kem, Xúc xích bò, Xúc xích heo, Xúc xích gà */
+    @Column(name = "misa_category", length = 100)
+    private String misaCategory;
+
     /** Toàn bộ tiers, ingredients dạng JSON */
     @Column(name = "tiers_json", columnDefinition = "TEXT")
     private String tiersJson;

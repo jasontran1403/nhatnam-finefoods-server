@@ -41,6 +41,7 @@ public class MaterialRequestService {
     private final com.nhatnam.server.repository.IngredientStockRepository ingredientStockRepo;
     private final com.nhatnam.server.repository.IngredientExpiryRepository ingredientExpiryRepo;
     private final com.nhatnam.server.repository.CategoryRepository categoryRepo;
+    private final FactoryStockNoteRepository factoryStockNoteRepo;
 
     /**
      * Category nguyên liệu mà SUPER_SELLER được phép đặt. Hardcode tạm — có thể thêm.
@@ -406,6 +407,40 @@ public class MaterialRequestService {
         mr.setStatus(MaterialRequest.RequestStatus.PARTIALLY_RECEIVED);
 
         MaterialRequest saved = requestRepo.save(mr);
+
+        // ── Ghi phiếu nhập kho (FactoryStockNote IMPORT) cho kho nguyên liệu xưởng ──
+        if (!isSeller && mr.getProductionFactory() != null) {
+            FactoryStockNote importNote = FactoryStockNote.builder()
+                    .type(FactoryStockNote.NoteType.IMPORT)
+                    .factory(mr.getProductionFactory())
+                    .factoryName(mr.getProductionFactory().getName())
+                    .reason("Nhận hàng đợt " + seq + " — Phiếu " + mr.getRequestCode())
+                    .createdBy(receiver)
+                    .createdByName(receiver.getFullName())
+                    .createdAt(now)
+                    .lines(new ArrayList<>())
+                    .documentImages("[]")
+                    .totalCostValue(BigDecimal.ZERO)
+                    .build();
+            // Generate note code: FIM-yyyyMMdd-XXXX
+            String day = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")
+                    .format(Instant.ofEpochMilli(now).atZone(ZoneId.of("Asia/Ho_Chi_Minh")));
+            long noteSeq = factoryStockNoteRepo.countByNoteCodeStartingWith("FIM-" + day) + 1;
+            importNote.setNoteCode(String.format("FIM-%s-%04d", day, noteSeq));
+
+            for (MaterialRequestReceiptItem ri2 : receipt.getItems()) {
+                MaterialRequestItem mri = ri2.getMaterialRequestItem();
+                importNote.getLines().add(FactoryStockNoteLine.builder()
+                        .note(importNote)
+                        .materialName(mri.getMaterialName())
+                        .unit(mri.getUnit())
+                        .quantity(ri2.getStockQty())
+                        .unitCost(BigDecimal.ZERO)
+                        .expiryDate(ri2.getExpiryDate())
+                        .build());
+            }
+            factoryStockNoteRepo.save(importNote);
+        }
 
         // KHÔNG báo cho SUPER_ACCOUNTANT ở đây. Việc nhận lẻ/giao bù là chuyện nội bộ
         // của xưởng; kế toán chỉ vào cuộc khi phiếu đã được chốt "đã giao xong"

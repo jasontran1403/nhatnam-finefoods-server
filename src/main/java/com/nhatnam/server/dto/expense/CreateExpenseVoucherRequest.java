@@ -72,6 +72,19 @@ public class CreateExpenseVoucherRequest {
     /** URLs ảnh chứng từ (đã upload trước) */
     private List<String> imageUrls;
 
+    // ── ỨNG LƯƠNG — chỉ dùng khi vendorType = SALARY_ADVANCE ──────────────────
+
+    /**
+     * ID nhân viên được ứng lương.
+     * Bắt buộc khi {@code vendorType = "SALARY_ADVANCE"}.
+     */
+    private Long salaryAdvanceUserId;
+
+    /**
+     * Tháng ứng lương — "YYYY-MM". Nếu null, server tự set = tháng hiện tại.
+     */
+    private String salaryAdvanceMonth;
+
     @Data
     public static class ExpenseItemRequest {
         /**

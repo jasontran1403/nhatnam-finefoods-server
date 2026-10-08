@@ -381,19 +381,86 @@ public class AttendanceExcelParser {
         return null;
     }
 
+    /**
+     * Đọc 1 ô giờ chấm. CHẤP NHẬN cả 2 cách lưu trong file:
+     * <ul>
+     *   <li>Ô NUMERIC format {@code h:mm} — máy chấm công xuất thẳng sẽ như vậy.</li>
+     *   <li>Ô STRING chứa chuỗi {@code "07:50"} / {@code "7:50"} / {@code "07:50:12"} —
+     *       khi file đi qua Google Sheets / LibreOffice / được dán tay, cột format
+     *       "General" sẽ chuyển time về chuỗi. Trước đây parser ÉP cứng {@code
+     *       CellType.NUMERIC} nên các khối này bị trả null hết → nhân viên có
+     *       0 công dù file có đủ dữ liệu (triệu chứng "chỉ xưởng sản xuất lên
+     *       được công", chuyên cần dòng trống).</li>
+     * </ul>
+     *
+     * <p>Trả {@code null} cho mọi ô không parse được hoặc đúng 00:00 (quy ước:
+     * 00:00 là ô trống, không phải chấm công lúc nửa đêm).
+     */
     private static LocalTime readTime(Sheet ws, int r, int c) {
         if (c < 0) return null;
         Row row = ws.getRow(r);
         if (row == null) return null;
         Cell cell = row.getCell(c);
-        if (cell == null || cell.getCellType() != CellType.NUMERIC) return null;
-        try {
-            LocalTime t = cell.getLocalDateTimeCellValue().toLocalTime();
-            // 00:00 trong file nghĩa là ô trống, không phải chấm công lúc nửa đêm
-            return LocalTime.MIDNIGHT.equals(t) ? null : t;
-        } catch (Exception e) {
-            return null;
+        if (cell == null) return null;
+
+        // Nhánh 1: ô number đúng dạng — đọc trực tiếp.
+        if (cell.getCellType() == CellType.NUMERIC) {
+            try {
+                LocalTime t = cell.getLocalDateTimeCellValue().toLocalTime();
+                return LocalTime.MIDNIGHT.equals(t) ? null : t;
+            } catch (Exception e) {
+                return null;
+            }
         }
+
+        // Nhánh 2: ô chuỗi "HH:mm" (hoặc "H:mm", kèm giây hoặc không).
+        if (cell.getCellType() == CellType.STRING) {
+            String s = cell.getStringCellValue();
+            if (s == null) return null;
+            s = s.trim();
+            if (s.isEmpty()) return null;
+
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("^(\\d{1,2}):(\\d{2})(?::(\\d{2}))?$").matcher(s);
+            if (!m.matches()) return null;
+            try {
+                int h = Integer.parseInt(m.group(1));
+                int mi = Integer.parseInt(m.group(2));
+                int sec = m.group(3) != null ? Integer.parseInt(m.group(3)) : 0;
+                if (h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59) return null;
+                LocalTime t = LocalTime.of(h, mi, sec);
+                return LocalTime.MIDNIGHT.equals(t) ? null : t;
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        // FORMULA và các kiểu khác: thử ép qua chuỗi.
+        if (cell.getCellType() == CellType.FORMULA) {
+            try {
+                if (cell.getCachedFormulaResultType() == CellType.NUMERIC) {
+                    LocalTime t = cell.getLocalDateTimeCellValue().toLocalTime();
+                    return LocalTime.MIDNIGHT.equals(t) ? null : t;
+                }
+                if (cell.getCachedFormulaResultType() == CellType.STRING) {
+                    String s = cell.getStringCellValue();
+                    if (s == null || s.trim().isEmpty()) return null;
+                    java.util.regex.Matcher m = java.util.regex.Pattern
+                            .compile("^(\\d{1,2}):(\\d{2})(?::(\\d{2}))?$").matcher(s.trim());
+                    if (m.matches()) {
+                        int h = Integer.parseInt(m.group(1));
+                        int mi = Integer.parseInt(m.group(2));
+                        int sec = m.group(3) != null ? Integer.parseInt(m.group(3)) : 0;
+                        if (h < 24 && mi < 60 && sec < 60) {
+                            LocalTime t = LocalTime.of(h, mi, sec);
+                            return LocalTime.MIDNIGHT.equals(t) ? null : t;
+                        }
+                    }
+                }
+            } catch (Exception ignored) { }
+        }
+
+        return null;
     }
 
     private static Integer readInt(Sheet ws, int r, Integer c) {

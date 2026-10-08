@@ -245,6 +245,49 @@ public final class EmployeeRequestDtos {
 
         /** Cảnh báo cho người duyệt: chưa khai báo ngày vào làm nên quỹ có thể sai. */
         private Boolean missingWorkStartDate;
+
+        // ── HIỂN THỊ CHO OrgChartPage — quy đổi ngày phép ra chuỗi "X.5 ngày Y phút" ──
+        // Vì {@code remainingDays} là bội số của 0.5 nên phần "Y phút" ở đây luôn = 0.
+        // Getter vẫn được giữ cùng công thức với FactoryPayrollDtos và
+        // LeaveReportExportService để tránh 3 nơi tính lệch nhau.
+
+        /** 1 ngày phép = 480 phút — trùng với FactoryPayrollService.LEAVE_MINUTES_PER_DAY. */
+        private static final int LEAVE_MINUTES_PER_DAY = 480;
+
+        /** Số phút phép còn lại (bằng {@code remainingDays × 480}). */
+        public Integer getRemainingMinutes() {
+            if (remainingDays == null) return null;
+            return (int) Math.round(remainingDays * LEAVE_MINUTES_PER_DAY);
+        }
+
+        /**
+         * Chuỗi hiển thị cho OrgChartPage — "X.5 ngày Y phút".
+         * Ví dụ: 4.5 ngày → "4.5 ngày"; 3.0 ngày → "3 ngày";
+         *        4.460 ngày (= 2141 phút) → "4 ngày 221 phút".
+         */
+        public String getRemainingDisplay() {
+            Integer mins = getRemainingMinutes();
+            if (mins == null)   return null;
+            if (mins == 0)      return "0 ngày";
+
+            int abs = Math.abs(mins);
+            int halfDays   = abs / 240;
+            int remMinutes = abs % 240;
+
+            String body;
+            if (halfDays == 0) {
+                // Dưới 1 buổi → chỉ hiện phần phút cho gọn.
+                body = remMinutes + " phút";
+            } else {
+                String daysStr = (halfDays % 2 == 0)
+                        ? String.valueOf(halfDays / 2)
+                        : (halfDays / 2) + ".5";
+                body = remMinutes == 0
+                        ? daysStr + " ngày"
+                        : daysStr + " ngày " + remMinutes + " phút";
+            }
+            return mins < 0 ? "-" + body : body;
+        }
     }
 
     /** Một dòng trong lịch sử nghỉ phép. */
@@ -272,5 +315,19 @@ public final class EmployeeRequestDtos {
         private Boolean morning;
         /** Nghỉ buổi chiều. */
         private Boolean afternoon;
+    }
+
+    /**
+     * Một ngày đã bị chiếm bởi phiếu nghỉ hiện có (PENDING hoặc đã duyệt).
+     * Dùng để FE disable ngày đó khi tạo phiếu mới, tránh xin nghỉ trùng.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class OccupiedDateDto {
+        private LocalDate date;
+        private boolean morning;
+        private boolean afternoon;
+        private String status;
+        private String statusLabel;
+        private Long requestId;
     }
 }

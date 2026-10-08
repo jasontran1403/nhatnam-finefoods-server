@@ -82,4 +82,30 @@ public interface MonthlyAdjustmentRepository extends JpaRepository<MonthlyAdjust
                                     @Param("year") int year,
                                     @Param("type") Type type,
                                     @Param("label") String label);
+
+    /**
+     * Xoá các khoản bắt đầu bằng nhãn nhất định — dùng cho phụ cấp có chi tiết
+     * động trong label (VD "Phụ cấp xăng xe (176.3 km × 3.000đ)").
+     */
+    @Modifying
+    @Query("DELETE FROM MonthlyAdjustment a "
+            + "WHERE a.month = :month AND a.year = :year AND a.type = :type AND a.label LIKE CONCAT(:prefix, '%')")
+    void deleteByPeriodTypeAndLabelPrefix(@Param("month") int month,
+                                          @Param("year") int year,
+                                          @Param("type") Type type,
+                                          @Param("prefix") String prefix);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 2 — THAO TÁC THEO SOURCE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Xoá sạch khoản AUTO_* của kỳ — dùng khi bấm "Mở lại" để tẩy sạch OT tự
+     * sinh trước khi tính lại. Không đụng vào khoản MANUAL do OWNER import.
+     */
+    @Modifying
+    @Query("DELETE FROM MonthlyAdjustment a WHERE a.month = :month AND a.year = :year AND a.source = :source")
+    void deleteByPeriodAndSource(@Param("month") int month,
+                                 @Param("year") int year,
+                                 @Param("source") MonthlyAdjustment.Source source);
 }

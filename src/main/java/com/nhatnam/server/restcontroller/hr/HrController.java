@@ -7,6 +7,8 @@ import com.nhatnam.server.enumtype.Role;
 import com.nhatnam.server.repository.UserRepository;
 import com.nhatnam.server.repository.EmployeeSalaryRepository;
 import com.nhatnam.server.service.hr.HrService;
+import com.nhatnam.server.service.hr.HrService.SalaryAdvanceInfoDto;
+import org.springframework.security.access.prepost.PreAuthorize;
 import com.nhatnam.server.utils.SeniorityCalculator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,6 +31,11 @@ import java.io.ByteArrayOutputStream;
 import java.math.BigDecimal;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import com.nhatnam.server.service.LeaveReportExportService;
+import com.nhatnam.server.service.LeaveManagementService;
+import com.nhatnam.server.dto.hr.LeaveManagementDtos.LeaveManagementResponse;
+import com.nhatnam.server.dto.common.ApiResponse;
+
 
 @RestController
 @RequestMapping("/api/hr")
@@ -39,6 +46,8 @@ public class HrController {
     private final HrService hrService;
     private final UserRepository userRepository;
     private final EmployeeSalaryRepository salaryRepository;
+    private final LeaveReportExportService leaveReportExportService;
+    private final LeaveManagementService leaveManagementService;
 
     @Value("${application.security.jwt.secret-key}")
     private String jwtSecretKey;
@@ -58,6 +67,92 @@ public class HrController {
             for (byte b : raw) sb.append(String.format("%02x", b));
             return sb.substring(0, 32);
         } catch (Exception e) { throw new RuntimeException("Không thể tạo token"); }
+    }
+
+    /**
+     * Dữ liệu bảng "Quản lý phép" (JSON) — cùng bộ số với XLSX export bên dưới.
+     * Chỉ OWNER/ADMIN được xem (spec: nút "Quản lý phép" nằm ở page Người dùng của Owner).
+     */
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+    @GetMapping("/leave-management")
+    public ApiResponse<LeaveManagementResponse> leaveManagement() {
+        return ApiResponse.ok(leaveManagementService.buildResponse());
+    }
+
+    /**
+     * Ghi 1 ô "Đã dùng T1..T8" của bảng "Quản lý phép" — OWNER click vào ô,
+     * nhập X ngày + Y phút, blur/Enter thì FE gửi tổng số phút xuống đây.
+     *
+     * <p>Body: {@code { userId, year, month, minutes }}. minutes = 0 → xoá bản
+     * ghi (ô hiển thị " - ").
+     */
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+    @PatchMapping("/leave-management/manual-usage")
+    public ApiResponse<LeaveManagementResponse> updateManualUsage(
+            @RequestBody ManualUsageUpdateRequest body,
+            Authentication auth) {
+        String actor = auth != null ? auth.getName() : "System";
+        LeaveManagementResponse res = leaveManagementService.setManualUsage(
+                body.userId(), body.year(), body.month(), body.minutes(), actor);
+        return ApiResponse.ok(res);
+    }
+
+    /** Body cho PATCH /api/hr/leave-management/manual-usage. */
+    public record ManualUsageUpdateRequest(
+            Long userId,
+            int year,
+            int month,
+            int minutes) {}
+
+    /**
+     * Ghi 1 ô cột "TỒN NĂM TRƯỚC" ({@code priorYearLeaveBalance}) của bảng
+     * "Quản lý phép" — OWNER click sửa. Body: {@code { userId, days }}.
+     * {@code days} nhận số thập phân (nửa buổi = 0.5; nhỏ hơn để bù phút).
+     */
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+    @PatchMapping("/leave-management/prior-year-balance")
+    public ApiResponse<LeaveManagementResponse> updatePriorYearBalance(
+            @RequestBody BalanceUpdateRequest body) {
+        return ApiResponse.ok(leaveManagementService.setPriorYearBalance(
+                body.userId(), body.days()));
+    }
+
+    /**
+     * Ghi 1 ô cột "PHÉP NĂM HIỆN TẠI" của bảng "Quản lý phép" — OWNER click sửa.
+     * BE lưu offset so với auto formula để mỗi 1 đầu tháng con số tự tăng 1
+     * mà không cần cronjob. Body: {@code { userId, days }}.
+     */
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN')")
+    @PatchMapping("/leave-management/current-year-entitled")
+    public ApiResponse<LeaveManagementResponse> updateCurrentYearEntitled(
+            @RequestBody BalanceUpdateRequest body) {
+        return ApiResponse.ok(leaveManagementService.setCurrentYearEntitled(
+                body.userId(), body.days()));
+    }
+
+    /** Body chung cho 2 endpoint set số ngày phép trực tiếp trên bảng. */
+    public record BalanceUpdateRequest(Long userId, double days) {}
+
+    @GetMapping("/leave-report/export")
+    public ResponseEntity<byte[]> exportLeaveReport(Authentication auth) throws Exception {
+        String exporterName = auth != null ? auth.getName() : "System";
+
+        // Lấy fullName nếu có
+        try {
+            User me = userRepository.findByUsername(exporterName).orElse(null);
+            if (me != null && me.getFullName() != null && !me.getFullName().isBlank()) {
+                exporterName = me.getFullName();
+            }
+        } catch (Exception ignored) {}
+
+        byte[] data = leaveReportExportService.export(exporterName);
+
+        String filename = "Leave_Report_%d.xlsx".formatted(java.time.LocalDate.now().getYear());
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(MediaType.parseMediaType(
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .body(data);
     }
 
     private String _generateExportToken() {
@@ -146,6 +241,12 @@ public class HrController {
             // và bảng nhân sự hiển thị để nhìn ra ngay ai còn thiếu.
             m.put("workStartDate", u.getWorkStartDate());
             m.put("isLockAccount", u.isLockAccount());
+            // Thông tin ngân hàng — để modal nạp lại và bảng hiển thị badge cho
+            // nhân viên đã điền đủ (dùng cho file chi lương gửi ngân hàng).
+            m.put("bankAccountNumber", u.getBankAccountNumber());
+            m.put("bankName", u.getBankName());
+            // Nghỉ thai sản — bảng nhân sự hiện badge, file chi lương NH bỏ qua.
+            m.put("onMaternityLeave", u.isOnMaternityLeave());
             result.add(m);
         }
         return ResponseEntity.ok(result);
@@ -661,5 +762,21 @@ public class HrController {
     @GetMapping("/overtimes/{id}")
     public ResponseEntity<OvertimeRequestDto> getOvertime(@PathVariable Long id) {
         return ResponseEntity.ok(hrService.getOvertime(id));
+    }
+
+    // ── Ứng lương ─────────────────────────────────────────────────────────────
+
+    /**
+     * Thông tin ứng lương của nhân viên trong tháng hiện tại:
+     * - lương cơ bản (từ hồ sơ lương đã duyệt)
+     * - tổng đã ứng (tổng phiếu chi SALARY_ADVANCE đã duyệt trong tháng)
+     * - còn lại có thể ứng = cơ bản - đã ứng
+     *
+     * Dùng cho form tạo phiếu chi khi chọn layout ỨNG LƯƠNG.
+     */
+    @GetMapping("/salary-advance/info/{userId}")
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN','SUPERADMIN','SUPER_ACCOUNTANT','ACCOUNTANT')")
+    public ResponseEntity<SalaryAdvanceInfoDto> getSalaryAdvanceInfo(@PathVariable Long userId) {
+        return ResponseEntity.ok(hrService.getSalaryAdvanceInfo(userId));
     }
 }

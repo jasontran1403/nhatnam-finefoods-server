@@ -3,6 +3,7 @@ package com.nhatnam.server.restcontroller.income;
 import com.nhatnam.server.dto.common.ApiResponse;
 import com.nhatnam.server.dto.common.PageResponse;
 import com.nhatnam.server.dto.income.CreateIncomeVoucherRequest;
+import com.nhatnam.server.dto.income.EmployeeSuggestionDto;
 import com.nhatnam.server.dto.income.IncomeVoucherDto;
 import com.nhatnam.server.entity.User;
 import com.nhatnam.server.enumtype.Role;
@@ -27,6 +28,13 @@ import org.springframework.web.bind.annotation.*;
 public class IncomeVoucherController {
 
     private final IncomeVoucherService voucherService;
+
+    @GetMapping("/employee-suggestions")
+    @PreAuthorize("hasAnyRole('ACCOUNTANT','SUPER_ACCOUNTANT','ADMIN','OWNER')")
+    public ApiResponse<java.util.List<EmployeeSuggestionDto>> suggestEmployees(
+            @RequestParam(required = false, defaultValue = "") String q) {
+        return ApiResponse.ok(voucherService.suggestEmployees(q.trim()));
+    }
 
     @PostMapping
     @PreAuthorize("hasAnyRole('ACCOUNTANT','SUPER_ACCOUNTANT','ADMIN','OWNER')")
@@ -56,6 +64,23 @@ public class IncomeVoucherController {
         // vừa chuyển sang Kế toán; user.getRole() chỉ trả role CHÍNH nên sai.
         Role activeRole = activeRole(auth, user);
         return ApiResponse.ok(voucherService.update(id, user.getId(), activeRole, req));
+    }
+
+    /**
+     * CẤN TRỪ phần dư của phiếu thu nguồn sang 1 đơn CÙNG KHÁCH. Tạo 1 phiếu thu
+     * MỚI gắn vào đơn đó; đồng thời cập nhật {@code offsetUsedAmount} của phiếu
+     * nguồn để phần dư giảm đi.
+     */
+    @PostMapping("/{id}/offset")
+    @PreAuthorize("hasAnyRole('ACCOUNTANT','SUPER_ACCOUNTANT','ADMIN','OWNER')")
+    public ApiResponse<IncomeVoucherDto> offset(
+            @PathVariable Long id,
+            @Valid @RequestBody com.nhatnam.server.dto.income.OffsetIncomeVoucherRequest req,
+            Authentication auth) {
+        User user = (User) auth.getPrincipal();
+        Role activeRole = activeRole(auth, user);
+        return ApiResponse.ok(
+                voucherService.offsetOverpayToOrder(id, user.getId(), activeRole, req));
     }
 
     /** Nhật ký tạo/sửa của một phiếu thu. */

@@ -57,6 +57,27 @@ public class EmployeeRequestService {
     private final UserRepository userRepository;
     private final PayrollDepartmentResolver deptResolver;
     private final NotificationService notificationService;
+    // ── MỚI: đọc usage lịch sử để đồng bộ với "Quản lý phép" ─────────────────
+    // Trước đây leaveBalance() CHỈ đếm EmployeeRequest.paidLeaveDays →
+    // bỏ sót phần OWNER nhập tay ở T1..T8 (usage lịch sử, trong đó có bù trễ/
+    // sớm cộng dồn từ tháng cũ) và bỏ sót AttendanceEntry.leaveMinutesUsed ở
+    // T9..T12. Kết quả: "Phiếu của tôi" của nhân viên thấy còn phép NHIỀU HƠN
+    // thực tế → nhân viên gửi thêm đơn được → OWNER duyệt → quỹ về ÂM.
+    private final com.nhatnam.server.repository.ManualLeaveUsageRepository manualLeaveUsageRepo;
+    private final com.nhatnam.server.repository.AttendanceEntryRepository attendanceEntryRepo;
+
+    /**
+     * Tháng cuối cùng dùng số OWNER NHẬP TAY (ManualLeaveUsage). Tháng lớn hơn
+     * → tự tính từ EmployeeRequest + AttendanceEntry.leaveMinutesUsed.
+     * <p>Phải KHỚP với {@code LeaveManagementService.MANUAL_USAGE_MAX_MONTH}
+     * (hiện = 8). Nếu OWNER mở thêm tháng manual thì đổi CẢ 2 nơi.
+     */
+    private static final int MANUAL_USAGE_MAX_MONTH = 8;
+
+    /** 1 ngày công = 480 phút (8h). Khớp {@code LeaveManagementService.LEAVE_MINUTES_PER_DAY}. */
+    private static final int LEAVE_MINUTES_PER_DAY = 480;
+
+
 
     // ══════════════════════════════════════════════════════════════════════════
     // 1. CẤU HÌNH FORM TẠO ĐƠN
@@ -69,19 +90,34 @@ public class EmployeeRequestService {
      * ngày nào theo múi giờ nào. Máy người dùng lệch múi giờ hay để sai đồng hồ
      * cũng không mở rộng được cửa sổ chọn ngày, vì server vẫn kiểm lại y hệt lúc
      * nhận đơn.
+     *
+     * <p><b>Nghỉ phép</b> dùng cửa sổ LÙI = ngày 1 THÁNG HIỆN TẠI; chiều TIẾN
+     * KHÔNG giới hạn (hôm nay tháng 9 vẫn xin nghỉ cho tháng 12 được).
+     * Các loại khác vẫn theo offset như cũ.
      */
     public RequestFormConfigDto formConfig() {
         LocalDate today = LocalDate.now(VN);
+        YearMonth ym = YearMonth.from(today);
 
         List<RequestTypeOptionDto> types = new ArrayList<>();
         for (EmployeeRequestType t : EmployeeRequestType.values()) {
+            LocalDate minDate, maxDate;
+            if (t.isMonthScoped()) {
+                // Nghỉ phép: lùi tối đa về ngày 1 tháng hiện tại; tiến không giới hạn.
+                minDate = ym.atDay(1);
+                maxDate = null;
+            } else {
+                minDate = today.plusDays(t.minOffsetDays());
+                maxDate = t.maxOffsetDays() == null ? null : today.plusDays(t.maxOffsetDays());
+            }
+
             types.add(RequestTypeOptionDto.builder()
                     .value(t.name())
                     .label(t.getLabel())
                     .rangeBased(t.isRangeBased())
                     .minutesBased(t.isMinutesBased())
-                    .minDate(today.plusDays(t.minOffsetDays()))
-                    .maxDate(t.maxOffsetDays() == null ? null : today.plusDays(t.maxOffsetDays()))
+                    .minDate(minDate)
+                    .maxDate(maxDate)
                     .allowPartialDay(t == EmployeeRequestType.LEAVE)
                     .build());
         }
@@ -139,16 +175,50 @@ public class EmployeeRequestService {
         if (body.getReason() == null || body.getReason().isBlank())
             throw new IllegalArgumentException("Bắt buộc nhập lý do.");
 
-        // Chặn trùng: đơn cũ cùng loại còn hiệu lực đè lên khoảng ngày đang xin.
-        // Đơn đã bị từ chối KHÔNG tính là trùng — nhân viên có quyền khai lại cho đúng.
-        List<EmployeeRequest> dup = repo.findOverlapping(me.getId(), type, from, to);
-        if (!dup.isEmpty()) {
-            EmployeeRequest d = dup.get(0);
-            throw new IllegalArgumentException(
-                    "Đã có phiếu %s cho khoảng %s (%s). Huỷ hoặc chờ xử lý phiếu đó trước."
-                            .formatted(type.getLabel().toLowerCase(),
-                                    rangeText(d.getFromDate(), d.getToDate()),
-                                    d.getStatus().getLabel()));
+        // Chặn trùng — kiểm tra ở CẤP ĐỘ NGÀY thay vì khoảng ngày.
+        //
+        // Khoảng from–to của phiếu MỚI có thể bao trùm phiếu CŨ trên lịch nhưng
+        // thực tế không nghỉ trùng ngày nào (nghỉ ngắt quãng). Chỉ throw khi TỒN
+        // TẠI NGÀY CỤ THỂ nào đó vừa nằm trong phiếu mới vừa thuộc phiếu cũ.
+        //
+        // IDEMPOTENT: phiếu PENDING khớp chính xác → trả về luôn, không tạo mới.
+        List<EmployeeRequest> overlapping = repo.findOverlapping(me.getId(), type, from, to);
+        if (!overlapping.isEmpty()) {
+            // ── Idempotent: cùng khoảng ngày + PENDING → coi như retry ──────
+            EmployeeRequest first = overlapping.get(0);
+            if (first.isPending()
+                    && first.getFromDate().equals(from)
+                    && first.getToDate().equals(to)) {
+                log.info("[Request] Idempotent hit: {} đã có phiếu #{} PENDING {} — trả về phiếu cũ",
+                        me.getFullName(), first.getId(), rangeText(from, to));
+                return toDto(first);
+            }
+
+            // ── Kiểm tra xung đột từng ngày ────────────────────────────────
+            // Gom tất cả ngày đang xin (từ danh sách buổi, hoặc trải toàn khoảng).
+            Set<LocalDate> requestedDates = new HashSet<>();
+            if (!days.isEmpty()) {
+                for (EmployeeRequest.LeaveDay d : days) requestedDates.add(d.getDate());
+            } else {
+                for (LocalDate d = from; !d.isAfter(to); d = d.plusDays(1)) requestedDates.add(d);
+            }
+
+            // Tìm ngày nào THẬT SỰ bị trùng
+            List<String> conflicts = new ArrayList<>();
+            for (EmployeeRequest existing : overlapping) {
+                for (LocalDate d = existing.getFromDate(); !d.isAfter(existing.getToDate()); d = d.plusDays(1)) {
+                    if (existing.covers(d) && requestedDates.contains(d)) {
+                        conflicts.add("%s (%s)".formatted(d.format(D), existing.getStatus().getLabel()));
+                    }
+                }
+            }
+
+            if (!conflicts.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Các ngày sau đã có phiếu nghỉ: %s. Bỏ các ngày đó khỏi phiếu hoặc huỷ phiếu cũ trước."
+                                .formatted(String.join(", ", conflicts)));
+            }
+            // Khoảng ngày overlap nhưng không có ngày cụ thể nào trùng → cho qua
         }
 
         PayrollDepartment dept = deptResolver.departmentOf(me);
@@ -231,10 +301,20 @@ public class EmployeeRequestService {
      * Cửa sổ ngày cho phép, kiểm ở SERVER dù FE đã khoá lịch.
      * Giới hạn ở FE chỉ là trợ giúp thao tác; ràng buộc thật phải nằm ở đây vì
      * request hoàn toàn có thể được gửi thẳng, không qua giao diện.
+     *
+     * <p><b>Nghỉ phép</b>: LÙI tối đa về ngày 1 THÁNG HIỆN TẠI; TIẾN không giới
+     * hạn. Các loại khác vẫn theo offset như cũ.
      */
     private void validateWindow(EmployeeRequestType type, LocalDate date, LocalDate today) {
-        LocalDate min = today.plusDays(type.minOffsetDays());
-        LocalDate max = type.maxOffsetDays() == null ? null : today.plusDays(type.maxOffsetDays());
+        LocalDate min, max;
+        if (type.isMonthScoped()) {
+            // Nghỉ phép: chặn lùi quá ngày 1 tháng hiện tại; không chặn tiến.
+            min = YearMonth.from(today).atDay(1);
+            max = null;
+        } else {
+            min = today.plusDays(type.minOffsetDays());
+            max = type.maxOffsetDays() == null ? null : today.plusDays(type.maxOffsetDays());
+        }
 
         if (date.isBefore(min) || (max != null && date.isAfter(max))) {
             String allowed = max == null
@@ -337,9 +417,28 @@ public class EmployeeRequestService {
         Double unpaid = body.getUnpaidLeaveDays();
 
         if (paid == null && unpaid == null) {
-            // Không chỉ định → suy từ lựa chọn có lương / không lương
-            paid   = Boolean.TRUE.equals(body.getPaid()) ? total : 0.0;
-            unpaid = Boolean.TRUE.equals(body.getPaid()) ? 0.0   : total;
+            if (Boolean.TRUE.equals(body.getPaid())) {
+                // ── AUTO-SPLIT: duyệt có lương, tự phân bổ dựa trên quỹ còn lại ──
+                LeaveBalanceDto balance = leaveBalance(r.getUser().getId(), r.getFromDate().getYear());
+                double remaining = balance.getRemainingDays() != null
+                        ? Math.max(0.0, balance.getRemainingDays()) : 0.0;
+
+                if (remaining >= total) {
+                    // Quỹ đủ → toàn bộ nghỉ có lương
+                    paid   = total;
+                    unpaid = 0.0;
+                } else {
+                    // Quỹ KHÔNG đủ → phần có phép = quỹ còn lại, phần thừa = không lương
+                    paid   = round2(remaining);
+                    unpaid = round2(total - remaining);
+                    log.info("[Leave] {} xin nghỉ {} ngày nhưng quỹ chỉ còn {} → auto-split: {} paid + {} unpaid",
+                            r.getUserFullName(), fmt(total), fmt(remaining), fmt(paid), fmt(unpaid));
+                }
+            } else {
+                // Duyệt không lương → toàn bộ là không lương
+                paid   = 0.0;
+                unpaid = total;
+            }
         } else {
             paid   = paid   == null ? 0.0 : Math.max(0.0, paid);
             unpaid = unpaid == null ? 0.0 : Math.max(0.0, unpaid);
@@ -355,10 +454,12 @@ public class EmployeeRequestService {
         r.setUnpaidLeaveDays(round2(unpaid));
 
         if (paid > 0) {
-            LeaveBalanceDto before = leaveBalance(r.getUser().getId(), r.getFromDate().getYear());
-            if (before.getRemainingDays() != null && paid > before.getRemainingDays() + 0.001) {
+            LeaveBalanceDto after = leaveBalance(r.getUser().getId(), r.getFromDate().getYear());
+            double newRemaining = after.getRemainingDays() != null ? after.getRemainingDays() : 0.0;
+            // Cảnh báo nếu SAU KHI TRỪ vẫn bị âm (trường hợp người duyệt chỉ định trực tiếp)
+            if (newRemaining - paid < -0.001) {
                 log.warn("[Leave] {} duyệt VƯỢT QUỸ: trừ {} ngày nhưng chỉ còn {} ngày (năm {})",
-                        r.getUserFullName(), fmt(paid), fmt(before.getRemainingDays()),
+                        r.getUserFullName(), fmt(paid), fmt(newRemaining),
                         r.getFromDate().getYear());
             }
         }
@@ -377,13 +478,70 @@ public class EmployeeRequestService {
         User u = userRepository.findById(userId)
                 .orElseThrow(() -> new IllegalArgumentException("Không tìm thấy nhân viên."));
 
-        long endOfYear = LocalDate.of(y, 12, 31).atTime(23, 59, 59)
+        long endOfPriorYear = LocalDate.of(y - 1, 12, 31).atTime(23, 59, 59)
                 .atZone(SeniorityCalculator.ZONE).toInstant().toEpochMilli();
-        int seniority = SeniorityCalculator.years(u.getWorkStartDate(), endOfYear);
+        int seniority = SeniorityCalculator.years(u.getWorkStartDate(), endOfPriorYear);
 
-        double entitled = LeaveBalanceCalculator.entitledDaysFor(u.getWorkStartDate(), y);
-        double used = repo.findApprovedLeavesOfYear(userId, y).stream()
-                .mapToDouble(EmployeeRequest::effectivePaidLeaveDays).sum();
+        // ── ĐỒNG BỘ VỚI "Quản lý phép" (LeaveManagementService.buildRow) ─────
+        // Trang "Quản lý phép" là NGUỒN CHÂN LÝ. Trước đây hàm này lệch với
+        // "Quản lý phép" vì 2 lý do:
+        //   1. QUÊN cộng entitledOffsetDays (offset OWNER nhập tay ở bảng
+        //      quản lý phép để chỉnh khởi điểm cho từng nhân viên).
+        //   2. VẪN tính seniorityBonusDays trong khi "Quản lý phép" đã tắt
+        //      (hardcode 0.0 — chính sách thâm niên đang tạm ngưng, cần bật
+        //      lại thì bật đồng thời ở CẢ 2 chỗ).
+        // → Kết quả: nhân viên có thâm niên ≥5 năm hoặc có offset thấy số dư
+        //   phép ở "Phiếu của tôi" khác với ở "Quản lý phép".
+        //
+        // Sửa: mirror y hệt công thức của LeaveManagementService.buildRow.
+
+        // Ngày phép cơ bản cộng dồn theo tháng (1 ngày / tháng đủ) + offset tay
+        double autoEntitled    = LeaveBalanceCalculator.entitledDaysFor(u.getWorkStartDate(), y);
+        double offset          = u.getEntitledOffsetDays() != null
+                ? u.getEntitledOffsetDays() : 0.0;
+        double currentEntitled = autoEntitled + offset;
+
+        // Thâm niên đang tắt — khớp với LeaveManagementService.buildRow.
+        // KHI muốn bật lại, bật đồng thời cả 2 chỗ để không lệch nữa.
+        double seniorityBonus  = 0.0;
+
+        // Ngày phép tồn năm trước + ngày phép thưởng thêm (OT, công tác…)
+        double prior = u.getPriorYearLeaveBalance() != null ? u.getPriorYearLeaveBalance() : 0.0;
+        double bonus = u.getBonusLeaveDays() != null ? u.getBonusLeaveDays() : 0.0;
+        double entitled = currentEntitled + seniorityBonus + prior + bonus;
+
+        // ── ĐỒNG BỘ VỚI "Quản lý phép" — usage = 3 nguồn cộng dồn theo tháng ─
+        // T1..MANUAL_USAGE_MAX_MONTH: OWNER nhập tay ở ManualLeaveUsage. Số
+        //   này ĐÈ luôn phần auto — dù T1..T8 có EmployeeRequest thì cũng
+        //   bỏ qua, chỉ dùng manual (khớp LeaveManagementService.buildRow).
+        // T(MANUAL_USAGE_MAX_MONTH+1)..T12: tự động từ 2 nguồn:
+        //   (a) paidLeaveDays của EmployeeRequest, chia tỷ lệ vào từng tháng
+        //       cho phiếu vắt qua nhiều tháng (dùng calcPaidLeaveDaysInMonth
+        //       — cùng công thức đã sửa ở LeaveManagementService).
+        //   (b) AttendanceEntry.leaveMinutesUsed — phần đi trễ/về sớm đã được
+        //       trừ bù vào quỹ phép khi tính lương.
+        //
+        // Trước đây chỉ đếm effectivePaidLeaveDays (EmployeeRequest.paidLeaveDays)
+        // cho CẢ năm, không phân tháng, không đọc manual, không đọc attendance.
+        // → nhân viên có bù trễ/sớm ở tháng cũ sẽ thấy quỹ nhiều hơn thực tế.
+        List<EmployeeRequest> yearLeaves = repo.findApprovedLeavesOfYear(userId, y);
+        long usedMinutes = 0;
+        for (int m = 1; m <= 12; m++) {
+            if (m <= MANUAL_USAGE_MAX_MONTH) {
+                usedMinutes += manualLeaveUsageRepo
+                        .findByUserIdAndYearAndMonth(userId, y, m)
+                        .map(com.nhatnam.server.entity.ManualLeaveUsage::getTotalMinutes)
+                        .orElse(0);
+            } else {
+                double paidDays = calcPaidLeaveDaysInMonth(yearLeaves, m, y);
+                int deductMinutes = attendanceEntryRepo
+                        .findByUserAndPeriod(userId, m, y)
+                        .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)
+                        .orElse(0);
+                usedMinutes += Math.round(paidDays * LEAVE_MINUTES_PER_DAY) + deductMinutes;
+            }
+        }
+        double used = usedMinutes / (double) LEAVE_MINUTES_PER_DAY;
 
         return LeaveBalanceDto.builder()
                 .userId(u.getId()).fullName(u.getFullName()).year(y)
@@ -394,6 +552,56 @@ public class EmployeeRequestService {
                 .remainingDays(round2(entitled - used))
                 .missingWorkStartDate(u.getWorkStartDate() == null)
                 .build();
+    }
+
+    /**
+     * Số ngày phép CÓ LƯƠNG đã nghỉ trong 1 tháng của user.
+     *
+     * <p>PHẢI KHỚP CÔNG THỨC với {@code LeaveManagementService.calcPaidLeaveDaysInMonth}
+     * — không thì "Quản lý phép" (OWNER) và "Phiếu của tôi" (nhân viên) sẽ
+     * ra số khác nhau. Về dài hạn nên gom vào 1 helper chung.
+     *
+     * <p>Với phiếu bị auto-split (paidLeaveDays &lt; tổng ngày trong phiếu),
+     * chia tỷ lệ paidDays × (dayValue tháng này / tổng dayValue phiếu) — không
+     * cộng nguyên dayValue của mọi buổi (sẽ ra sai như bug cũ).
+     */
+    private double calcPaidLeaveDaysInMonth(List<EmployeeRequest> leaves, int month, int year) {
+        java.time.LocalDate monthStart = java.time.LocalDate.of(year, month, 1);
+        java.time.LocalDate monthEnd   = monthStart.withDayOfMonth(monthStart.lengthOfMonth());
+        double total = 0;
+
+        for (EmployeeRequest r : leaves) {
+            if (r.getFromDate() == null || r.getToDate() == null) continue;
+            if (r.getToDate().isBefore(monthStart) || r.getFromDate().isAfter(monthEnd)) continue;
+
+            double paidDays = r.getPaidLeaveDays() != null ? r.getPaidLeaveDays() : 0.0;
+            if (paidDays <= 0) continue;
+
+            if (r.getDays() != null && !r.getDays().isEmpty()) {
+                // Chia tỷ lệ để tránh trừ quá phần được duyệt CÓ phép.
+                double totalDayValues = 0;
+                double thisMonthDayValues = 0;
+                for (EmployeeRequest.LeaveDay ld : r.getDays()) {
+                    if (ld.getDate() == null) continue;
+                    double dv = ld.dayValue();
+                    totalDayValues += dv;
+                    if (!ld.getDate().isBefore(monthStart) && !ld.getDate().isAfter(monthEnd)) {
+                        thisMonthDayValues += dv;
+                    }
+                }
+                if (totalDayValues > 0) {
+                    total += paidDays * thisMonthDayValues / totalDayValues;
+                }
+            } else {
+                // Phiếu cũ không có LeaveDay list → chia tỷ lệ theo ngày lịch.
+                java.time.LocalDate effStart = r.getFromDate().isBefore(monthStart) ? monthStart : r.getFromDate();
+                java.time.LocalDate effEnd   = r.getToDate().isAfter(monthEnd) ? monthEnd : r.getToDate();
+                long daysInMonth = effStart.until(effEnd).getDays() + 1;
+                long totalDays   = r.getFromDate().until(r.getToDate()).getDays() + 1;
+                if (totalDays > 0) total += paidDays * daysInMonth / totalDays;
+            }
+        }
+        return total;
     }
 
     /** LỊCH SỬ nghỉ phép đã duyệt trong năm — dữ liệu cho modal "xem chi tiết". */
@@ -416,6 +624,51 @@ public class EmployeeRequestService {
                         .decidedAt(r.getDecidedAt())
                         .build())
                 .toList();
+    }
+
+    /**
+     * CÁC NGÀY ĐÃ BỊ CHIẾM bởi phiếu nghỉ phép (PENDING hoặc đã duyệt) của
+     * một nhân viên trong khoảng ngày.
+     *
+     * <p>FE dùng dữ liệu này để disable ngày đã nghỉ/đang xin, tránh nhân viên
+     * xin nghỉ trùng → bị trừ phép hai lần cho cùng một ngày.
+     */
+    @Transactional(readOnly = true)
+    public List<OccupiedDateDto> occupiedDates(Long userId, LocalDate from, LocalDate to) {
+        List<EmployeeRequest> requests = repo.findOverlapping(
+                userId, EmployeeRequestType.LEAVE, from, to);
+
+        List<OccupiedDateDto> out = new ArrayList<>();
+        for (EmployeeRequest r : requests) {
+            if (r.hasDays()) {
+                for (EmployeeRequest.LeaveDay d : r.getDays()) {
+                    if (!d.getDate().isBefore(from) && !d.getDate().isAfter(to) && !d.isEmpty()) {
+                        out.add(OccupiedDateDto.builder()
+                                .date(d.getDate())
+                                .morning(d.isMorning())
+                                .afternoon(d.isAfternoon())
+                                .status(r.getStatus().name())
+                                .statusLabel(r.getStatus().getLabel())
+                                .requestId(r.getId())
+                                .build());
+                    }
+                }
+            } else {
+                // Phiếu cũ không có danh sách buổi → trải toàn khoảng, cả ngày
+                for (LocalDate d = r.getFromDate().isBefore(from) ? from : r.getFromDate();
+                     !d.isAfter(r.getToDate()) && !d.isAfter(to);
+                     d = d.plusDays(1)) {
+                    out.add(OccupiedDateDto.builder()
+                            .date(d)
+                            .morning(true).afternoon(true)
+                            .status(r.getStatus().name())
+                            .statusLabel(r.getStatus().getLabel())
+                            .requestId(r.getId())
+                            .build());
+                }
+            }
+        }
+        return out;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -498,18 +751,36 @@ public class EmployeeRequestService {
                                                    EmployeeRequestStatus status,
                                                    LocalDate from, LocalDate to,
                                                    int page, int size) {
-        return searchForOwner(dept, status, null, from, to, page, size);
+        return searchForOwner(dept, status, null, null, from, to, page, size);
     }
 
-    /** Như trên nhưng hẹp lại về MỘT nhân viên ({@code userId} null = tất cả). */
+    /** Phase 6b overload: thêm {@code typeFilter} để tách tab WFH khỏi LEAVE. */
     @Transactional(readOnly = true)
     public Page<EmployeeRequestDto> searchForOwner(PayrollDepartment dept,
                                                    EmployeeRequestStatus status,
                                                    Long userId,
                                                    LocalDate from, LocalDate to,
                                                    int page, int size) {
+        return searchForOwner(dept, status, userId, null, from, to, page, size);
+    }
+
+    /**
+     * Phase 6b core overload — thêm filter {@code type}:
+     * <ul>
+     *   <li>null → trả toàn bộ (hành vi cũ, tương thích ngược).</li>
+     *   <li>{@link EmployeeRequestType#LEAVE} → chỉ phiếu nghỉ.</li>
+     *   <li>{@link EmployeeRequestType#WORK_FROM_HOME} → chỉ phiếu WFH.</li>
+     * </ul>
+     */
+    @Transactional(readOnly = true)
+    public Page<EmployeeRequestDto> searchForOwner(PayrollDepartment dept,
+                                                   EmployeeRequestStatus status,
+                                                   Long userId,
+                                                   EmployeeRequestType type,
+                                                   LocalDate from, LocalDate to,
+                                                   int page, int size) {
         Pageable p = PageRequest.of(Math.max(0, page), Math.min(200, Math.max(1, size)));
-        return repo.search(dept, status, userId, from, to, p).map(this::toDto);
+        return repo.search(dept, status, userId, type, from, to, p).map(this::toDto);
     }
 
     @Transactional(readOnly = true)
@@ -550,6 +821,11 @@ public class EmployeeRequestService {
      * @param excusedFrom    đầu khoảng giờ được miễn có mặt (nghỉ ít hơn 1 ngày)
      * @param excusedTo      cuối khoảng giờ được miễn có mặt
      * @param deduction      tổng số công bị trừ theo quyết định của OWNER (0–1)
+     * @param minCredit      MỨC SÀN CÔNG cho ngày MIX (paid + unpaid): 0.5 khi nửa
+     *                       buổi ăn quỹ + nửa buổi không lương, không đi làm.
+     *                       {@code FactoryPayrollService.applyEffect} lan sang
+     *                       {@code DayPlan.minCredit} — đã có sẵn cơ chế này cho
+     *                       nghỉ nửa buổi bên ngoài.
      * @param labels         mô tả để hiển thị trên lịch chi tiết ngày công
      */
     public record DayEffect(boolean fullDayCredit,
@@ -560,15 +836,22 @@ public class EmployeeRequestService {
                             LocalTime excusedFrom,
                             LocalTime excusedTo,
                             double deduction,
-                            List<String> labels) {
+                            double minCredit,
+                            List<String> labels,
+                            /**
+                             * PHASE 6b — TRUE nếu ngày này có đơn WORK_FROM_HOME đã duyệt.
+                             * Dùng để UI tô màu khác với LEAVE và để UI công chi tiết
+                             * hiển thị badge "Làm ở nhà".
+                             */
+                            boolean wfh) {
 
         public static DayEffect none() {
-            return new DayEffect(false, false, true, null, null, null, null, 0.0, List.of());
+            return new DayEffect(false, false, true, null, null, null, null, 0.0, 0.0, List.of(), false);
         }
 
         public boolean isEmpty() {
             return !fullDayCredit && !zeroDay && shiftStart == null && shiftEnd == null
-                    && excusedFrom == null && deduction == 0.0;
+                    && excusedFrom == null && deduction == 0.0 && minCredit == 0.0;
         }
 
         public String label() { return labels.isEmpty() ? null : String.join(" · ", labels); }
@@ -641,7 +924,10 @@ public class EmployeeRequestService {
         boolean fullCredit = false, zero = false;
         LocalTime shiftStart = null, shiftEnd = null, exFrom = null, exTo = null;
         double deduction = 0.0;
+        double minCredit = 0.0;
         List<String> labels = new ArrayList<>();
+        // PHASE 6b: TRUE nếu có bất kỳ đơn WORK_FROM_HOME nào duyệt cho ngày này.
+        boolean wfh = false;
 
         for (EmployeeRequest r : list) {
             labels.add("%s (%s)".formatted(r.getType().getLabel(), r.getStatus().getLabel()));
@@ -650,58 +936,110 @@ public class EmployeeRequestService {
             boolean paid = r.getStatus().isPaid() || r.getType().alwaysFullCredit();
 
             switch (r.getType()) {
+                // ─ PHASE 6b: Làm ở nhà — luôn 1 công đầy đủ, không trừ quỹ phép ─
+                case WORK_FROM_HOME -> {
+                    if (paid) {
+                        fullCredit = true;
+                        wfh = true;    // UI dùng để tô màu + hiển thị badge "WFH"
+                    } else {
+                        zero = true;   // Bị từ chối duyệt → không công
+                    }
+                }
                 // Nghỉ / công tác / quên chấm công: ảnh hưởng CẢ NGÀY,
-                // trừ khi là nghỉ theo khung giờ.
-                case LEAVE, BUSINESS_TRIP, MISSING_PUNCH -> {
+                // trừ khi là nghỉ theo khung giờ.MISSING_PUNCH
+                case LEAVE, BUSINESS_TRIP -> {
                     // Buổi nghỉ CỦA ĐÚNG NGÀY ĐANG XÉT — cùng một phiếu có thể
                     // nghỉ cả ngày 24 nhưng chỉ nghỉ sáng ngày 27.
                     var sess = r.dayAt(date);
                     boolean halfThisDay = (sess != null && !sess.isFullDay()) || r.isHalfDay();
 
-                    if (halfThisDay) {
-                        // NGHỈ NỬA NGÀY:
-                        //   · có phép  → nửa ngày làm + nửa ngày phép = vẫn đủ công,
-                        //                phần trừ nằm ở QUỸ PHÉP (0,5 ngày) chứ không ở công.
-                        //   · không phép → chỉ được nửa công.
-                        if (paid) fullCredit = true;
-                        else deduction += 0.5;
-                    } else if (r.isPartialDay()) {
-                        // Dữ liệu CŨ còn khung giờ — giữ nguyên cách tính để phiếu
-                        // đã duyệt trước đây không đổi kết quả lương.
-                        exFrom = min(exFrom, r.getFromTime());
-                        exTo = max(exTo, r.getToTime());
-                    } else if (paid) {
-                        fullCredit = true;
-                    } else {
-                        zero = true;
+                    // ── MIX: phiếu NGHỈ PHÉP có cả paid & unpaid ────────────
+                    // Chỉ có ý nghĩa khi APPROVED_UNPAID (paid=false) — nếu
+                    // APPROVED_PAID thì OWNER đã chọn hưởng đủ công cho toàn
+                    // phiếu, dùng nhánh cũ (fullCredit) là đủ.
+                    boolean handledAsMix = false;
+                    if (r.getType() == com.nhatnam.server.enumtype.EmployeeRequestType.LEAVE
+                            && !paid) {
+                        Map<LocalDate, EmployeeRequest.SessionPay> spm = r.sessionPayMap();
+                        EmployeeRequest.SessionPay info = spm.get(date);
+                        if (info != null && sess != null) {
+                            boolean mP = info.morningPaid();
+                            boolean aP = info.afternoonPaid();
+
+                            if (halfThisDay) {
+                                // Ngày nghỉ NỬA BUỔI:
+                                //   Buổi nghỉ đó paid → nửa quỹ + nửa đi làm = 1 công.
+                                //   Buổi nghỉ đó unpaid → 0.5 công theo chấm công.
+                                boolean thisSessionPaid = sess.isMorning() ? mP : aP;
+                                if (thisSessionPaid) fullCredit = true;
+                                else deduction += 0.5;
+                            } else {
+                                // Ngày nghỉ FULL:
+                                //   2 buổi paid → 1 công.
+                                //   1 paid + 1 unpaid → 0.5 công (mức sàn).
+                                //   0 buổi paid → 0 công.
+                                int paidSessions = (mP ? 1 : 0) + (aP ? 1 : 0);
+                                switch (paidSessions) {
+                                    case 2 -> fullCredit = true;
+                                    case 1 -> minCredit = Math.max(minCredit, 0.5);
+                                    default -> zero = true;
+                                }
+                            }
+                            handledAsMix = true;
+                        }
+                    }
+
+                    if (!handledAsMix) {
+                        if (halfThisDay) {
+                            // NGHỈ NỬA NGÀY:
+                            //   · có phép  → nửa ngày làm + nửa ngày phép = vẫn đủ công,
+                            //                phần trừ nằm ở QUỸ PHÉP (0,5 ngày) chứ không ở công.
+                            //   · không phép → chỉ được nửa công.
+                            if (paid) fullCredit = true;
+                            else deduction += 0.5;
+                        } else if (r.isPartialDay()) {
+                            // Dữ liệu CŨ còn khung giờ — giữ nguyên cách tính để phiếu
+                            // đã duyệt trước đây không đổi kết quả lương.
+                            exFrom = min(exFrom, r.getFromTime());
+                            exTo = max(exTo, r.getToTime());
+                        } else if (paid) {
+                            fullCredit = true;
+                        } else {
+                            zero = true;
+                        }
                     }
                 }
                 // Đi trễ được duyệt → dời giờ VÀO ca, ngày đó không tính là trễ.
-                case LATE_ARRIVAL -> {
-                    if (paid && r.getMinutes() != null) {
-                        shiftStart = max(shiftStart, SHIFT_START.plusMinutes(r.getMinutes()));
-                    } else if (!paid) {
-                        zero = true;
-                    }
-                }
+//                case LATE_ARRIVAL -> {
+//                    if (paid && r.getMinutes() != null) {
+//                        shiftStart = max(shiftStart, SHIFT_START.plusMinutes(r.getMinutes()));
+//                    } else if (!paid) {
+//                        zero = true;
+//                    }
+//                }
                 // Về sớm được duyệt → kéo giờ TAN ca về sớm tương ứng.
-                case EARLY_LEAVE -> {
-                    if (paid && r.getMinutes() != null) {
-                        shiftEnd = min(shiftEnd, SHIFT_END.minusMinutes(r.getMinutes()));
-                    } else if (!paid) {
-                        zero = true;
-                    }
-                }
+//                case EARLY_LEAVE -> {
+//                    if (paid && r.getMinutes() != null) {
+//                        shiftEnd = min(shiftEnd, SHIFT_END.minusMinutes(r.getMinutes()));
+//                    } else if (!paid) {
+//                        zero = true;
+//                    }
+//                }
             }
         }
 
-        if (zero) fullCredit = false;
+        if (zero) {
+            fullCredit = false;
+            wfh = false;   // Nếu bị override thành 0 công thì không coi là WFH thành công
+        }
 
         return new DayEffect(fullCredit, zero,
                 /* mealEligible */ !zero,
                 shiftStart, shiftEnd, exFrom, exTo,
                 Math.min(1.0, round2(deduction)),
-                labels);
+                Math.min(1.0, minCredit),
+                labels,
+                wfh);
     }
 
     /** Ca chuẩn — giữ trùng khớp với {@code FactoryPayrollService}. */

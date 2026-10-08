@@ -86,6 +86,15 @@ public class OrderDto {
     private Long createdAt;
     private Long updatedAt;
 
+    // ── Hoàn/Đổi SP ──────────────────────────────────────────────────────────
+    private String linkType;
+    private Long   sourceOrderId;
+    private String sourceOrderCode;
+    private String returnExchangeNote;
+    private java.math.BigDecimal pendingRefundAmount;
+    private java.math.BigDecimal refundedAmount;
+    private String refundVoucherCode;
+
     // Items
     private List<OrderItemDto> items;
 }

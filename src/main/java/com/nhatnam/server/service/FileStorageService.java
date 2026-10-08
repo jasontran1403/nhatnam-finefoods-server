@@ -17,6 +17,8 @@ public interface FileStorageService {
     String saveSellerImportReceiptImage(MultipartFile file) throws IOException;
     String saveInventoryImage(MultipartFile file) throws IOException;
     String saveReceiptFile(MultipartFile file) throws IOException;
+    /** Ảnh đính kèm feedback KH — nhiều ảnh trên một feedback, cùng convention với các ảnh nghiệp vụ khác. */
+    String saveFeedbackImage(MultipartFile file) throws IOException;
     String saveCertificateFile(MultipartFile file) throws IOException;
 
     /**

@@ -122,11 +122,23 @@ public enum Permission {
     FACTORY_PRODUCTION_WORKER_CREATE("factory_production_worker:create"),
     FACTORY_PRODUCTION_WORKER_DELETE("factory_production_worker:delete"),
 
+    // ── Nhân viên đóng gói ────────────────────────────────────────────
+    FACTORY_PACKAGING_WORKER_READ("factory_packaging_worker:read"),
+    FACTORY_PACKAGING_WORKER_UPDATE("factory_packaging_worker:update"),
+    FACTORY_PACKAGING_WORKER_CREATE("factory_packaging_worker:create"),
+    FACTORY_PACKAGING_WORKER_DELETE("factory_packaging_worker:delete"),
+
     // ── Quản lý xưởng ─────────────────────────────────────────────────
     FACTORY_MANAGER_READ("factory_manager:read"),
     FACTORY_MANAGER_UPDATE("factory_manager:update"),
     FACTORY_MANAGER_CREATE("factory_manager:create"),
     FACTORY_MANAGER_DELETE("factory_manager:delete"),
+
+    // ── Thu mua (chỉ có duy nhất trang Danh sách yêu cầu VPP) ─────────
+    PURCHASING_READ("purchasing:read"),
+    PURCHASING_UPDATE("purchasing:update"),
+    PURCHASING_CREATE("purchasing:create"),
+    PURCHASING_DELETE("purchasing:delete"),
 
     ;
 

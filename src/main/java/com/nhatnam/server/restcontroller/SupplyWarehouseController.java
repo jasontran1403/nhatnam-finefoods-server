@@ -26,7 +26,7 @@ public class SupplyWarehouseController {
 
     private static final String ROLES_STAFF =
             "hasAnyRole('SUPER_SELLER','SUPER_WAREHOUSE','SUPER_FACTORY_WORKER',"
-            + "'SUPER_ACCOUNTANT','OWNER','ADMIN','SUPERADMIN')";
+                    + "'SUPER_ACCOUNTANT','OWNER','ADMIN','SUPERADMIN')";
     private static final String ROLES_OWNER = "hasAnyRole('OWNER','ADMIN','SUPERADMIN')";
 
     /**
@@ -37,7 +37,7 @@ public class SupplyWarehouseController {
      * nguyên {@link #ROLES_OWNER}.
      */
     private static final String ROLES_OWNER_OR_ACCOUNTANT =
-            "hasAnyRole('OWNER','ADMIN','SUPERADMIN','ACCOUNTANT','SUPER_ACCOUNTANT')";
+            "hasAnyRole('OWNER','ADMIN','SUPERADMIN','ACCOUNTANT','SUPER_ACCOUNTANT','PURCHASING')";
 
     private final SupplyWarehouseService service;
     private final SupplyItemService itemService;
@@ -46,9 +46,15 @@ public class SupplyWarehouseController {
 
     /**
      * Kho user được thao tác. Dùng cho dropdown "kho nhận" khi tạo phiếu và cho
-     * page Rút sử dụng. FE auto-select khi list chỉ có 1 phần tử.
+     * page Rút sử dụng.
+     *
+     * <p>Sau khi module VPP được refactor thành 1 kho duy nhất "Kho Trung tâm"
+     * và MỌI nhân viên đều được gán vào đó, endpoint này phải mở cho toàn bộ
+     * người đăng nhập — không giới hạn ROLES_STAFF nữa. Service đã tự filter
+     * kho theo {@code auth.getName()} nên user chỉ thấy kho được gán, không
+     * leak dữ liệu.
      */
-    @PreAuthorize(ROLES_STAFF)
+    @PreAuthorize("isAuthenticated()")
     @GetMapping("/api/supply-warehouses")
     public ApiResponse<List<SupplyWarehouseDto>> myWarehouses(Authentication auth) {
         return ApiResponse.ok(service.listWarehouses(auth.getName()));

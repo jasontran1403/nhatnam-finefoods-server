@@ -112,6 +112,10 @@ public class EmployeeRequestController {
             @RequestParam(required = false) String department,
             @RequestParam(required = false) String status,
             @RequestParam(required = false) Long userId,
+            // PHASE 6b: filter loại đơn (LEAVE / BUSINESS_TRIP / WORK_FROM_HOME).
+            // FE: tab "Phiếu nghỉ" truyền null (hoặc "LEAVE") để tách rời tab
+            // "Phiếu làm ở nhà" truyền "WORK_FROM_HOME".
+            @RequestParam(required = false) String type,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
             @RequestParam(defaultValue = "0") int page,
@@ -119,9 +123,11 @@ public class EmployeeRequestController {
 
         PayrollDepartment dept = PayrollDepartment.parse(department);
         EmployeeRequestStatus st = parseStatus(status);
+        com.nhatnam.server.enumtype.EmployeeRequestType typeEnum =
+                com.nhatnam.server.enumtype.EmployeeRequestType.parse(type);
 
         return ResponseEntity.ok(ApiResponse.success(
-                service.searchForOwner(dept, st, userId, from, to, page, size), "OK"));
+                service.searchForOwner(dept, st, userId, typeEnum, from, to, page, size), "OK"));
     }
 
     @GetMapping("/summary")
@@ -151,6 +157,22 @@ public class EmployeeRequestController {
     // ══════════════════════════════════════════════════════════════════════════
     //  QUỸ NGÀY PHÉP
     // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Các ngày đã có phiếu nghỉ (PENDING hoặc đã duyệt) trong khoảng ngày.
+     * FE dùng để disable ngày khi tạo phiếu mới, tránh xin nghỉ trùng.
+     */
+    @GetMapping("/my-occupied-dates")
+    public ResponseEntity<ApiResponse<List<OccupiedDateDto>>> myOccupiedDates(
+            @AuthenticationPrincipal User me,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(service.occupiedDates(me.getId(), from, to), "OK"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
+    }
 
     /** Số dư phép CỦA CHÍNH MÌNH — card trên màn hình xin nghỉ phép. */
     @GetMapping("/my-leave-balance")

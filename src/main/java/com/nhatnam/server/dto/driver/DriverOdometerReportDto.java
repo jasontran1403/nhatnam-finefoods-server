@@ -1,7 +1,9 @@
 package com.nhatnam.server.dto.driver;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.util.List;
 
@@ -47,10 +49,26 @@ public class DriverOdometerReportDto {
         private String endDate;
         private String endSession;
 
-        /** endOdometer - startOdometer. Null khi thiếu một trong hai đầu. */
+        /** Tổng km của loại xe này trong kỳ = sum(END.odo - START.odo) các ngày có đủ cả START và END. */
         private Integer km;
 
         /** Số lần điểm danh ghi nhận được trong kỳ cho loại xe này. */
         private Integer recordCount;
+
+        /** Số ngày trong kỳ có đủ cả START và END (đã tính km). */
+        private Integer daysWithData;
+
+        private List<OdoNote> odoNotes;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class OdoNote {
+        private String date;       // "yyyy-MM-dd"
+        private String session;    // "START" hoặc "END"
+        private Integer odometer;  // số ODO lúc đó
+        private String note;       // lý do người nhập ghi
     }
 }

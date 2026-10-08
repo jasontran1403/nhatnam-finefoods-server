@@ -58,10 +58,8 @@ public class SuperSellerOrderService {
     private final IncomeVoucherRepository       incomeVoucherRepository;
     private final FifoDeductService             fifoDeductService;
     private final CartHoldService               cartHoldService;
-    private final OrderService                  orderService; // dùng mapToResponse qua getOrderById
+    private final OrderService                  orderService;
     private final NotificationService           notificationService;
-
-    // ── Search nhân viên theo keyword (tên / username) ────────────────────────
 
     public List<Map<String, Object>> searchStaff(String keyword) {
         if (keyword == null || keyword.isBlank()) return List.of();
@@ -74,9 +72,7 @@ public class SuperSellerOrderService {
         );
 
         return userRepository.findAll().stream()
-                // Có ít nhất 1 role thuộc danh sách cho phép
                 .filter(u -> u.getAllRoles().stream().anyMatch(ALLOWED_ROLES::contains))
-                // Match tên hoặc username
                 .filter(u -> {
                     String fn = u.getFullName() != null ? u.getFullName().toLowerCase() : "";
                     String un = u.getUsername() != null ? u.getUsername().toLowerCase() : "";
@@ -88,7 +84,6 @@ public class SuperSellerOrderService {
                     m.put("id", u.getId());
                     m.put("fullName", u.getFullName() != null ? u.getFullName() : u.getUsername());
                     m.put("username", u.getUsername());
-                    // Trả về tất cả roles để frontend hiển thị
                     m.put("roles", u.getAllRoles().stream()
                             .map(Role::name)
                             .sorted()
@@ -98,8 +93,6 @@ public class SuperSellerOrderService {
                 })
                 .toList();
     }
-
-    // ── Sửa đơn hàng ──────────────────────────────────────────────────────────
 
     @Transactional
     public OrderResponse updateOrder(Long orderId, Long editorUserId,
@@ -186,14 +179,6 @@ public class SuperSellerOrderService {
         order.getOrderItems().clear();
         orderRepository.saveAndFlush(order);
 
-        // Ghi lại toàn bộ deduction của đơn: XOÁ SẠCH rồi tạo đúng 1 dòng / nguyên liệu
-        // theo usage mới.
-        //
-        // Không dùng upsert được, vì trong applyStockDelta FifoDeductService.deduct()
-        // đã tự sinh thêm deduction cho phần TĂNG (mỗi lô HSD một dòng). Upsert chỉ
-        // sửa dòng cũ nên các dòng do FIFO sinh ra bị bỏ lại, khiến tổng deduction của
-        // đơn lớn hơn lượng thực dùng. Lần sửa đơn sau, oldUsageMap đọc từ đống dòng
-        // này sẽ bị thổi phồng → delta âm sai → hoàn kho thừa.
         rewriteDeductions(orderId, warehouseId, now, newUsageMap, ingredientUnitCostMap);
 
         // ── 9. Tính lại giá ──────────────────────────────────────────────
@@ -202,7 +187,8 @@ public class SuperSellerOrderService {
         for (OrderItem oi : newItems) {
             int pct = oi.getDiscountPercent() != null ? oi.getDiscountPercent() : 0;
             if (pct == 0) continue;
-            BigDecimal lineGross = oi.getUnitPrice().multiply(oi.getQuantity());
+            BigDecimal effectiveQty = getEffectiveQuantity(oi);
+            BigDecimal lineGross = oi.getUnitPrice().multiply(effectiveQty);
             itemDiscountTotal = itemDiscountTotal.add(
                     lineGross.multiply(BigDecimal.valueOf(pct))
                             .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP));
@@ -229,9 +215,63 @@ public class SuperSellerOrderService {
         }
 
         BigDecimal afterDiscount = subtotal.subtract(totalDiscount);
-        BigDecimal[] vatResult   = calcVatForItems(newItems, subtotal, afterDiscount);
-        BigDecimal exclusiveVat  = vatResult[0];
-        BigDecimal totalVat      = vatResult[1];
+
+        // TÍNH VAT
+        BigDecimal totalVat     = BigDecimal.ZERO;
+        BigDecimal exclusiveVat = BigDecimal.ZERO;   // ← FIX: tách riêng VAT ngoài giá
+        for (OrderItem item : newItems) {
+            int rate = item.getVatRate() != null ? item.getVatRate() : 0;
+            if (rate == 0) continue;
+
+            // ── tính effective quantity ──
+            BigDecimal effectiveQty = getEffectiveQuantity(item);
+            BigDecimal lineGross = item.getUnitPrice().multiply(effectiveQty);
+
+            int itemDiscPct = item.getDiscountPercent() != null ? item.getDiscountPercent() : 0;
+            BigDecimal itemDiscount = itemDiscPct > 0
+                    ? lineGross.multiply(BigDecimal.valueOf(itemDiscPct))
+                    .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP)
+                    : BigDecimal.ZERO;
+
+            // Tính phần chiết khấu cấp đơn cho item này
+            BigDecimal itemDiscountTotal2 = BigDecimal.ZERO;
+            for (OrderItem oi : newItems) {
+                int pct = oi.getDiscountPercent() != null ? oi.getDiscountPercent() : 0;
+                if (pct == 0) continue;
+                BigDecimal effQty = getEffectiveQuantity(oi);
+                BigDecimal lg = oi.getUnitPrice().multiply(effQty);
+                itemDiscountTotal2 = itemDiscountTotal2.add(
+                        lg.multiply(BigDecimal.valueOf(pct))
+                                .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP));
+            }
+            BigDecimal subtotalAfterItemDisc2 = subtotal.subtract(itemDiscountTotal2);
+            BigDecimal billDisc = subtotal.subtract(afterDiscount).subtract(itemDiscountTotal2);
+            if (billDisc.compareTo(BigDecimal.ZERO) < 0) billDisc = BigDecimal.ZERO;
+
+            BigDecimal billDiscForItem = BigDecimal.ZERO;
+            if (billDisc.compareTo(BigDecimal.ZERO) > 0 && subtotalAfterItemDisc2.compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal itemAfterOwnDisc = lineGross.subtract(itemDiscount);
+                BigDecimal prop = itemAfterOwnDisc.divide(subtotalAfterItemDisc2, 10, RoundingMode.HALF_UP);
+                billDiscForItem = billDisc.multiply(prop).setScale(2, RoundingMode.HALF_UP);
+            }
+
+            BigDecimal itemAfterDisc = lineGross.subtract(itemDiscount).subtract(billDiscForItem);
+            if (itemAfterDisc.compareTo(BigDecimal.ZERO) < 0) itemAfterDisc = BigDecimal.ZERO;
+
+            BigDecimal itemVat;
+            if ("EXCLUSIVE".equals(item.getVatMode())) {
+                // VAT ngoài giá → cộng thêm vào finalAmount
+                itemVat = itemAfterDisc.multiply(BigDecimal.valueOf(rate))
+                        .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+                exclusiveVat = exclusiveVat.add(itemVat);   // ← FIX
+            } else {
+                // VAT trong giá → chỉ hiển thị, KHÔNG cộng vào finalAmount
+                itemVat = itemAfterDisc.multiply(BigDecimal.valueOf(rate))
+                        .divide(BigDecimal.valueOf(100 + rate), 2, RoundingMode.HALF_UP);
+            }
+            item.setVatAmount(itemVat);
+            totalVat = totalVat.add(itemVat);
+        }
 
         // Surcharge
         BigDecimal surcharge;
@@ -252,12 +292,12 @@ public class SuperSellerOrderService {
         order.setSubtotal(subtotal);
         order.setDiscountRate(newDiscountRate);
         order.setDiscountAmount(totalDiscount);
-        order.setVatAmount(totalVat);
+        order.setVatAmount(totalVat);              // lưu tổng VAT (inclusive + exclusive) để hiển thị
         order.setTotalAmount(afterDiscount);
         order.setSurcharge(surcharge);
         order.setSurchargeDetail(surchargeDetail);
-        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge)
-                .setScale(0, RoundingMode.HALF_UP)); // VND không có lẻ — làm tròn nguyên để khớp số tiền thực thu
+        order.setFinalAmount(afterDiscount.add(exclusiveVat).add(surcharge)    // ← FIX: chỉ cộng exclusive
+                .setScale(0, RoundingMode.HALF_UP));
 
         // Thông tin người nhận / đơn
         if (req.getOrderedByName() != null)  order.setOrderedByName(req.getOrderedByName());
@@ -274,9 +314,6 @@ public class SuperSellerOrderService {
             if (req.getHideAllPrices()) order.setShowPrices(true);
         }
         if (req.getPaymentMethod() != null) {
-            // Không cho chuyển sang công nợ khi khách chưa có hợp đồng — cùng quy
-            // tắc với lúc tạo đơn, nếu không thì sửa đơn trở thành đường vòng.
-            // Khách cũ được miễn (xem CustomerContractService.isDebtAllowed).
             if ("DEBT".equalsIgnoreCase(req.getPaymentMethod().trim())
                     && !customerContractService.isDebtAllowed(order.getCustomer())) {
                 throw new RuntimeException(
@@ -288,7 +325,7 @@ public class SuperSellerOrderService {
         order.setUpdatedAt(now);
         Order saved = orderRepository.save(order);
 
-        // ── 11. Warehouse receipt (điều chỉnh kho) ────────────────────────
+        // ── 11. Warehouse receipt ────────────────────────────────────────
         if (!receiptItems.isEmpty()) {
             String editorName = editor.getFullName() != null ? editor.getFullName() : editor.getUsername();
             WarehouseReceipt receipt = WarehouseReceipt.builder()
@@ -316,7 +353,7 @@ public class SuperSellerOrderService {
                             warehouseId, ingId, s.getStockQuantity()));
         }
 
-        // ── 13. Cập nhật deliveryInfo (tài xế) nếu có ────────────────────────
+        // ── 13. Cập nhật deliveryInfo ────────────────────────────────────
         if (req.getDeliveryInfo() != null) {
             try {
                 String json = objectMapper.writeValueAsString(req.getDeliveryInfo());
@@ -329,7 +366,6 @@ public class SuperSellerOrderService {
 
         // ── 14. Order log ─────────────────────────────────────────────────
         String editorName = editor.getFullName() != null ? editor.getFullName() : editor.getUsername();
-        // actorRole: do FE gửi lên (role người yêu cầu sửa), fallback về SELLER
         String actorRole = req.getRequestedByRole() != null && !req.getRequestedByRole().isBlank()
                 ? req.getRequestedByRole().toUpperCase()
                 : "SELLER";
@@ -344,12 +380,8 @@ public class SuperSellerOrderService {
                 .createdAt(now)
                 .build());
 
-        log.info("[SUPER_SELLER_UPDATE] orderId={} editor={} requestedBy={} role={} reason={}",
-                orderId, editorName, req.getRequestedBy(), actorRole, req.getEditReason());
 
-        // ── 15. WS + Notification ─────────────────────────────────────────────
-        // Gửi event ORDER_EDITED — frontend EditOrderModal đang mở sẽ bắt được
-        // editorName trong payload để hiện banner "X vừa sửa đơn này"
+        // ── 15. WS + Notification ─────────────────────────────────────────
         String editedPayload = String.format(
                 "{\"eventType\":\"ORDER_EDITED\",\"orderId\":%d,\"referenceId\":\"%d\",\"orderCode\":\"%s\",\"editorName\":\"%s\"}",
                 saved.getId(), saved.getId(), saved.getOrderCode(), editorName);
@@ -359,12 +391,18 @@ public class SuperSellerOrderService {
         return orderService.getOrderById(orderId);
     }
 
-    // ── Hủy đơn hàng — SUPER_SELLER (mọi trạng thái) ──────────────────────────
 
-    /**
-     * Kiểm tra thông tin trước khi hủy: đơn đã thanh toán chưa, có phiếu thu
-     * liên kết hay không (nếu có, trả về số phiếu thu để FE hiển thị cảnh báo).
-     */
+    // ── Helper: Lấy effective quantity cho BOX products ──────────────────────
+    private BigDecimal getEffectiveQuantity(OrderItem item) {
+        BigDecimal qty = item.getQuantity();
+        if (item.getUnitsPerBox() != null && item.getUnitsPerBox() > 0) {
+            qty = qty.multiply(BigDecimal.valueOf(item.getUnitsPerBox()));
+        }
+        return qty;
+    }
+
+    // ── Hủy đơn hàng ──────────────────────────────────────────────────────────
+
     @Transactional(readOnly = true)
     public Map<String, Object> checkCancelInfo(Long orderId) {
         Order order = orderRepository.findById(orderId)
@@ -389,7 +427,6 @@ public class SuperSellerOrderService {
         return result;
     }
 
-    /** Tìm các phiếu thu (IncomeVoucher) có liên kết tới orderCode truyền vào. */
     private List<String> findLinkedVoucherCodes(String orderCode) {
         if (orderCode == null || orderCode.isBlank()) return List.of();
         List<String> codes = new ArrayList<>();
@@ -409,11 +446,6 @@ public class SuperSellerOrderService {
         }
     }
 
-    /**
-     * Hủy đơn hàng — SUPER_SELLER có thể hủy ở MỌI trạng thái (kể cả đã thanh
-     * toán / đã giao / đã hoàn thành). Hoàn lại toàn bộ tồn kho đã trừ.
-     * Bắt buộc có requestedBy (người yêu cầu hủy) + cancelReason (lý do).
-     */
     @Transactional
     public OrderResponse cancelOrder(Long orderId, Long actorUserId, SuperSellerCancelOrderRequest req) {
         if (req.getRequestedBy() == null || req.getRequestedBy().isBlank())
@@ -434,7 +466,6 @@ public class SuperSellerOrderService {
             throw new RuntimeException("Chỉ SUPER_SELLER hoặc OWNER mới có thể dùng API này");
 
         if (order.getStatus() == OrderStatus.CANCELLED) {
-            // Tìm log hủy trước đó để báo rõ ai đã hủy
             String detail = orderLogRepository.findByOrderIdOrderByCreatedAtAsc(order.getId())
                     .stream().filter(l -> "CANCELLED".equals(l.getAction())).reduce((a, b) -> b)
                     .map(l -> " bởi " + l.getActorName() + " (" + l.getActorRole() + ")"
@@ -445,14 +476,12 @@ public class SuperSellerOrderService {
 
         long now = System.currentTimeMillis();
 
-        // ── Hoàn tồn kho toàn bộ deduction của đơn này ────────────────────
         restoreAllStock(orderId, now);
 
         order.setStatus(OrderStatus.CANCELLED);
         order.setUpdatedAt(now);
         Order saved = orderRepository.save(order);
 
-        // ── Order log ──────────────────────────────────────────────────────
         String actorName = actor.getFullName() != null ? actor.getFullName() : actor.getUsername();
         String requestedByRole = req.getRequestedByRole() != null && !req.getRequestedByRole().isBlank()
                 ? req.getRequestedByRole().toUpperCase() : "SUPER_SELLER";
@@ -467,10 +496,8 @@ public class SuperSellerOrderService {
                 .createdAt(now)
                 .build());
 
-        log.info("[SUPER_SELLER_CANCEL] orderId={} actor={} requestedBy={} role={} reason={}",
-                orderId, actorName, req.getRequestedBy(), requestedByRole, req.getCancelReason());
 
-        // ── WS notify cho người yêu cầu hủy ───────────────────────────────
+
         String cancelPayload = String.format(
                 "{\"eventType\":\"ORDER_CANCELLED\",\"orderId\":%d,\"referenceId\":\"%d\",\"orderCode\":\"%s\",\"actorName\":\"%s\",\"reason\":\"%s\"}",
                 saved.getId(), saved.getId(), saved.getOrderCode(), actorName,
@@ -484,7 +511,6 @@ public class SuperSellerOrderService {
                             cancelMsg, cancelPayload));
         }
 
-        // ── Notify chung cho các role liên quan (giống cancelOrder thông thường) ──
         String broadcastMsg = String.format("%s đã hủy đơn %s. Lý do: %s",
                 actorName, saved.getOrderCode(), req.getCancelReason());
         notifyOrderUpdated(saved, actorUserId, broadcastMsg, cancelPayload);
@@ -492,7 +518,6 @@ public class SuperSellerOrderService {
         return orderService.getOrderById(orderId);
     }
 
-    /** Hoàn trả toàn bộ tồn kho đã trừ cho đơn — dùng khi hủy đơn ở mọi trạng thái. */
     private void restoreAllStock(Long orderId, long now) {
         List<OrderStockDeduction> deductions = orderStockDeductionRepository.findByOrderId(orderId);
         if (deductions.isEmpty()) {
@@ -513,8 +538,6 @@ public class SuperSellerOrderService {
             stock.setUpdatedAt(now);
             ingredientStockRepository.save(stock);
 
-            // Hoàn lô — luôn phải có lô, không nhánh nào được chỉ cộng tồn tổng.
-            // Bỏ sót ở đây là nguồn gốc lệch "có tồn tổng nhưng không lô nào".
             IngredientExpiry linked = d.getIngredientExpiry() != null
                     ? ingredientExpiryRepository.findById(d.getIngredientExpiry().getId()).orElse(null)
                     : null;
@@ -533,12 +556,10 @@ public class SuperSellerOrderService {
                         .createdAt(now).updatedAt(now).build());
             }
 
-            // Broadcast cập nhật tồn kho realtime
             cartHoldService.broadcastIngredientStockUpdate(
                     stock.getWarehouse() != null ? stock.getWarehouse().getId() : null,
                     stock.getIngredientId(), stock.getStockQuantity());
         }
-        log.info("[SUPER_SELLER_CANCEL] Đã hoàn kho {} deduction records cho orderId={}", deductions.size(), orderId);
     }
 
     private void notifyOrderUpdated(Order order, Long actorUserId,
@@ -547,42 +568,28 @@ public class SuperSellerOrderService {
         OrderStatus status = order.getStatus();
         final String EVENT = "ORDER_EDITED";
 
-        log.info("[WS_DEBUG] notifyOrderUpdated — orderId={} orderCode={} status={} actorUserId={} payload={}",
-                order.getId(), order.getOrderCode(), status, actorUserId, payload);
-
-        // ── Người tạo đơn — gửi cho TẤT CẢ roles để đảm bảo nhận được
-        // dù họ đang login bằng role nào (SELLER, WAREHOUSE, v.v.)
         if (order.getUser() != null) {
             User creator = order.getUser();
             if (actorUserId == null || !actorUserId.equals(creator.getId())) {
                 Set<Role> creatorRoles = creator.getAllRoles();
                 if (creatorRoles.isEmpty()) {
                     String fallback = creator.getRole() != null ? creator.getRole().name() : "SELLER";
-                    log.info("[WS_DEBUG] → gửi cho creator userId={} name={} role={} (fallback)", creator.getId(), creator.getFullName(), fallback);
                     notificationService.sendToUser(creator, fallback, EVENT, message, payload);
                 } else {
                     for (Role r : creatorRoles) {
-                        log.info("[WS_DEBUG] → gửi cho creator userId={} name={} role={}", creator.getId(), creator.getFullName(), r.name());
                         notificationService.sendToUser(creator, r.name(), EVENT, message, payload);
                     }
                 }
                 notified.add(creator.getId());
-            } else {
-                log.info("[WS_DEBUG] → bỏ qua creator userId={} vì là actor", creator.getId());
             }
-        } else {
-            log.warn("[WS_DEBUG] → order.getUser() = null, không tìm được creator");
         }
 
-        // ── DELIVERING: thêm WAREHOUSE + SUPER_WAREHOUSE ─────────────────────
         if (status == OrderStatus.DELIVERING) {
             for (Role r : List.of(Role.WAREHOUSE, Role.SUPER_WAREHOUSE)) {
                 List<User> users = userRepository.findByRoleAndIsLockAccountFalse(r);
-                log.info("[WS_DEBUG] → DELIVERING: tìm thấy {} user role={}", users.size(), r);
                 users.forEach(u -> {
                     if (!notified.contains(u.getId())
                             && (actorUserId == null || !actorUserId.equals(u.getId()))) {
-                        log.info("[WS_DEBUG]   → gửi userId={} name={} role={}", u.getId(), u.getFullName(), r.name());
                         notificationService.sendToUser(u, r.name(), EVENT, message, payload);
                         notified.add(u.getId());
                     }
@@ -590,23 +597,18 @@ public class SuperSellerOrderService {
             }
         }
 
-        // ── PENDING_PAYMENT / COMPLETED: thêm OWNER, ACCOUNTANT, SUPER_ACCOUNTANT ──
         if (status == OrderStatus.PENDING_PAYMENT || status == OrderStatus.COMPLETED) {
             for (Role r : List.of(Role.OWNER, Role.ACCOUNTANT, Role.SUPER_ACCOUNTANT)) {
                 List<User> users = userRepository.findByRoleAndIsLockAccountFalse(r);
-                log.info("[WS_DEBUG] → PENDING_PAYMENT/COMPLETED: tìm thấy {} user role={}", users.size(), r);
                 users.forEach(u -> {
                     if (!notified.contains(u.getId())
                             && (actorUserId == null || !actorUserId.equals(u.getId()))) {
-                        log.info("[WS_DEBUG]   → gửi userId={} name={} role={}", u.getId(), u.getFullName(), r.name());
                         notificationService.sendToUser(u, r.name(), EVENT, message, payload);
                         notified.add(u.getId());
                     }
                 });
             }
         }
-
-        log.info("[WS_DEBUG] notifyOrderUpdated xong — đã gửi cho {} user: {}", notified.size(), notified);
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -673,7 +675,6 @@ public class SuperSellerOrderService {
 
             BigDecimal before = stock.getStockQuantity();
             if (delta.compareTo(BigDecimal.ZERO) > 0) {
-                // Tăng usage → trừ kho
                 if (stock.getStockQuantity().compareTo(delta) < 0)
                     throw new BusinessException(String.format(
                             "Không đủ tồn kho '%s' tại kho '%s' (còn: %s, cần thêm: %s %s)",
@@ -695,10 +696,6 @@ public class SuperSellerOrderService {
                         .quantityAfter(after).difference(delta.negate()).build());
 
             } else {
-                // Giảm usage → hoàn kho.
-                // LƯU Ý: chỉ CHỖ NÀY được ghi stockQuantity. restoreStock() bên dưới
-                // chỉ gỡ bản ghi deduction + trả lại lô HSD + hoàn giá vốn — nếu nó
-                // cộng stockQuantity thêm lần nữa thì tồn sẽ tăng GẤP ĐÔI lượng hoàn.
                 BigDecimal restore = delta.abs();
                 BigDecimal after = before.add(restore).setScale(3, RoundingMode.HALF_UP);
                 stock.setStockQuantity(after); stock.setUpdatedAt(now);
@@ -714,7 +711,6 @@ public class SuperSellerOrderService {
             }
         }
 
-        // Cost map cho ingredient không thay đổi (giữ nguyên cost cũ)
         for (Long ingId : oldUsageMap.keySet()) {
             if (!deltaMap.containsKey(ingId)) {
                 BigDecimal oldQty = oldUsageMap.get(ingId);
@@ -730,15 +726,6 @@ public class SuperSellerOrderService {
         }
     }
 
-    /**
-     * Gỡ phần đã trừ kho của đơn khi số lượng GIẢM: cuốn ngược bản ghi deduction
-     * (mới nhất trước), TRẢ LẠI lô hạn sử dụng và HOÀN giá vốn cho tồn kho.
-     *
-     * <p><b>KHÔNG chạm vào {@code stockQuantity}.</b> Số lượng tồn do
-     * {@link #applyStockDelta} ghi một lần duy nhất theo đúng delta. Trước đây hàm này
-     * cũng cộng {@code stockQuantity}, nên mỗi lần giảm/xoá sản phẩm tồn kho bị cộng
-     * hai lần — giảm 0.5kg thì tồn tăng 1kg.
-     */
     private void restoreStock(Long orderId, Long ingId, BigDecimal restore, long now) {
         List<OrderStockDeduction> deductions = orderStockDeductionRepository.findByOrderId(orderId)
                 .stream()
@@ -757,7 +744,6 @@ public class SuperSellerOrderService {
             BigDecimal canRestore = remaining.min(d.getQuantity());
             remaining = remaining.subtract(canRestore);
 
-            // Trả lại số lượng cho đúng lô HSD đã trừ, để tổng các lô không lệch tồn kho
             IngredientExpiry lot = d.getIngredientExpiry();
             if (lot != null) {
                 lot.setQuantity(lot.getQuantity().add(canRestore).setScale(3, RoundingMode.HALF_UP));
@@ -765,7 +751,6 @@ public class SuperSellerOrderService {
                 ingredientExpiryRepository.save(lot);
             }
 
-            // Hoàn giá vốn tương ứng — FifoDeductService đã trừ totalCostValue lúc xuất
             if (d.getCostPrice() != null)
                 costBack = costBack.add(d.getCostPrice().multiply(canRestore));
 
@@ -783,15 +768,6 @@ public class SuperSellerOrderService {
         }
     }
 
-    /**
-     * Ghi lại bảng deduction của đơn cho khớp CHÍNH XÁC lượng nguyên liệu đang dùng:
-     * xoá hết dòng cũ (kể cả dòng do FIFO sinh thêm trong lúc trừ delta) rồi tạo đúng
-     * một dòng cho mỗi nguyên liệu.
-     *
-     * <p>Bảng này là nguồn duy nhất để tính {@code oldUsageMap} ở lần sửa đơn kế tiếp,
-     * nên nó phải bằng đúng lượng thực dùng — sai ở đây là sai dây chuyền cho mọi lần
-     * sửa về sau.
-     */
     private void rewriteDeductions(Long orderId, Long warehouseId, long now,
                                    Map<Long, BigDecimal> newUsageMap,
                                    Map<Long, BigDecimal> costMap) {
@@ -826,7 +802,6 @@ public class SuperSellerOrderService {
         Long tierId = null;
         String tierName = null;
         BigDecimal tierPriceSnap = null;
-        Integer discountPct = null;
 
         if (Boolean.TRUE.equals(itemReq.getIsManualPrice()) && itemReq.getSentUnitPrice() != null) {
             unitPrice = itemReq.getSentUnitPrice();
@@ -840,8 +815,6 @@ public class SuperSellerOrderService {
                 tierName = tier.getTierName();
                 tierPriceSnap = tier.getPrice();
             } else {
-                // Tier không còn tồn tại (VD: product đã được sửa lại bảng giá).
-                // Thông tin món đã được snapshot ở order item cũ → dùng lại snapshot đó.
                 OrderItem oldSnap = order.getOrderItems().stream()
                         .filter(oi -> itemReq.getTierId().equals(oi.getTierId())
                                 && itemReq.getProductId().equals(oi.getProductId()))
@@ -852,7 +825,6 @@ public class SuperSellerOrderService {
                     tierName = oldSnap.getTierName();
                     tierPriceSnap = oldSnap.getTierPriceSnapshot();
                 } else if (itemReq.getSentUnitPrice() != null) {
-                    // Không có snapshot cũ nhưng client gửi giá → dùng giá client gửi.
                     unitPrice = itemReq.getSentUnitPrice();
                     tierId = itemReq.getTierId();
                     tierPriceSnap = itemReq.getSentUnitPrice();
@@ -863,15 +835,23 @@ public class SuperSellerOrderService {
         } else {
             unitPrice = product.getBasePrice();
             priceMode = "BASE";
-            discountPct = itemReq.getDiscountPercent();
         }
 
+        // Lấy discountPercent từ request
+        Integer discountPercent = itemReq.getDiscountPercent();
+
+        // Xác định unitsPerBox từ product
         boolean isBOX = "BOX".equals(itemReq.getSaleType());
         Integer unitsPerBox = isBOX ? product.getUnitsPerBox() : null;
-        BigDecimal effectiveMultiplier = (unitsPerBox != null && unitsPerBox > 0)
-                ? itemReq.getQuantity().multiply(BigDecimal.valueOf(unitsPerBox))
-                : itemReq.getQuantity();
-        BigDecimal subtotal = unitPrice.multiply(effectiveMultiplier).setScale(2, RoundingMode.HALF_UP);
+
+        // Tính effective quantity
+        BigDecimal effectiveQuantity = itemReq.getQuantity();
+        if (unitsPerBox != null && unitsPerBox > 0) {
+            effectiveQuantity = itemReq.getQuantity().multiply(BigDecimal.valueOf(unitsPerBox));
+        }
+
+        // Tính subtotal
+        BigDecimal subtotal = unitPrice.multiply(effectiveQuantity).setScale(2, RoundingMode.HALF_UP);
 
         int vatRatePct = itemReq.getVatRate() != null ? itemReq.getVatRate()
                 : (product.getVatRate() != null ? product.getVatRate().getPercentage() : 0);
@@ -883,20 +863,30 @@ public class SuperSellerOrderService {
 
         OrderItem item = OrderItem.builder()
                 .order(order)
-                .productId(product.getId()).productName(product.getName())
-                .productImageUrl(product.getImageUrl()).unit(unit)
-                .categorySnapshot(product.getCategory()).skuSnapshot(product.getSku())
+                .productId(product.getId())
+                .productName(product.getName())
+                .productImageUrl(product.getImageUrl())
+                .unit(unit)
+                .categorySnapshot(product.getCategory())
+                .skuSnapshot(product.getSku())
                 .packagingDescriptionSnapshot(product.getPackagingDescription())
                 .maxDiscountRateSnapshot(product.getMaxDiscountRate())
                 .saleType(itemReq.getSaleType() != null ? itemReq.getSaleType() : "RETAIL")
                 .unitsPerBox(unitsPerBox)
-                .basePrice(product.getBasePrice()).unitPrice(unitPrice).priceMode(priceMode)
-                .tierId(tierId).tierName(tierName).tierPriceSnapshot(tierPriceSnap)
-                .discountPercent(discountPct)
+                .basePrice(product.getBasePrice())
+                .unitPrice(unitPrice)
+                .priceMode(priceMode)
+                .tierId(tierId)
+                .tierName(tierName)
+                .tierPriceSnapshot(tierPriceSnap)
+                .discountPercent(discountPercent)  // ← QUAN TRỌNG: set discountPercent từ request
                 .vatRate(vatRatePct)
-                .vatMode(product.getVatMode() != null ? product.getVatMode().name() : "INCLUSIVE")
+                .vatMode(itemReq.getVatMode() != null
+                        ? itemReq.getVatMode()
+                        : (product.getVatMode() != null ? product.getVatMode().name() : "INCLUSIVE"))
                 .vatAmount(BigDecimal.ZERO)
-                .quantity(itemReq.getQuantity()).subtotal(subtotal)
+                .quantity(itemReq.getQuantity())
+                .subtotal(subtotal)
                 .notes(itemReq.getNotes())
                 .orderItemIngredients(new ArrayList<>())
                 .build();
@@ -914,15 +904,19 @@ public class SuperSellerOrderService {
                     : effQty.setScale(0, RoundingMode.CEILING).multiply(qtyPerUnit).setScale(3, RoundingMode.HALF_UP);
             usageMap.merge(ingId, usage, BigDecimal::add);
             oiIngredients.add(OrderItemIngredient.builder()
-                    .orderItem(item).ingredientId(ingId)
+                    .orderItem(item)
+                    .ingredientId(ingId)
                     .ingredientName(pi.getIngredientNameSnapshot())
                     .ingredientImageUrl(pi.getIngredientImageUrlSnapshot())
                     .unit(pi.getIngredientUnitSnapshot())
-                    .quantityUsed(usage).qtyPerUnit(qtyPerUnit).build());
+                    .quantityUsed(usage)
+                    .qtyPerUnit(qtyPerUnit)
+                    .build());
         }
         item.setOrderItemIngredients(oiIngredients);
         return item;
     }
+
 
     private BigDecimal calcDiscountAmount(BigDecimal subtotal, BigDecimal amtInput,
                                           Integer rateInput, int rateCurrent) {
@@ -936,30 +930,6 @@ public class SuperSellerOrderService {
                 ? subtotal.multiply(BigDecimal.valueOf(rate))
                 .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP)
                 : BigDecimal.ZERO.setScale(2);
-    }
-
-    private BigDecimal[] calcVatForItems(List<OrderItem> items,
-                                         BigDecimal subtotal, BigDecimal afterDiscount) {
-        BigDecimal exclusiveVat = BigDecimal.ZERO, totalVat = BigDecimal.ZERO;
-        for (OrderItem item : items) {
-            int rate = item.getVatRate() == null ? 0 : item.getVatRate();
-            if (rate == 0) continue;
-            BigDecimal proportion = subtotal.compareTo(BigDecimal.ZERO) == 0 ? BigDecimal.ZERO
-                    : item.getSubtotal().divide(subtotal, 10, RoundingMode.HALF_UP);
-            BigDecimal itemAfterDisc = afterDiscount.multiply(proportion);
-            BigDecimal itemVat;
-            if ("EXCLUSIVE".equals(item.getVatMode())) {
-                itemVat = itemAfterDisc.multiply(BigDecimal.valueOf(rate))
-                        .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
-                exclusiveVat = exclusiveVat.add(itemVat);
-            } else {
-                itemVat = itemAfterDisc.multiply(BigDecimal.valueOf(rate))
-                        .divide(BigDecimal.valueOf(100 + rate), 2, RoundingMode.HALF_UP);
-            }
-            item.setVatAmount(itemVat);
-            totalVat = totalVat.add(itemVat);
-        }
-        return new BigDecimal[]{ exclusiveVat, totalVat };
     }
 
     private BigDecimal calcSurchargeTotal(List<CreateOrderRequest.SurchargeItem> items) {

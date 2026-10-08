@@ -9,11 +9,44 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
 @Repository
 public interface UserRepository extends JpaRepository<User, Long> {
+    @Query("""
+    SELECT u FROM User u
+    WHERE u.deleted = false
+      AND u.isLockAccount = false
+      AND (
+        LOWER(u.fullName) LIKE LOWER(CONCAT('%', :keyword, '%'))
+        OR LOWER(u.username) LIKE LOWER(CONCAT('%', :keyword, '%'))
+      )
+    ORDER BY u.fullName
+    """)
+    List<User> searchActiveByKeyword(
+            @Param("keyword") String keyword,
+            Pageable pageable
+    );
+
+    @Query("""
+    SELECT u FROM User u
+    WHERE u.deleted = false
+      AND u.isLockAccount = false
+      AND u.payrollRole IN :roles
+      AND (
+        LOWER(u.fullName) LIKE LOWER(CONCAT('%', :keyword, '%'))
+        OR LOWER(u.username) LIKE LOWER(CONCAT('%', :keyword, '%'))
+      )
+    ORDER BY u.fullName
+    """)
+    List<User> searchByPayrollRolesAndKeyword(
+            @Param("roles") Collection<Role> roles,
+            @Param("keyword") String keyword,
+            Pageable pageable
+    );
+
     /**
      * User đang hoạt động có role đã cho — xét CẢ {@code _user_roles} lẫn role chính.
      * (Trước đây chỉ JOIN u.roles nên bỏ sót user cũ chỉ có {@code u.role}.)

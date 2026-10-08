@@ -9,7 +9,10 @@ import lombok.*;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * ĐƠN DO NHÂN VIÊN TỰ TẠO — nghỉ phép / công tác / đi trễ / về sớm / quên chấm công.
@@ -335,5 +338,45 @@ public class EmployeeRequest {
     public double effectiveDeduction() {
         if (status != EmployeeRequestStatus.APPROVED_DEDUCTED || deductedDays == null) return 0.0;
         return Math.max(0.0, Math.min(1.0, deductedDays));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // MIX: PHÂN BỔ NGÀY PHÉP THEO BUỔI
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Buổi nào của một ngày trong phiếu được ăn quỹ phép (paid), buổi nào phải
+     * chịu không lương (unpaid). Dùng khi phiếu duyệt kiểu MIX — cả
+     * {@code paidLeaveDays} lẫn {@code unpaidLeaveDays} đều {@code > 0}.
+     */
+    public record SessionPay(boolean morningPaid, boolean afternoonPaid) {}
+
+    /**
+     * Bảng tra "buổi nào paid" cho từng ngày của phiếu, phân bổ THEO THỨ TỰ
+     * THỜI GIAN: ngày sớm nhất → buổi sáng trước, chiều sau. Cấp paid cho tới
+     * khi hết {@code paidLeaveDays} buổi, còn lại là unpaid.
+     *
+     * <p>Trả map RỖNG khi phiếu không phải nghỉ phép hoặc không có phần paid.
+     * Người gọi ({@code EmployeeRequestService.merge}) tự hiểu map rỗng =
+     * không cần xử lý MIX, cứ theo status flag như cũ.
+     */
+    public Map<LocalDate, SessionPay> sessionPayMap() {
+        if (type != com.nhatnam.server.enumtype.EmployeeRequestType.LEAVE) return Map.of();
+        if (paidLeaveDays == null || paidLeaveDays <= 0 || !hasDays()) return Map.of();
+
+        // Bản sao đã sắp theo NGÀY tăng dần — thứ tự trong days không đảm bảo
+        // sau khi JPA load.
+        List<LeaveDay> sorted = new ArrayList<>(days);
+        sorted.sort(Comparator.comparing(LeaveDay::getDate));
+
+        double budget = paidLeaveDays;
+        Map<LocalDate, SessionPay> out = new HashMap<>();
+        for (LeaveDay ld : sorted) {
+            boolean mP = false, aP = false;
+            if (ld.isMorning() && budget >= 0.5 - 0.001) { mP = true; budget -= 0.5; }
+            if (ld.isAfternoon() && budget >= 0.5 - 0.001) { aP = true; budget -= 0.5; }
+            out.put(ld.getDate(), new SessionPay(mP, aP));
+        }
+        return out;
     }
 }

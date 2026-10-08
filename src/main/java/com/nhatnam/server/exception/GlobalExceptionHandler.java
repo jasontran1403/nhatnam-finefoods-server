@@ -1,10 +1,6 @@
 package com.nhatnam.server.exception;
 
-import com.nhatnam.server.common.BusinessException;
-import com.nhatnam.server.common.OutOfStockException;
-import com.nhatnam.server.common.RateLimitException;
-import com.nhatnam.server.common.ResourceNotFoundException;
-import com.nhatnam.server.common.StaleOrderDataException;
+import com.nhatnam.server.common.*;
 import com.nhatnam.server.dto.income.StaleOrderConflictResponse;
 import com.nhatnam.server.dto.response.ApiResponse;
 import com.nhatnam.server.enumtype.StatusCode;
@@ -47,10 +43,46 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }
 
+    /**
+     * BUG FIX (all stock races): trả HTTP 200 + ApiResponse với code OUT_OF_STOCK
+     * và data structured để FE hiển thị inline error tại field ingredient bị thiếu.
+     *
+     * <p>QUAN TRỌNG: handler này phải đặt TRƯỚC handleBusiness vì InsufficientStock
+     * extends Business — Spring chọn handler theo thứ tự cụ thể trước tổng quát.
+     */
+    @ExceptionHandler(InsufficientStockException.class)
+    public ResponseEntity<ApiResponse<java.util.Map<String, Object>>> handleInsufficientStock(
+            InsufficientStockException e) {
+        java.util.Map<String, Object> detail = new java.util.LinkedHashMap<>();
+        detail.put("reason", "INSUFFICIENT_STOCK");
+        detail.put("ingredientId", e.getIngredientId());
+        detail.put("warehouseId", e.getWarehouseId());
+        detail.put("ingredientName", e.getIngredientName());
+        detail.put("warehouseName", e.getWarehouseName());
+        detail.put("unit", e.getUnit());
+        detail.put("available", e.getAvailable());
+        detail.put("onHand", e.getOnHand());
+        detail.put("held", e.getHeld());
+        detail.put("needed", e.getNeeded());
+
+        log.info("[INSUFFICIENT_STOCK] ingId={} whId={} needed={} available={} held={}",
+                e.getIngredientId(), e.getWarehouseId(), e.getNeeded(),
+                e.getAvailable(), e.getHeld());
+
+        return ResponseEntity.ok(
+                ApiResponse.error(StatusCode.OUT_OF_STOCK, detail, e.getMessage()));
+    }
+
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException e) {
         return ResponseEntity.ok(
                 ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+    }
+
+    @ExceptionHandler(ConflictException.class)
+    public ResponseEntity<ApiResponse<?>> handleConflict(ConflictException e) {
+        return ResponseEntity.status(409)
+                .body(ApiResponse.error(StatusCode.NOT_FOUND, e.getMessage()));
     }
 
     @ExceptionHandler(OutOfStockException.class)

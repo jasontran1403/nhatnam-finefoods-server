@@ -689,7 +689,7 @@ public class SupplierManagementService {
     private VendorExpenseCategoryDto toCategoryDto(VendorExpenseCategory c) {
         return VendorExpenseCategoryDto.builder()
                 .id(c.getId())
-                .vendorId(null)            // pool chung — không thuộc NCC nào
+                .vendorId(null)
                 .name(c.getName())
                 .description(c.getDescription())
                 .active(c.isActive())

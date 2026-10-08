@@ -25,6 +25,32 @@ import java.util.List;
 @Repository
 public interface EmployeeRequestRepository extends JpaRepository<EmployeeRequest, Long> {
 
+    @Query("""
+            SELECT r FROM EmployeeRequest r
+            WHERE r.user.id = :userId
+              AND r.type = com.nhatnam.server.enumtype.EmployeeRequestType.LEAVE
+              AND r.status IN (com.nhatnam.server.enumtype.EmployeeRequestStatus.APPROVED_PAID,
+                               com.nhatnam.server.enumtype.EmployeeRequestStatus.APPROVED_UNPAID,
+                               com.nhatnam.server.enumtype.EmployeeRequestStatus.APPROVED_DEDUCTED)
+              AND r.fromDate <= :monthEnd
+              AND r.toDate   >= :monthStart
+            ORDER BY r.fromDate ASC
+            """)
+    List<EmployeeRequest> findApprovedLeavesInMonth(@Param("userId") Long userId,
+                                                    @Param("monthStart") LocalDate monthStart,
+                                                    @Param("monthEnd") LocalDate monthEnd);
+
+    @Query("""
+            SELECT r FROM EmployeeRequest r
+              JOIN FETCH r.user u
+            WHERE r.type = com.nhatnam.server.enumtype.EmployeeRequestType.LEAVE
+              AND r.status IN (com.nhatnam.server.enumtype.EmployeeRequestStatus.APPROVED_PAID,
+                               com.nhatnam.server.enumtype.EmployeeRequestStatus.APPROVED_UNPAID,
+                               com.nhatnam.server.enumtype.EmployeeRequestStatus.APPROVED_DEDUCTED)
+              AND YEAR(r.fromDate) = :year
+            ORDER BY u.id ASC, r.fromDate ASC
+            """)
+    List<EmployeeRequest> findAllApprovedLeavesOfYear(@Param("year") int year);
     // ══════════════════════════════════════════════════════════════════════════
     // PHỤC VỤ TÍNH LƯƠNG
     // ══════════════════════════════════════════════════════════════════════════
@@ -72,11 +98,17 @@ public interface EmployeeRequestRepository extends JpaRepository<EmployeeRequest
      * Truyền {@code null} vào tham số nào thì bỏ qua điều kiện đó, tránh phải
      * viết bốn biến thể query gần giống nhau.
      */
+    /**
+     * PHASE 6b (10/2026): thêm tham số {@code type} để FE lọc riêng tab "Phiếu
+     * nghỉ" (LEAVE/BUSINESS_TRIP) và tab "Phiếu làm ở nhà" (WORK_FROM_HOME).
+     * Truyền {@code null} vào tham số nào thì bỏ qua điều kiện đó.
+     */
     @Query("""
            SELECT r FROM EmployeeRequest r
             WHERE (:dept   IS NULL OR r.department = :dept)
               AND (:status IS NULL OR r.status     = :status)
               AND (:userId IS NULL OR r.user.id    = :userId)
+              AND (:type   IS NULL OR r.type       = :type)
               AND (:from   IS NULL OR r.toDate    >= :from)
               AND (:to     IS NULL OR r.fromDate  <= :to)
             ORDER BY
@@ -87,6 +119,7 @@ public interface EmployeeRequestRepository extends JpaRepository<EmployeeRequest
     Page<EmployeeRequest> search(@Param("dept") PayrollDepartment dept,
                                  @Param("status") EmployeeRequestStatus status,
                                  @Param("userId") Long userId,
+                                 @Param("type") com.nhatnam.server.enumtype.EmployeeRequestType type,
                                  @Param("from") LocalDate from,
                                  @Param("to") LocalDate to,
                                  Pageable pageable);

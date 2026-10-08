@@ -71,9 +71,10 @@ public interface OrderService {
     OrderResponse markAsPreparing(Long orderId, Long userId);
     OrderResponse markAsCompleted(Long orderId, String actorName);
     OrderResponse markAsCompleted(Long orderId, String actorName, Long actorUserId);
+    void markAsCompletedNoFixedPaidAmount(Long orderId, String actorName, Long actorUserId);
     OrderResponse markAsPendingPayment(Long orderId, String actorName);
     OrderResponse markAsPendingPayment(Long orderId, String actorName, Long actorUserId);
-    OrderResponse updatePaymentMethod(Long orderId, String paymentMethod, String actorName);
+    void updatePaymentMethod(Long orderId, String paymentMethod, String actorName);
     OrderResponse markAsDelivering(Long orderId, String actorName);
     OrderResponse markAsDelivering(Long orderId, String actorName, Long actorUserId);
 

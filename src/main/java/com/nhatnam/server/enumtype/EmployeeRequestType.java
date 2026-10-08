@@ -1,3 +1,6 @@
+// ──────────────────────────────────────────────────────────────────────
+// PATH: src/main/java/com/nhatnam/server/enumtype/EmployeeRequestType.java
+// ──────────────────────────────────────────────────────────────────────
 package com.nhatnam.server.enumtype;
 
 import java.util.Arrays;
@@ -5,66 +8,72 @@ import java.util.Arrays;
 /**
  * LOẠI ĐƠN NHÂN VIÊN TỰ TẠO trên trang "Tạo phiếu".
  *
- * <p>Khác hẳn với {@link AttendanceExceptionType} — cái đó mô tả NGOẠI LỆ đã
- * được chốt và đưa vào công thức tính công. Enum này mô tả CÁI NHÂN VIÊN XIN,
- * lúc tạo ra chưa có hiệu lực gì cả; phải qua tay OWNER duyệt mới tác động tới
- * bảng chấm công.
- *
- * <h3>Hai nhóm hoàn toàn khác nhau về mặt thời gian</h3>
- * <pre>
- *   NHÓM KHOẢNG NGÀY  (rangeBased = true)
- *     LEAVE          Nghỉ phép   — từ ngày … đến ngày …, có thể kèm khung giờ
- *                                  nếu xin nghỉ ÍT HƠN 1 ngày (VD nghỉ 3 tiếng chiều)
- *     BUSINESS_TRIP  Công tác    — từ ngày … đến ngày …
- *
- *   NHÓM MỘT NGÀY     (rangeBased = false)
- *     LATE_ARRIVAL   Đi trễ          — 1 ngày + SỐ PHÚT xin trễ
- *     EARLY_LEAVE    Về sớm          — 1 ngày + SỐ PHÚT xin về sớm
- *     MISSING_PUNCH  Quên chấm công  — 1 ngày, không cần giờ
- * </pre>
- *
  * <h3>Cửa sổ ngày được phép chọn khi tạo đơn</h3>
- * Quy tắc nằm ở {@link #minOffsetDays()} / {@link #maxOffsetDays()}, tính theo
- * số ngày lệch so với HÔM NAY. Việc đặt ở enum (thay vì rải rác trong service và
- * component React) để FE và BE không bao giờ lệch nhau về luật:
  * <ul>
- *   <li>Nghỉ phép / Công tác — từ HÔM NAY trở đi, không được chọn quá khứ.
- *       Xin nghỉ cho ngày đã trôi qua thì không còn là "xin" nữa.</li>
- *   <li>Đi trễ / Về sớm / Quên chấm công — chỉ HÔM QUA, HÔM NAY, NGÀY MAI.
- *       Ba loại này bản chất là đính chính dữ liệu máy chấm công nên phải khai
- *       gần thời điểm xảy ra, tránh khai bù cả tháng vào cuối kỳ.</li>
+ *   <li>Nghỉ phép — LÙI: ngày 1 tháng hiện tại; TIẾN: không giới hạn.
+ *       (Hôm nay tháng 9 vẫn xin nghỉ cho tháng 12 được.)</li>
+ *   <li>Công tác — 7 ngày trước → không giới hạn tương lai.</li>
+ *   <li>Đi trễ / Về sớm / Quên chấm công — 7 ngày trước → 7 ngày sau.</li>
  * </ul>
+ * Với các loại dùng offset, offset KHÔNG tính ngày hiện tại:
+ * -7 nghĩa là đúng 7 ngày trước hôm nay.
  */
 public enum EmployeeRequestType {
 
     /** Nghỉ phép — khoảng ngày; kèm khung giờ nếu nghỉ ít hơn 1 ngày. */
-    LEAVE("Nghỉ phép", true, false, 0, null),
+    LEAVE("Nghỉ phép", true, false, -7, null, true),
 
     /** Đi công tác — khoảng ngày, luôn tính đủ công. */
-    BUSINESS_TRIP("Công tác", true, false, 0, null),
+    BUSINESS_TRIP("Công tác", true, false, -7, null, false),
 
-    /** Đi trễ — 1 ngày, khai SỐ PHÚT xin trễ. */
-    LATE_ARRIVAL("Đi trễ", false, true, -1, 1),
+    /**
+     * PHASE 6b (10/2026): LÀM Ở NHÀ / TỪ XA.
+     *
+     * <p>Dành cho nhân viên không thể đến công ty (ốm nhẹ, trời bão, kẹt xe
+     * dài, đang trông con…) nhưng vẫn làm việc được từ xa. OWNER / ADMIN duyệt;
+     * ngày WFH được duyệt sẽ tính 1 công ĐẦY ĐỦ như đi làm thật — không trừ
+     * quỹ phép năm, không trừ phụ cấp cơm.
+     *
+     * <h3>So với các loại khác</h3>
+     * <ul>
+     *   <li>Khác {@link #LEAVE}: không rút quỹ phép, không có khái niệm "nửa
+     *       ngày paid / unpaid" — WFH đã duyệt = 1 công.</li>
+     *   <li>Giống {@link #BUSINESS_TRIP}: {@link #alwaysFullCredit()} = true.</li>
+     * </ul>
+     *
+     * <p>Cửa sổ chọn ngày: -7 tới +∞ (nhân viên có thể báo trước nhiều tháng
+     * hoặc xin phê duyệt lại trong vòng 7 ngày trước).
+     */
+    WORK_FROM_HOME("Làm ở nhà", true, false, -7, null, false);
 
-    /** Về sớm — 1 ngày, khai SỐ PHÚT xin về sớm. */
-    EARLY_LEAVE("Về sớm", false, true, -1, 1),
-
-    /** Quên chấm công — 1 ngày, không cần giờ. */
-    MISSING_PUNCH("Quên chấm công", false, false, -1, 1);
+//    /** Đi trễ — 1 ngày, khai SỐ PHÚT xin trễ. */
+//    LATE_ARRIVAL("Đi trễ", false, true, -7, 7, false),
+//
+//    /** Về sớm — 1 ngày, khai SỐ PHÚT xin về sớm. */
+//    EARLY_LEAVE("Về sớm", false, true, -7, 7, false),
+//
+//    /** Quên chấm công — 1 ngày, không cần giờ. */
+//    MISSING_PUNCH("Quên chấm công", false, false, -7, 7, false);
 
     private final String label;
     private final boolean rangeBased;
     private final boolean minutesBased;
     private final int minOffsetDays;
     private final Integer maxOffsetDays;
+    /**
+     * TRUE nếu cửa sổ LÙI là "ngày 1 tháng hiện tại" thay vì offset so với hôm nay.
+     * Chiều TIẾN vẫn không giới hạn (maxOffsetDays = null).
+     */
+    private final boolean monthScoped;
 
     EmployeeRequestType(String label, boolean rangeBased, boolean minutesBased,
-                        int minOffsetDays, Integer maxOffsetDays) {
+                        int minOffsetDays, Integer maxOffsetDays, boolean monthScoped) {
         this.label = label;
         this.rangeBased = rangeBased;
         this.minutesBased = minutesBased;
         this.minOffsetDays = minOffsetDays;
         this.maxOffsetDays = maxOffsetDays;
+        this.monthScoped = monthScoped;
     }
 
     /** Nhãn tiếng Việt hiển thị trên UI và trong nội dung thông báo. */
@@ -78,21 +87,34 @@ public enum EmployeeRequestType {
 
     /**
      * Số ngày lệch NHỎ NHẤT so với hôm nay được phép chọn.
-     * {@code 0} = hôm nay, {@code -1} = hôm qua.
+     * {@code -7} = 7 ngày trước hôm nay.
+     * <p>Chỉ có ý nghĩa khi {@link #isMonthScoped()} = false.
      */
     public int minOffsetDays() { return minOffsetDays; }
 
     /**
      * Số ngày lệch LỚN NHẤT so với hôm nay được phép chọn.
-     * {@code null} = không giới hạn (nghỉ phép có thể xin trước nhiều tháng).
+     * {@code null} = không giới hạn (công tác / nghỉ phép xin trước nhiều tháng).
+     * <p>Chỉ có ý nghĩa khi {@link #isMonthScoped()} = false.
      */
     public Integer maxOffsetDays() { return maxOffsetDays; }
 
     /**
-     * Loại này có được tính ĐỦ CÔNG khi duyệt "có phép" hay không.
-     * Công tác luôn đủ công; nghỉ phép thì tuỳ OWNER chọn có lương / không lương.
+     * TRUE nếu cửa sổ LÙI của loại này là "ngày 1 THÁNG HIỆN TẠI",
+     * không phụ thuộc hôm nay là ngày nào. Chiều TIẾN không giới hạn.
+     * <p>Ví dụ: hôm nay 30/9 vẫn được tạo đơn nghỉ cho ngày 1/9;
+     * hôm nay tháng 9 vẫn xin nghỉ cho tháng 12.
      */
-    public boolean alwaysFullCredit() { return this == BUSINESS_TRIP; }
+    public boolean isMonthScoped() { return monthScoped; }
+
+    /**
+     * Loại này có được tính ĐỦ CÔNG khi duyệt "có phép" hay không.
+     * Công tác và Làm-ở-nhà luôn đủ công; nghỉ phép thì tuỳ OWNER chọn
+     * có lương / không lương.
+     */
+    public boolean alwaysFullCredit() {
+        return this == BUSINESS_TRIP || this == WORK_FROM_HOME;
+    }
 
     public static EmployeeRequestType parse(String raw) {
         if (raw == null || raw.isBlank()) return null;

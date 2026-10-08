@@ -1,7 +1,9 @@
 package com.nhatnam.server.restcontroller;
 
+import com.nhatnam.server.common.BusinessException;
 import com.nhatnam.server.dto.InvoiceDTO;
 import com.nhatnam.server.dto.WarehouseDTO.*;
+import com.nhatnam.server.dto.driver.DriverOdometerReportDto;
 import com.nhatnam.server.dto.request.CreateIngredientRequest;
 import com.nhatnam.server.dto.response.*;
 import com.nhatnam.server.entity.Driver;
@@ -35,6 +37,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @RestController
@@ -50,6 +53,8 @@ public class WarehouseController {
      */
     private final com.nhatnam.server.service.serviceimpl.OrderServiceImpl orderServiceImpl;
     private final TransportSlipPdf transportSlipPdf;
+    /** Báo cáo PDF chi tiết một phiếu kho — dùng cho nút "Xuất báo cáo" ở trang Lịch sử. */
+    private final com.nhatnam.server.utils.ReceiptReportPdf receiptReportPdf;
     private final InvoicePdf invoicePdf;
     private final DriverRepository driverRepository;
     private final com.nhatnam.server.service.DriverUserSyncService driverUserSyncService;
@@ -57,9 +62,26 @@ public class WarehouseController {
     private final FileStorageService fileStorageService;
     private final CategoryService categoryService;
     private final SubCategoryService subCategoryService;
-
+    private final DriverOdometerReportService service;
     private final WarehouseInventoryExportService exportService;
     private final com.nhatnam.server.service.IngredientWarehouseService ingredientWarehouseService;
+
+    @GetMapping("/driver-odometer")
+    public ResponseEntity<ApiResponse<List<DriverOdometerReportDto>>> report(
+            @RequestParam String from,
+            @RequestParam String to,
+            @RequestParam(defaultValue = "false") boolean includeInactive) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(
+                    service.report(from, to, includeInactive), "OK"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[DRIVER_ODO] report error from={} to={}", from, to, e);
+            return ResponseEntity.ok(ApiResponse.error(
+                    StatusCode.INTERNAL_SERVER_ERROR, "Không tải được báo cáo ODO"));
+        }
+    }
 
     @PostMapping("/export-inventory-check")
     public ResponseEntity<?> exportInventoryCheck(
@@ -207,8 +229,9 @@ public class WarehouseController {
             }
 
             // markAsPendingPayment: DELIVERING → PENDING_PAYMENT.
-            // NGOẠI LỆ: nếu đơn ĐÃ THU ĐỦ TIỀN (điển hình là khách bắt buộc thanh toán trước)
-            // thì service sẽ tự chuyển thẳng sang COMPLETED — không có gì để "chờ thu" nữa.
+            // NGOẠI LỆ, service tự chuyển thẳng sang COMPLETED khi:
+            //   1. Đơn ĐÃ THU ĐỦ TIỀN từ trước (thanh toán bắt buộc trước).
+            //   2. Đơn 0đ (toàn khuyến mãi hoặc phí = 0) — không có gì để chờ thu.
             var result = orderService.markAsPendingPayment(id, actorName, actor.getId());
 
             boolean completed = result != null
@@ -216,9 +239,9 @@ public class WarehouseController {
 
             // TRẢ VỀ TRẠNG THÁI THẬT thay vì null.
             //
-            // Đơn đã thu đủ tiền trước sẽ được service chuyển thẳng sang COMPLETED, nhưng
-            // FE trước đây tự gán cứng PENDING_PAYMENT nên hiển thị sai cho tới khi F5.
-            // Có dữ liệu trả về thì FE dùng đúng cái server quyết định.
+            // Đơn được service chuyển thẳng sang COMPLETED (thu đủ trước hoặc 0đ),
+            // nhưng FE trước đây tự gán cứng PENDING_PAYMENT nên hiển thị sai cho tới
+            // khi F5. Có dữ liệu trả về thì FE dùng đúng cái server quyết định.
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("id",            result != null ? result.getId() : id);
             data.put("status",        result != null ? result.getStatus() : null);
@@ -227,7 +250,7 @@ public class WarehouseController {
             data.put("completed",     completed);
 
             return ResponseEntity.ok(ApiResponse.success(data, completed
-                    ? "Đã xác nhận giao hàng — đơn đã thu đủ tiền nên được HOÀN THÀNH luôn"
+                    ? "Đã xác nhận giao hàng — đơn không cần chờ thanh toán nên được HOÀN THÀNH luôn"
                     : "Đã xác nhận giao hàng thành công"));
         } catch (RuntimeException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
@@ -512,6 +535,21 @@ public class WarehouseController {
             @RequestBody AdjustRequest req,
             Authentication authentication) {
         User user = (User) authentication.getPrincipal();
+
+        // Whitelist tài khoản được phép điều chỉnh tồn kho.
+        // Điều chỉnh tồn theo lô ảnh hưởng trực tiếp giá vốn + HSD → chỉ một số
+        // tài khoản đặc biệt được phép. Danh sách này có thể mở rộng về sau.
+        final Set<String> ADJUST_ALLOWED_USERNAMES = Set.of("nguyenhai");
+
+        String username = user.getUsername();
+
+        if (username == null || !ADJUST_ALLOWED_USERNAMES.contains(username)) {
+            // Ném lỗi nghiệp vụ → GlobalExceptionHandler trả JSON có message
+            // → Frontend catch và hiển thị toast "Bạn không được phép..."
+            throw new BusinessException(
+                    "Bạn không được phép thực hiện chức năng điều chỉnh tồn kho");
+        }
+
         return ResponseEntity.ok(warehouseService.adjustStock(req, user.getId()));
     }
 
@@ -604,6 +642,36 @@ public class WarehouseController {
             log.error("Lỗi tạo phiếu đi đường cho phiếu {}", receiptId, e);
             return ResponseEntity.status(500)
                     .body("Không tạo được phiếu đi đường".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * BÁO CÁO PDF chi tiết một phiếu kho — dùng cho NÚT "Xuất báo cáo" ở trang Lịch sử.
+     *
+     * <p>Hoạt động cho MỌI loại phiếu (IMPORT / EXPORT_ORDER / EXPORT_OTHER / ADJUST /
+     * TRANSFER_IN / TRANSFER_OUT). Khác với endpoint {@code /transport-slip} bên trên —
+     * cái đó chỉ dùng cho TRANSFER_OUT và in theo mẫu Giấy thông tin nguồn gốc động vật.
+     *
+     * <p>Trả về PDF với {@code inline} để trình duyệt mở tab mới (giữ nguyên hành vi như
+     * transport-slip cho nhất quán trên FE). Nếu popup bị chặn FE tự tải file về.
+     */
+    @GetMapping("/receipt/{receiptId}/report")
+    public ResponseEntity<byte[]> getReceiptReport(@PathVariable Long receiptId) {
+        try {
+            ReceiptResponse data = warehouseService.getReceiptDetail(receiptId);
+            byte[] pdf = receiptReportPdf.generate(data);
+            String filename = "bao-cao-phieu-" + data.getReceiptCode() + ".pdf";
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
+                    .contentType(MediaType.APPLICATION_PDF)
+                    .body(pdf);
+        } catch (com.nhatnam.server.common.BusinessException e) {
+            return ResponseEntity.badRequest()
+                    .body(e.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.error("Lỗi tạo báo cáo phiếu {}", receiptId, e);
+            return ResponseEntity.status(500)
+                    .body("Không tạo được báo cáo phiếu".getBytes(java.nio.charset.StandardCharsets.UTF_8));
         }
     }
 
@@ -1076,6 +1144,8 @@ public class WarehouseController {
                     vMap.put("endRecordedBy",   endAtt   != null ? endAtt.getRecordedBy()   : null);
                     vMap.put("prevOdometer",    prevOdo);
                     vMap.put("prevOdometerDate", prevDate);
+                    vMap.put("startNote",       startAtt != null ? startAtt.getNote() : null);
+                    vMap.put("endNote",         endAtt   != null ? endAtt.getNote()   : null);
                     vehicles.add(vMap);
                 }
 
@@ -1113,7 +1183,8 @@ public class WarehouseController {
             String vtStr  = (String) body.get("vehicleType");
             String stStr  = (String) body.get("sessionType");
             Integer odo   = body.get("odometer") instanceof Number n ? n.intValue() : null;
-            String date   = body.get("date") instanceof String s && !s.isBlank() ? s
+            String note   = body.get("note") instanceof String s ? s.trim() : null;  // ← MỚI
+            String date   = body.get("date") instanceof String s2 && !s2.isBlank() ? s2
                     : java.time.LocalDate.now(java.time.ZoneId.of("Asia/Ho_Chi_Minh"))
                     .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE);
 
@@ -1127,7 +1198,7 @@ public class WarehouseController {
             com.nhatnam.server.entity.DriverAttendance.SessionType st =
                     com.nhatnam.server.entity.DriverAttendance.SessionType.valueOf(stStr.toUpperCase());
 
-            // Validate: đầu ca ≤ cuối ca
+            // Validate: đầu ca ≤ cuối ca (TRONG CÙNG NGÀY — giữ nguyên logic cũ)
             com.nhatnam.server.entity.DriverAttendance.SessionType otherSt =
                     (st == com.nhatnam.server.entity.DriverAttendance.SessionType.START)
                             ? com.nhatnam.server.entity.DriverAttendance.SessionType.END
@@ -1144,44 +1215,31 @@ public class WarehouseController {
                 if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.END && odo < otherOdo)
                     throw new IllegalArgumentException("ODO cuối ca không được nhỏ hơn ODO đầu ca (" + otherOdo + " km)");
             } else if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.END) {
-                // KẾT CA PHẢI CÓ VÀO CA TRƯỚC.
-                //
-                // Không có ODO đầu ca thì quãng đường ngày đó không tính được, mà
-                // dòng kết ca đơn độc lại làm ô "đầu ca" bị khoá bởi mốc sàn của
-                // chính nó — càng khó sửa. Chặn ngay từ đầu là cách rẻ nhất.
                 throw new IllegalArgumentException(
                         "Chưa điểm danh đầu ca ngày " + date + " — vui lòng nhập ODO đầu ca trước.");
             }
 
-            // Validate: không được nhỏ hơn số ODO đã ghi ở NGÀY TRƯỚC.
-            //
-            // Trước đây chỉ đối chiếu trong cùng một ngày, nên gõ nhầm thiếu chữ số
-            // vẫn lọt và ngày hôm sau ra quãng đường âm. Chặn ngay tại đây thay vì
-            // sửa số liệu về sau — báo cáo tháng thường chỉ được rà lại khi đã muộn.
-            List<com.nhatnam.server.entity.DriverAttendance> prevList =
-                    driverAttendanceRepository.findPreviousBefore(driver, vt, date);
-            if (!prevList.isEmpty()) {
-                com.nhatnam.server.entity.DriverAttendance prev = prevList.get(0);
-                if (odo < prev.getOdometer()) {
-                    throw new IllegalArgumentException(
-                            "ODO không được nhỏ hơn số đã ghi ngày " + prev.getAttendanceDate()
-                                    + " (" + prev.getOdometer() + " km)");
+            // ══════════════════════════════════════════════════════════════
+            // THAY ĐỔI: Cho phép ODO nhỏ hơn ngày trước, nhưng BẮT BUỘC ghi chú
+            // ══════════════════════════════════════════════════════════════
+            boolean odoLowerThanPrev = false;
+            if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.START) {
+                List<com.nhatnam.server.entity.DriverAttendance> prevList =
+                        driverAttendanceRepository.findPreviousBefore(driver, vt, date);
+                if (!prevList.isEmpty()) {
+                    com.nhatnam.server.entity.DriverAttendance prev = prevList.get(0);
+                    if (odo < prev.getOdometer()) {
+                        odoLowerThanPrev = true;
+                        if (note == null || note.isBlank()) {
+                            throw new IllegalArgumentException(
+                                    "ODO nhỏ hơn số đã ghi ngày " + prev.getAttendanceDate()
+                                            + " (" + prev.getOdometer() + " km)"
+                                            + " — vui lòng nhập lý do (VD: đổi xe, sửa đồng hồ…)");
+                        }
+                    }
                 }
             }
-
-            // ── TỰ BÙ KẾT CA CHO NGÀY CŨ CÒN THIẾU ──────────────────────────
-            //
-            // Tài xế quên bấm kết ca thì ngày đó treo mãi, và số km của nó không
-            // bao giờ được tính. Khi điểm danh ĐẦU CA của một ngày sau, ODO hiện
-            // tại chính là mốc cuối cùng mà xe đã chạy tới — dùng nó bù vào kết ca
-            // còn thiếu là con số sát thực tế nhất có được.
-            //
-            // VD: 1/8 có đầu ca, quên kết ca. Ngày 4/8 nhập đầu ca 10.500 km →
-            // kết ca ngày 1/8 được ghi 10.500 km.
-            //
-            // Chỉ bù NGÀY GẦN NHẤT còn thiếu, không quét ngược toàn bộ lịch sử:
-            // dồn hết quãng đường của nhiều ngày vào một ngày sẽ sai nặng hơn là
-            // để trống. Bản ghi bù ghi rõ nguồn gốc ở recordedBy để còn truy lại.
+            // Tự bù kết ca cho ngày cũ còn thiếu (giữ nguyên logic)
             if (st == com.nhatnam.server.entity.DriverAttendance.SessionType.START) {
                 autoFillMissingEnd(driver, vt, date, odo, recorderName);
             }
@@ -1197,10 +1255,12 @@ public class WarehouseController {
                         .driver(driver).attendanceDate(date)
                         .sessionType(st).vehicleType(vt)
                         .odometer(odo).recordedBy(recorderName)
+                        .note(odoLowerThanPrev ? note : null)   // ← Chỉ lưu note khi ODO bất thường
                         .build();
             } else {
                 att.setOdometer(odo);
                 att.setRecordedBy(recorderName);
+                att.setNote(odoLowerThanPrev ? note : null);    // ← Cập nhật note
             }
             att = driverAttendanceRepository.save(att);
 
@@ -1212,6 +1272,7 @@ public class WarehouseController {
             res.put("sessionType",    att.getSessionType().name());
             res.put("odometer",       att.getOdometer());
             res.put("recordedBy",     att.getRecordedBy());
+            res.put("note",           att.getNote());            // ← Trả note
             res.put("attendanceDate", att.getAttendanceDate());
             res.put("updatedAt",      att.getUpdatedAt());
             return ResponseEntity.ok(ApiResponse.success(res, "Đã lưu điểm danh"));

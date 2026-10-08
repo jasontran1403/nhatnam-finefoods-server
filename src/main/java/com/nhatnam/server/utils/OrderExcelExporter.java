@@ -11,6 +11,8 @@ import org.apache.poi.xssf.usermodel.*;
 import org.apache.poi.xssf.usermodel.extensions.XSSFCellBorder;
 import org.springframework.stereotype.Component;
 import java.io.ByteArrayOutputStream;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -76,17 +78,6 @@ public class OrderExcelExporter {
 
     // ════════════════════════════════════════════════════════════════
     // STYLE CACHE
-    //
-    // Nguyên nhân lỗi "maximum number of Cell Styles was exceeded (64000)":
-    // trước đây mỗi ô đều gọi wb.createCellStyle() → export nhiều đơn là nổ.
-    // StyleCache tạo MỘT style cho mỗi tổ hợp thuộc tính (màu nền, màu chữ,
-    // đậm, cỡ, canh lề, định dạng số, có/không border trên/dưới) rồi tái sử
-    // dụng. Số style giảm từ hàng triệu xuống còn vài trăm.
-    //
-    // LƯU Ý: style được cache là DÙNG CHUNG nên TUYỆT ĐỐI không mutate nó
-    // (không setDataFormat / setBorder... sau khi lấy về). Mọi thuộc tính
-    // phải truyền vào ngay lúc get(). Một cache được tạo mới cho mỗi workbook
-    // (mỗi lần export) — style thuộc về workbook nào chỉ dùng trong workbook đó.
     // ════════════════════════════════════════════════════════════════
     private static final class StyleCache {
         private final XSSFWorkbook wb;
@@ -113,7 +104,6 @@ public class OrderExcelExporter {
             return f;
         }
 
-        /** Full control. Border trái/phải luôn THIN; trên/dưới tuỳ tham số. */
         XSSFCellStyle get(String bgHex, String fgHex, boolean bold, int size,
                           HorizontalAlignment align, short dataFmt,
                           boolean borderTop, boolean borderBottom) {
@@ -146,12 +136,10 @@ public class OrderExcelExporter {
             return cs;
         }
 
-        // Convenience: border trên + dưới, format General
         XSSFCellStyle get(String bgHex, String fgHex, boolean bold, int size, HorizontalAlignment align) {
             return get(bgHex, fgHex, bold, size, align, (short) 0, true, true);
         }
 
-        // Convenience: có format số, border trên + dưới
         XSSFCellStyle get(String bgHex, String fgHex, boolean bold, int size,
                           HorizontalAlignment align, short dataFmt) {
             return get(bgHex, fgHex, bold, size, align, dataFmt, true, true);
@@ -171,7 +159,7 @@ public class OrderExcelExporter {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // SHEET 1 — SUMMARY (bản thường, không có cột phiếu thu)
+    // SHEET 1 — SUMMARY
     // ════════════════════════════════════════════════════════════════
     private void buildSummarySheet(StyleCache sc, XSSFWorkbook wb, List<Order> orders,
                                    String title, String exportedBy) {
@@ -311,8 +299,7 @@ public class OrderExcelExporter {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // SHEET 1 — SUMMARY (bản kế toán, có cột "Số phiếu thu" index 11)
-    // Map<orderCode, List<receiptNumber>> — hỗ trợ nhiều phiếu thu / đơn
+    // SHEET 1 — SUMMARY (bản kế toán)
     // ════════════════════════════════════════════════════════════════
     private void buildSummarySheet(StyleCache sc, XSSFWorkbook wb, List<Order> orders, String title,
                                    String exportedBy, Map<String, List<String>> orderCodeToReceipts, boolean isAccountant) {
@@ -533,13 +520,6 @@ public class OrderExcelExporter {
 
     // ════════════════════════════════════════════════════════════════
     // SHEET 2 — ITEM DETAIL
-    //
-    // "Giả merge" (fix filter/sort mất dòng trên Excel): KHÔNG merge ô theo
-    // chiều dọc. Set giá trị THẬT cho mọi dòng của một khối. Để nhìn vẫn như
-    // merge: các dòng "phụ" (không phải dòng đầu khối) được set màu chữ = màu
-    // nền để chữ ẩn đi, đồng thời border trên/dưới giữa các dòng trong khối bị
-    // bỏ. Border được TÍNH SẴN theo vị trí (đầu/giữa/cuối khối) và lấy style đã
-    // cache — không mutate style dùng chung (đó là lý do gây lỗi 64000 style cũ).
     // ════════════════════════════════════════════════════════════════
     private void buildDetailSheet(StyleCache sc, XSSFWorkbook wb, List<Order> orders, boolean accountantMode) {
         XSSFSheet ws = wb.createSheet("Chi tiết sản phẩm");
@@ -622,7 +602,7 @@ public class OrderExcelExporter {
             String fgMain       = cancelled ? "9CA3AF" : "1C1C1E";
             String fgCode       = cancelled ? "9CA3AF" : C_ACCENT;
 
-            // Cols 0–3: khối = toàn bộ đơn (giá trị giống nhau mọi dòng)
+            // Cols 0–3: khối = toàn bộ đơn
             for (int r = orderFirstRow; r <= orderLastRow; r++) {
                 Row row = ws.getRow(r);
 
@@ -646,119 +626,197 @@ public class OrderExcelExporter {
             }
 
             if (accountantMode) {
-                java.math.BigDecimal totalGross = java.math.BigDecimal.ZERO;
-                for (OrderItem item : items) {
-                    java.math.BigDecimal sub = item.getSubtotal() != null ? item.getSubtotal() : java.math.BigDecimal.ZERO;
-                    totalGross = totalGross.add(sub);
-                }
-                java.math.BigDecimal orderDiscountAmt = o.getDiscountAmount() != null
-                        ? o.getDiscountAmount() : java.math.BigDecimal.ZERO;
-                java.math.BigDecimal discRatio = totalGross.compareTo(java.math.BigDecimal.ZERO) > 0
-                        ? orderDiscountAmt.divide(totalGross, 10, java.math.RoundingMode.HALF_UP)
-                        : java.math.BigDecimal.ZERO;
+                // ── TÍNH TOÁN DISCOUNT ──────────────────────────────────────────────
 
-                java.math.BigDecimal sumL = java.math.BigDecimal.ZERO;
+                // 1. Tính tổng discount riêng từng sản phẩm (item-level discount)
+                BigDecimal totalItemDiscount = BigDecimal.ZERO;
+                Map<Long, BigDecimal> itemDiscountMap = new HashMap<>();
+
                 for (OrderItem item : items) {
-                    java.math.BigDecimal sub = item.getSubtotal() != null ? item.getSubtotal() : java.math.BigDecimal.ZERO;
-                    java.math.BigDecimal qty = item.getQuantity()  != null ? item.getQuantity()  : java.math.BigDecimal.ONE;
-                    int vr       = item.getVatRate() != null ? item.getVatRate() : 0;
+                    Integer discPct = item.getDiscountPercent();
+                    if (discPct != null && discPct > 0) {
+                        BigDecimal qty = item.getQuantity() != null ? item.getQuantity() : BigDecimal.ONE;
+                        BigDecimal unitPrice = item.getUnitPrice() != null ? item.getUnitPrice() : BigDecimal.ZERO;
+                        // BOX: unitPrice là giá/đơn vị gốc, cần nhân unitsPerBox để ra giá/thùng
+                        boolean isBox = "BOX".equalsIgnoreCase(item.getSaleType())
+                                && item.getUnitsPerBox() != null && item.getUnitsPerBox() > 0;
+                        BigDecimal effectiveUnitPrice = isBox
+                                ? unitPrice.multiply(BigDecimal.valueOf(item.getUnitsPerBox()))
+                                : unitPrice;
+                        BigDecimal lineSubtotal = effectiveUnitPrice.multiply(qty);
+                        BigDecimal discAmount = lineSubtotal.multiply(BigDecimal.valueOf(discPct))
+                                .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+                        totalItemDiscount = totalItemDiscount.add(discAmount);
+                        itemDiscountMap.put(item.getProductId(), discAmount);
+                    }
+                }
+
+                // 2. Tính discount cả bill (order-level discount)
+                BigDecimal orderDiscount = o.getDiscountAmount() != null ? o.getDiscountAmount() : BigDecimal.ZERO;
+                BigDecimal billDiscount = orderDiscount.subtract(totalItemDiscount);
+                if (billDiscount.compareTo(BigDecimal.ZERO) < 0) billDiscount = BigDecimal.ZERO;
+
+                // 3. Tính tổng gross của tất cả sản phẩm
+                BigDecimal totalGross = BigDecimal.ZERO;
+                for (OrderItem item : items) {
+                    BigDecimal qty = item.getQuantity() != null ? item.getQuantity() : BigDecimal.ONE;
+                    BigDecimal unitPrice = item.getUnitPrice() != null ? item.getUnitPrice() : BigDecimal.ZERO;
+                    // BOX: unitPrice là giá/đơn vị gốc, cần nhân unitsPerBox
+                    boolean isBox = "BOX".equalsIgnoreCase(item.getSaleType())
+                            && item.getUnitsPerBox() != null && item.getUnitsPerBox() > 0;
+                    BigDecimal effectiveUnitPrice = isBox
+                            ? unitPrice.multiply(BigDecimal.valueOf(item.getUnitsPerBox()))
+                            : unitPrice;
+                    totalGross = totalGross.add(effectiveUnitPrice.multiply(qty));
+                }
+
+                // 4. Tính tỷ lệ discount cả bill
+                BigDecimal billDiscRatio = totalGross.compareTo(BigDecimal.ZERO) > 0
+                        ? billDiscount.divide(totalGross, 10, RoundingMode.HALF_UP)
+                        : BigDecimal.ZERO;
+
+                // 5. Tính tổng phụ phí
+                BigDecimal surchargeVal = o.getSurcharge() != null ? o.getSurcharge() : BigDecimal.ZERO;
+                long surchargeDisplay = surchargeVal.setScale(0, RoundingMode.HALF_UP).longValue();
+
+                // 6. Tính lại các giá trị cho từng item
+                BigDecimal totalAfterVat = BigDecimal.ZERO;
+
+                for (OrderItem item : items) {
+                    BigDecimal qty = item.getQuantity() != null ? item.getQuantity() : BigDecimal.ONE;
+                    BigDecimal unitPrice = item.getUnitPrice() != null ? item.getUnitPrice() : BigDecimal.ZERO;
+                    int vr = item.getVatRate() != null ? item.getVatRate() : 0;
                     boolean incl = "INCLUSIVE".equalsIgnoreCase(item.getVatMode());
-                    java.math.BigDecimal divisor = vr == 0 ? java.math.BigDecimal.ONE
-                            : java.math.BigDecimal.ONE.add(java.math.BigDecimal.valueOf(vr)
-                            .divide(java.math.BigDecimal.valueOf(100), 10, java.math.RoundingMode.HALF_UP));
-                    java.math.BigDecimal grossPerUnit = sub.divide(qty, 10, java.math.RoundingMode.HALF_UP);
-                    java.math.BigDecimal h  = incl ? grossPerUnit.divide(divisor, 10, java.math.RoundingMode.HALF_UP) : grossPerUnit;
-                    java.math.BigDecimal i2 = h.multiply(discRatio);
-                    java.math.BigDecimal j  = h.subtract(i2).multiply(qty);
-                    java.math.BigDecimal k  = vr == 0 ? java.math.BigDecimal.ZERO
-                            : j.multiply(java.math.BigDecimal.valueOf(vr))
-                            .divide(java.math.BigDecimal.valueOf(100), 10, java.math.RoundingMode.HALF_UP);
-                    sumL = sumL.add(j.add(k));
-                }
 
-                java.math.BigDecimal surchargeVal = o.getSurcharge() != null ? o.getSurcharge() : java.math.BigDecimal.ZERO;
-                long surchargeDisplay = surchargeVal.setScale(0, java.math.RoundingMode.HALF_UP).longValue();
-                long nValue = sumL.add(surchargeVal).setScale(0, java.math.RoundingMode.HALF_UP).longValue();
+                    // BOX: unitPrice là giá/đơn vị gốc (vd 235.000/kg),
+                    // cần nhân unitsPerBox để ra giá/thùng (vd 1.175.000/thùng)
+                    boolean isBox = "BOX".equalsIgnoreCase(item.getSaleType())
+                            && item.getUnitsPerBox() != null && item.getUnitsPerBox() > 0;
+                    BigDecimal effectiveUnitPrice = isBox
+                            ? unitPrice.multiply(BigDecimal.valueOf(item.getUnitsPerBox()))
+                            : unitPrice;
 
-                // Cols 12,13: khối = toàn bộ đơn
-                for (int r = orderFirstRow; r <= orderLastRow; r++) {
-                    Row row = ws.getRow(r);
+                    // Gross của item (dùng effectiveUnitPrice cho BOX)
+                    BigDecimal itemGross = effectiveUnitPrice.multiply(qty);
 
-                    Cell cSur = row.getCell(12);
-                    cSur.setCellValue(surchargeDisplay > 0 ? surchargeDisplay : 0);
-                    styleMerged(sc, cSur, r, orderFirstRow, orderLastRow, rowBg, fgMain, false, 9,
-                            HorizontalAlignment.LEFT, vndFormat);
+                    // ── FIX: Xử lý discount cho VAT INCLUSIVE ──────────────────────
+                    BigDecimal itemDiscAmount;
+                    BigDecimal billDiscForItem;
+                    BigDecimal beforeVat;
+                    BigDecimal vatAmount;
+                    BigDecimal afterVat;
 
-                    Cell cn = row.getCell(13);
-                    cn.setCellValue(nValue);
-                    styleMerged(sc, cn, r, orderFirstRow, orderLastRow, rowBg, fgMain, true, 10,
-                            HorizontalAlignment.LEFT, vndFormat);
-                }
+                    if (incl) {
+                        // VAT INCLUSIVE: giá đã bao gồm VAT
+                        // Bước 1: Lấy giá chưa VAT từ giá đã bao gồm VAT
+                        // BOX: dùng effectiveUnitPrice (giá/thùng) thay vì unitPrice (giá/kg)
+                        BigDecimal divisor = BigDecimal.ONE.add(BigDecimal.valueOf(vr)
+                                .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP));
+                        BigDecimal priceExclVat = effectiveUnitPrice.divide(divisor, 10, RoundingMode.HALF_UP);
 
-                for (OrderItem item : items) {
-                    var ings = item.getOrderItemIngredients();
-                    int ingCount     = (ings != null && !ings.isEmpty()) ? ings.size() : 1;
-                    int itemFirstRow = rowNum;
-                    int itemLastRow  = rowNum + ingCount - 1;
+                        // Bước 2: Tính discount trên giá chưa VAT
+                        Integer discPct = item.getDiscountPercent();
+                        if (discPct != null && discPct > 0) {
+                            itemDiscAmount = priceExclVat.multiply(qty)
+                                    .multiply(BigDecimal.valueOf(discPct))
+                                    .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+                        } else {
+                            itemDiscAmount = BigDecimal.ZERO;
+                        }
 
-                    java.math.BigDecimal sub = item.getSubtotal() != null ? item.getSubtotal() : java.math.BigDecimal.ZERO;
-                    java.math.BigDecimal qty = item.getQuantity()  != null ? item.getQuantity()  : java.math.BigDecimal.ONE;
-                    int vr       = item.getVatRate() != null ? item.getVatRate() : 0;
-                    boolean incl = "INCLUSIVE".equalsIgnoreCase(item.getVatMode());
-                    java.math.BigDecimal divisor = vr == 0 ? java.math.BigDecimal.ONE
-                            : java.math.BigDecimal.ONE.add(java.math.BigDecimal.valueOf(vr)
-                            .divide(java.math.BigDecimal.valueOf(100), 10, java.math.RoundingMode.HALF_UP));
-                    java.math.BigDecimal grossPerUnit = sub.divide(qty, 10, java.math.RoundingMode.HALF_UP);
-                    java.math.BigDecimal h  = incl ? grossPerUnit.divide(divisor, 10, java.math.RoundingMode.HALF_UP) : grossPerUnit;
-                    java.math.BigDecimal i2 = h.multiply(discRatio);
-                    java.math.BigDecimal j  = h.subtract(i2).multiply(qty);
-                    java.math.BigDecimal k  = vr == 0 ? java.math.BigDecimal.ZERO
-                            : j.multiply(java.math.BigDecimal.valueOf(vr))
-                            .divide(java.math.BigDecimal.valueOf(100), 10, java.math.RoundingMode.HALF_UP);
-                    java.math.BigDecimal l  = j.add(k);
+                        // Bước 3: Phần discount cả bill phân bổ (tính trên giá chưa VAT)
+                        BigDecimal grossExclVat = priceExclVat.multiply(qty);
+                        billDiscForItem = totalGross.compareTo(BigDecimal.ZERO) > 0
+                                ? grossExclVat.multiply(billDiscRatio)
+                                : BigDecimal.ZERO;
 
-                    double hVal = h.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
-                    double iVal = i2.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
-                    double jVal = j.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
-                    double kVal = k.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
-                    double lVal = l.setScale(2, java.math.RoundingMode.HALF_UP).doubleValue();
+                        // Bước 4: Giá sau discount (chưa VAT)
+                        BigDecimal afterDisc = grossExclVat.subtract(itemDiscAmount).subtract(billDiscForItem);
+                        if (afterDisc.compareTo(BigDecimal.ZERO) < 0) afterDisc = BigDecimal.ZERO;
 
-                    boolean isBox = "BOX".equalsIgnoreCase(item.getSaleType());
+                        // Bước 5: VAT trên giá sau discount
+                        vatAmount = afterDisc.multiply(BigDecimal.valueOf(vr))
+                                .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+
+                        // Bước 6: Giá sau thuế
+                        afterVat = afterDisc.add(vatAmount);
+
+                        // Bước 7: Đơn giá trước thuế (giá đã trừ discount, chưa VAT, trên 1 đơn vị)
+                        beforeVat = afterDisc.divide(qty, 10, RoundingMode.HALF_UP);
+
+                        // Discount hiển thị = tổng discount (riêng + bill)
+                        itemDiscAmount = itemDiscAmount.add(billDiscForItem);
+
+                    } else {
+                        // VAT EXCLUSIVE: giá chưa bao gồm VAT (logic cũ vẫn đúng)
+                        itemDiscAmount = itemDiscountMap.getOrDefault(item.getProductId(), BigDecimal.ZERO);
+                        billDiscForItem = totalGross.compareTo(BigDecimal.ZERO) > 0
+                                ? itemGross.multiply(billDiscRatio)
+                                : BigDecimal.ZERO;
+                        BigDecimal totalDiscForItem = itemDiscAmount.add(billDiscForItem);
+                        BigDecimal afterDisc = itemGross.subtract(totalDiscForItem);
+                        if (afterDisc.compareTo(BigDecimal.ZERO) < 0) afterDisc = BigDecimal.ZERO;
+
+                        BigDecimal divisor = vr == 0 ? BigDecimal.ONE
+                                : BigDecimal.ONE.add(BigDecimal.valueOf(vr)
+                                .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP));
+                        beforeVat = afterDisc.divide(qty, 10, RoundingMode.HALF_UP);
+                        vatAmount = afterDisc.multiply(BigDecimal.valueOf(vr))
+                                .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+                        afterVat = afterDisc.add(vatAmount);
+
+                        itemDiscAmount = totalDiscForItem;
+                    }
+
+                    totalAfterVat = totalAfterVat.add(afterVat);
+
                     String displayUnit = isBox ? "Thùng" : (item.getUnit() != null ? item.getUnit() : "");
 
                     String fgDisc = cancelled ? "9CA3AF" : "991B1B";
                     String fgVat  = cancelled ? "9CA3AF" : "374151";
 
-                    // Cols 7–11: khối = item (giá trị giống nhau mọi dòng của item)
+                    double beforeVatVal = beforeVat.setScale(2, RoundingMode.HALF_UP).doubleValue();
+                    double discAmountVal = itemDiscAmount.setScale(2, RoundingMode.HALF_UP).doubleValue();
+                    double afterDiscVal = beforeVat.multiply(qty).setScale(2, RoundingMode.HALF_UP).doubleValue();
+                    double vatAmountVal = vatAmount.setScale(2, RoundingMode.HALF_UP).doubleValue();
+                    double afterVatVal = afterVat.setScale(2, RoundingMode.HALF_UP).doubleValue();
+
+                    var ings = item.getOrderItemIngredients();
+                    int ingCount     = (ings != null && !ings.isEmpty()) ? ings.size() : 1;
+                    int itemFirstRow = rowNum;
+                    int itemLastRow  = rowNum + ingCount - 1;
+
+                    // Cols 7–11: khối = item
                     for (int r = itemFirstRow; r <= itemLastRow; r++) {
                         Row itemRow = ws.getRow(r);
 
                         Cell ch = itemRow.getCell(7);
-                        ch.setCellValue(hVal);
+                        ch.setCellValue(beforeVatVal);
                         styleMerged(sc, ch, r, itemFirstRow, itemLastRow, rowBg, fgMain, false, 9,
                                 HorizontalAlignment.LEFT, vnd2Format);
 
                         Cell ci = itemRow.getCell(8);
-                        ci.setCellValue(iVal);
+                        ci.setCellValue(discAmountVal);
                         styleMerged(sc, ci, r, itemFirstRow, itemLastRow, rowBg, fgDisc, false, 9,
                                 HorizontalAlignment.LEFT, vnd2Format);
 
                         Cell cj = itemRow.getCell(9);
-                        cj.setCellValue(jVal);
+                        cj.setCellValue(afterDiscVal);
                         styleMerged(sc, cj, r, itemFirstRow, itemLastRow, rowBg, fgMain, false, 9,
                                 HorizontalAlignment.LEFT, vnd2Format);
 
                         Cell ck = itemRow.getCell(10);
-                        ck.setCellValue(kVal);
+                        ck.setCellValue(vatAmountVal);
                         styleMerged(sc, ck, r, itemFirstRow, itemLastRow, rowBg, fgVat, false, 9,
                                 HorizontalAlignment.LEFT, vnd2Format);
 
                         Cell cl = itemRow.getCell(11);
-                        cl.setCellValue(lVal);
+                        cl.setCellValue(afterVatVal);
                         styleMerged(sc, cl, r, itemFirstRow, itemLastRow, rowBg, fgMain, true, 9,
                                 HorizontalAlignment.LEFT, vnd2Format);
                     }
 
+                    // Fill ingredient data
                     if (ings != null && !ings.isEmpty()) {
                         for (int idx = 0; idx < ings.size(); idx++) {
                             var ii = ings.get(idx);
@@ -791,17 +849,39 @@ public class OrderExcelExporter {
                     rowNum = itemLastRow + 1;
                 }
 
+                // Cols 12,13: khối = toàn bộ đơn
+                long nValue = totalAfterVat.add(surchargeVal).setScale(0, RoundingMode.HALF_UP).longValue();
+                for (int r = orderFirstRow; r <= orderLastRow; r++) {
+                    Row row = ws.getRow(r);
+
+                    Cell cSur = row.getCell(12);
+                    cSur.setCellValue(surchargeDisplay > 0 ? surchargeDisplay : 0);
+                    styleMerged(sc, cSur, r, orderFirstRow, orderLastRow, rowBg, fgMain, false, 9,
+                            HorizontalAlignment.LEFT, vndFormat);
+
+                    Cell cn = row.getCell(13);
+                    cn.setCellValue(nValue);
+                    styleMerged(sc, cn, r, orderFirstRow, orderLastRow, rowBg, fgMain, true, 10,
+                            HorizontalAlignment.LEFT, vndFormat);
+                }
+
             } else {
+                // Non-accountant mode
                 for (OrderItem item : items) {
                     var ings = item.getOrderItemIngredients();
                     int ingCount     = (ings != null && !ings.isEmpty()) ? ings.size() : 1;
                     int itemFirstRow = rowNum;
                     int itemLastRow  = rowNum + ingCount - 1;
 
-                    long unitPriceVal = round(item.getUnitPrice());
+                    // BOX: unitPrice là giá/đơn vị gốc, cần nhân unitsPerBox để ra giá/thùng
+                    boolean isBox = "BOX".equalsIgnoreCase(item.getSaleType())
+                            && item.getUnitsPerBox() != null && item.getUnitsPerBox() > 0;
+                    BigDecimal effectiveUnitPrice = isBox
+                            ? item.getUnitPrice().multiply(BigDecimal.valueOf(item.getUnitsPerBox()))
+                            : item.getUnitPrice();
+                    long unitPriceVal = round(effectiveUnitPrice);
                     long subtotalVal  = round(item.getSubtotal());
 
-                    // Cols 7,8: khối = item
                     for (int r = itemFirstRow; r <= itemLastRow; r++) {
                         Row itemRow = ws.getRow(r);
 
@@ -849,7 +929,7 @@ public class OrderExcelExporter {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // exportForAccountant — build map orderCode → List<receiptNumber>
+    // exportForAccountant
     // ════════════════════════════════════════════════════════════════
     public byte[] exportForAccountant(List<Order> orders, String title, String exportedBy, boolean isAccountant) throws Exception {
         Map<String, List<String>> orderCodeToReceipts = new HashMap<>();
@@ -883,7 +963,7 @@ public class OrderExcelExporter {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // HEIGHT CALCULATOR
+    // HELPERS
     // ════════════════════════════════════════════════════════════════
     private float calcRowHeight(Object[] rowData, int[] colWidths) {
         int maxLines = 1;
@@ -902,28 +982,15 @@ public class OrderExcelExporter {
         return maxLines * LINE_HEIGHT_PT + ROW_PADDING_PT;
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
-    /**
-     * Áp style cho một ô thuộc "khối giả-merge". Dòng đầu khối hiển thị chữ
-     * (màu fg thật) và có border trên; các dòng sau ẩn chữ (màu chữ = màu nền)
-     * và bỏ border trên. Border dưới chỉ có ở dòng cuối khối. Dữ liệu thật vẫn
-     * được set cho mọi dòng (do caller) nên filter/sort trên Excel hoạt động đúng.
-     */
     private void styleMerged(StyleCache sc, Cell cell, int r, int first, int last,
                              String bg, String fg, boolean bold, int size,
                              HorizontalAlignment align, short dataFmt) {
         boolean isFirst = (r == first);
         boolean isLast  = (r == last);
-        String useFg = isFirst ? fg : bg; // ẩn chữ ở các dòng nối tiếp
+        String useFg = isFirst ? fg : bg;
         cell.setCellStyle(sc.get(bg, useFg, bold, size, align, dataFmt, isFirst, isLast));
     }
 
-    /**
-     * Giống styleMerged nhưng cho ô Trạng thái: nền là màu theo status. Giá trị
-     * trạng thái được set cho mọi dòng (để filter/sort đúng), ẩn chữ ở dòng phụ
-     * bằng cách cho màu chữ = màu nền status.
-     */
     private void styleStatusMerged(StyleCache sc, Cell cell, String status, int r, int first, int last) {
         cell.setCellValue(STATUS_LABELS.getOrDefault(status, status));
         String[] clr = STATUS_COLORS.get(status);
@@ -957,8 +1024,8 @@ public class OrderExcelExporter {
         return LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), TZ).format(DT_FMT);
     }
 
-    private long round(java.math.BigDecimal bd) {
-        return bd == null ? 0L : bd.setScale(0, java.math.RoundingMode.HALF_UP).longValue();
+    private long round(BigDecimal bd) {
+        return bd == null ? 0L : bd.setScale(0, RoundingMode.HALF_UP).longValue();
     }
 
     private String getCancelReason(Long orderId) {

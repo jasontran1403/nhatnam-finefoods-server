@@ -95,12 +95,27 @@ public enum Role {
           FACTORY_PRODUCTION_WORKER_CREATE, FACTORY_PRODUCTION_WORKER_DELETE
   )),
 
+  FACTORY_PACKAGING_WORKER(Set.of(
+          FACTORY_PACKAGING_WORKER_READ, FACTORY_PACKAGING_WORKER_UPDATE,
+          FACTORY_PACKAGING_WORKER_CREATE, FACTORY_PACKAGING_WORKER_DELETE
+  )),
+
   /** Quản lý xưởng — thưởng KPI cao hơn NV sản xuất 25%. */
   FACTORY_MANAGER(Set.of(
           FACTORY_MANAGER_READ, FACTORY_MANAGER_UPDATE,
           FACTORY_MANAGER_CREATE, FACTORY_MANAGER_DELETE,
           FACTORY_WORKER_READ, FACTORY_WORKER_UPDATE,
           FACTORY_WORKER_CREATE, FACTORY_WORKER_DELETE
+  )),
+
+  /**
+   * Thu mua — chỉ có DUY NHẤT trang "Danh sách yêu cầu văn phòng phẩm".
+   * Quyền tối thiểu: xem tổng hợp VPP, in phiếu PDF, đặt hàng (có form giá/phí).
+   * Không có mọi quyền khác trong hệ thống.
+   */
+  PURCHASING(Set.of(
+          PURCHASING_READ, PURCHASING_UPDATE,
+          PURCHASING_CREATE, PURCHASING_DELETE
   ));
 
   @Getter
@@ -133,12 +148,14 @@ public enum Role {
       case FACTORY_MANAGER           -> "Quản lý xưởng";
       case FACTORY_STAFF             -> "Trợ lý kho xưởng";
       case FACTORY_PRODUCTION_WORKER -> "Nhân viên sản xuất";
+      case FACTORY_PACKAGING_WORKER  -> "Nhân viên đóng gói";
       case FACTORY_SECURITY          -> "Bảo vệ xưởng";
       case SECURITY                  -> "Bảo vệ";
       case DRIVER                    -> "Tài xế";
       case SHIPPER                   -> "Nhân viên giao hàng";
       case POS                       -> "Máy bán hàng";
       case USER                      -> "Người dùng";
+      case PURCHASING                -> "Thu mua";
     };
   }
 

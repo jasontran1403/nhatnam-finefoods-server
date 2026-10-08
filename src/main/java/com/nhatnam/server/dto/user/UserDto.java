@@ -1,5 +1,6 @@
 package com.nhatnam.server.dto.user;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -24,6 +25,17 @@ public class UserDto {
     /** Tất cả roles của user — dùng cho UI multi-role */
     private Set<String> roles;
 
+    /**
+     * Tình trạng khoá tài khoản.
+     *
+     * <p>Bắt buộc @JsonProperty("isLockAccount"): Lombok sinh getter
+     * {@code isLockAccount()} cho boolean primitive, Jackson mặc định sẽ strip
+     * tiền tố "is" → serialize thành field JSON "lockAccount". Front-end đang đọc
+     * {@code u.isLockAccount} khắp nơi (AdminUsers.jsx, OrgChartPage.jsx) nên nếu
+     * không ép tên field, giá trị sang FE luôn {@code undefined} → nút mở khoá
+     * không thao tác được (chỉ khoá được, không mở lại được).
+     */
+    @JsonProperty("isLockAccount")
     private boolean isLockAccount;
     private boolean mfaEnabled;
     private Long timeCreate;

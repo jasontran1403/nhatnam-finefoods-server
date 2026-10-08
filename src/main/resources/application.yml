@@ -29,3 +29,16 @@ application:
 app:
   attendance:
     upload-dir: ~/Desktop/nhatnam-finefoods-storage/attendance
+
+misa:
+  enabled: false
+  app-id: ""
+  org-company-code: ""
+  base-url: "https://openapi.misa.com.vn"
+  # access-token-url: "https://..."   # sẽ thêm sau
+  # client-id: ""
+  # client-secret: ""
+  default-branch-id: ""               # ID chi nhánh trên MISA
+  default-stock-code: "KPQ"           # Mã kho mặc định
+  default-stock-name: "Kho Phổ Quang" # Tên kho mặc định
+

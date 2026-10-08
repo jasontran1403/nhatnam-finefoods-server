@@ -1,3 +1,4 @@
+// src/main/java/com/nhatnam/server/entity/PaymentTransaction.java
 package com.nhatnam.server.entity;
 
 import jakarta.persistence.*;
@@ -7,10 +8,24 @@ import java.math.BigDecimal;
 /**
  * Một lần thanh toán (partial hoặc full).
  * Mỗi đơn hàng có thể có nhiều PaymentTransaction.
+ *
+ * <h3>Index</h3>
+ * <ul>
+ *   <li>{@code idx_pt_order_created} — composite (order_id, created_at): tra lịch sử
+ *       của 1 đơn (findByOrderIdOrderByCreatedAtAsc) và dùng cho dedup khi backfill
+ *       (existsByOrderIdAndCreatedAtBetween).</li>
+ *   <li>{@code idx_pt_created_at} — standalone (created_at): dùng cho các query
+ *       SUM/COUNT theo khoảng thời gian (sumRevenueAllOrders, sumRevenueByUser,...)
+ *       — chạy mỗi lần tính hoa hồng/thưởng. Thiếu index này thì khi bảng lớn
+ *       sẽ full-scan hàng triệu row.</li>
+ * </ul>
  */
 @Entity
 @Table(name = "payment_transaction",
-       indexes = @Index(columnList = "order_id, created_at"))
+        indexes = {
+                @Index(name = "idx_pt_order_created", columnList = "order_id, created_at"),
+                @Index(name = "idx_pt_created_at",   columnList = "created_at")
+        })
 @Data @Builder @NoArgsConstructor @AllArgsConstructor
 public class PaymentTransaction {
 
@@ -45,8 +60,20 @@ public class PaymentTransaction {
     @Column(name = "collected_by", length = 100)
     private String collectedBy;
 
+    /**
+     * Epoch milliseconds (UTC). Cùng chuẩn với Order.createdAt.
+     * Khi tính "trong tháng N" phải map sang Asia/Ho_Chi_Minh — xem FactoryPayrollService.VN.
+     */
     @Column(name = "created_at", nullable = false)
     private Long createdAt;
+
+    /**
+     * Nguồn gốc dòng này: null = tạo trực tiếp từ nghiệp vụ, BACKFILL_LOG = tạo lại
+     * từ order_log bằng PaymentTransactionBackfillService. Dùng để phân biệt khi
+     * cần rollback / re-backfill mà không xoá nhầm dữ liệu gốc.
+     */
+    @Column(name = "source", length = 20)
+    private String source;
 
     @PrePersist
     void onCreate() { if (createdAt == null) createdAt = System.currentTimeMillis(); }

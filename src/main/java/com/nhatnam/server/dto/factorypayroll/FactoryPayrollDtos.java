@@ -83,6 +83,38 @@ public class FactoryPayrollDtos {
         private String shiftStart;
         private String shiftEnd;
         private List<AttendanceDayDto> days;
+
+        // ── Ngày phép còn lại sau kỳ (tính theo phút) ────────────────────────
+        /** Phút phép đã trừ do trễ/sớm trong kỳ này. */
+        private Integer leaveMinutesUsed;
+        /**
+         * Phút phép còn lại sau kỳ.
+         * Hiển thị UI: quy ra bước 0.5 ngày + phút dư.
+         * Báo cáo: chia 480 lấy 3 số thập phân.
+         */
+        private Integer leaveBalanceMinutesAfter;
+
+        /**
+         * Chuỗi hiển thị — "X.5 ngày Y phút".
+         * Ví dụ: 1901 phút → "3.5 ngày 221 phút".
+         */
+        public String getLeaveBalanceDisplay() {
+            if (leaveBalanceMinutesAfter == null || leaveBalanceMinutesAfter <= 0) return "0 ngày";
+            int halfDays   = leaveBalanceMinutesAfter / 240;
+            int remMinutes = leaveBalanceMinutesAfter % 240;
+            String daysStr = (halfDays % 2 == 0)
+                    ? String.valueOf(halfDays / 2)
+                    : (halfDays / 2) + ".5";
+            return remMinutes == 0
+                    ? daysStr + " ngày"
+                    : daysStr + " ngày " + remMinutes + " phút";
+        }
+
+        /** Số ngày thập phân cho báo cáo (3 chữ số). Ví dụ: 1901 phút → 3.960. */
+        public Double getLeaveBalanceDaysReport() {
+            if (leaveBalanceMinutesAfter == null) return null;
+            return Math.round(leaveBalanceMinutesAfter / 480.0 * 1000.0) / 1000.0;
+        }
     }
 
     // ─── TÀI XẾ — số km chạy theo ngày ────────────────────────────────────────
@@ -248,13 +280,23 @@ public class FactoryPayrollDtos {
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
     public static class MyPayslipDto {
         /**
-         * PROCESSING = OWNER chưa bấm "Hoàn tất" cho tháng + bộ phận → FE hiện
+         * PROCESSING = OWNER chưa bấm "Hoàn tất Lương" cho tháng + bộ phận → FE hiện
          *              "Đang xử lý lương".
-         * READY      = đã hoàn tất, hiển thị đầy đủ phiếu lương.
+         * READY      = đã hoàn tất lương, hiển thị đầy đủ phiếu lương.
          * NO_SALARY  = đã hoàn tất nhưng nhân viên chưa có hồ sơ lương.
          * NO_DEPARTMENT = nhân viên không thuộc bộ phận tính lương nào.
          */
         private String status;
+
+        /**
+         * Trạng thái KPI / Bonus — tách riêng khỏi {@code status}:
+         * <ul>
+         *   <li>{@code PENDING}  — OWNER chưa bấm "Hoàn tất KPI", FE hiển thị "Đang tính thưởng".</li>
+         *   <li>{@code READY}    — đã hoàn tất KPI, hiển thị số thưởng.</li>
+         *   <li>{@code NONE}     — bộ phận không có KPI/bonus.</li>
+         * </ul>
+         */
+        private String kpiStatus;
 
         private Integer month;
         private Integer year;
@@ -346,8 +388,68 @@ public class FactoryPayrollDtos {
         private Boolean finalized;
         private Long    finalizedAt;
         private String  finalizedByName;
-        /** Đủ điều kiện bấm "Hoàn tất" chưa (đã có bảng chấm công, hoặc bộ phận Tài xế) */
+        /** Đủ điều kiện bấm "Hoàn tất Lương" chưa (đã có bảng chấm công, hoặc bộ phận không cần file) */
         private Boolean canFinalize;
+
+        // ── Hoàn tất KPI / Thưởng (tách riêng khỏi lương) ──
+        /** OWNER đã bấm "Hoàn tất KPI" chưa — false = KPI đang pending với nhân viên. */
+        private Boolean kpiFinalized;
+        private Long    kpiFinalizedAt;
+        private String  kpiFinalizedByName;
+        /** Bộ phận này có KPI / bonus để tính không (hiện đang áp dụng cho tất cả bộ phận). */
+        private Boolean hasKpiBonus;
+
+        // ── Hoàn tất Thưởng doanh thu (chỉ SALES và ACCOUNTING, bước 3) ──
+        /**
+         * OWNER đã bấm "Hoàn tất Thưởng" chưa.
+         * Chỉ có ý nghĩa với SALES và ACCOUNTING.
+         * false = thưởng đang pending (nhân viên thấy "Đang tính thưởng").
+         */
+        private Boolean bonusFinalized;
+        private Long    bonusFinalizedAt;
+        private String  bonusFinalizedByName;
+        /**
+         * Bộ phận này có tính thưởng doanh thu không.
+         * true  = SALES hoặc ACCOUNTING.
+         * false = FACTORY, WAREHOUSE, MANAGEMENT, DRIVER (không dùng bước 3).
+         */
+        private Boolean hasSalesBonus;
+    }
+
+    // ── Kết quả tính thưởng doanh thu (SALES / ACCOUNTING) ────────────────────
+
+    /** Tóm tắt kết quả tính thưởng doanh thu cho cả bộ phận. */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class OfficeBonusSummaryDto {
+        private Integer month;
+        private Integer year;
+        private String  department;
+        private String  departmentLabel;
+        /** Tổng doanh thu (tiền THỰC THU) của bộ phận trong tháng. */
+        private java.math.BigDecimal totalRevenue;
+        /** Tổng quỹ thưởng được chia. */
+        private Long totalBonusPool;
+        /** Số phiếu thanh toán được đếm. */
+        private Integer transactionCount;
+        private Long    computedAt;
+        private String  computedByName;
+        /** Chi tiết từng nhân viên. */
+        private java.util.List<OfficeBonusItemDto> items;
+    }
+
+    /** Dòng thưởng của 1 nhân viên. */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class OfficeBonusItemDto {
+        private Long   userId;
+        private String userFullName;
+        private String roleLabel;
+        /** Doanh thu tính thưởng cho người này (VNĐ). */
+        private java.math.BigDecimal revenue;
+        /** Số tiền thưởng. */
+        private Long bonusAmount;
+        /** % KPI áp dụng (snapshot). */
+        private Double kpiPercent;
+        private Integer transactionCount;
     }
 
     /** 1 dòng trong báo cáo khớp nhân viên sau khi import. */
@@ -419,6 +521,22 @@ public class FactoryPayrollDtos {
         private Long netSalary;
         /** Thưởng KPI sản xuất — chỉ bộ phận Xưởng */
         private Long kpiBonus;
+
+        /**
+         * LƯƠNG THỰC NHẬN hiển thị trên bảng preview — KHỚP với "Lương thực
+         * nhận" ở file export tổng hợp VÀ "Số tiền" ở file chuyển khoản NH.
+         *
+         * <p>Công thức (tương đương bank export):
+         * <pre>
+         *   netReceived = roundUpToThousand(baseSalary + Σ(visible allowances))
+         * </pre>
+         *
+         * <p>Visible allowances = tất cả allowance HIỂN THỊ trong file lương
+         * (bỏ các khoản tự sinh từ hỗ trợ giao hàng, bỏ "Phụ cấp xăng xe"
+         * nếu là tài xế). Đây là số OWNER đọc trên bảng, số máy ngân hàng
+         * chuyển, và số nhân viên nhận.
+         */
+        private Long netReceived;
 
         /**
          * LƯƠNG CƠ BẢN KHI ĐỦ CÔNG — mức đã nhập trong hồ sơ, CHƯA chia theo
@@ -510,6 +628,8 @@ public class FactoryPayrollDtos {
         private String department;
         private String departmentLabel;
         private Boolean finalized;
+        /** OWNER đã bấm "Hoàn tất KPI/Thưởng" chưa — false = KPI đang pending. */
+        private Boolean kpiFinalized;
         private Boolean attendanceBased;
         private Boolean hasKpiBonus;
 
@@ -580,6 +700,14 @@ public class FactoryPayrollDtos {
 
         /** Tổng lương của tài xế = motorbike.totalSalary + truck.totalSalary. */
         private Long grandTotalSalary;
+
+        // ── Thông tin bổ sung cho nhân viên NGOÀI bộ phận tài xế ──
+        /** Bộ phận thực tế của nhân viên (VD "Xưởng sản xuất") */
+        private String department;
+        /** Chức vụ (VD "Trợ lý xưởng") */
+        private String position;
+        /** TRUE nếu nhân viên này KHÔNG thuộc bộ phận Tài xế */
+        private Boolean nonDriver;
     }
 
     /** Chi tiết lương của MỘT loại xe (dùng cho cả xe máy và xe tải). */
@@ -617,5 +745,105 @@ public class FactoryPayrollDtos {
         /** Tổng lương chi cho toàn bộ tài xế. */
         private Long grandTotalSalary;
         private List<DriverSalaryRowDto> rows;
+
+        /**
+         * Nhân viên NGOÀI bộ phận Tài xế nhưng có hoạt động giao hàng (ODO / đơn).
+         * Phụ cấp xăng xe được tính và lưu vào phiếu lương của bộ phận gốc.
+         */
+        private List<DriverSalaryRowDto> nonDriverRows;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PREVIEW HOA HỒNG — hiển thị trước khi tính (11/2026)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Preview dữ liệu Thưởng/Hoa hồng cho tab SALES hoặc ACCOUNTING.
+     * Trả về CẢ khi chưa tính (bonusAmount = null) và sau khi đã tính.
+     *
+     * <ul>
+     *   <li>SALES: mỗi row là 1 seller với doanh thu riêng.</li>
+     *   <li>ACCOUNTING: mỗi row là 1 kế toán viên; các cột doanh thu bằng nhau
+     *       (dùng tổng phòng), bonusAmount thì mỗi người riêng theo trọng số.</li>
+     * </ul>
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class OfficeBonusPreviewDto {
+        private Integer month;
+        private Integer year;
+        private String  department;        // SALES | ACCOUNTING
+        private String  departmentLabel;
+
+        /** Tổng doanh thu TOÀN BỘ ĐƠN tạo trong tháng (bất kể đã thu hay chưa). */
+        private java.math.BigDecimal totalMonthOrderRevenue;
+        /** Tổng tiền THỰC THU trong tháng — dùng tính hoa hồng. */
+        private java.math.BigDecimal totalCollectedRevenue;
+        /**
+         * Σ (finalAmount − paidAmount) của đơn PENDING_PAYMENT tạo trong tháng.
+         * KHÔNG tính đơn COMPLETED còn chênh — xem {@link #totalWaivedRevenue}.
+         */
+        private java.math.BigDecimal totalHoldRevenue;
+        /**
+         * Σ (finalAmount − paidAmount) của đơn COMPLETED tạo trong tháng còn chênh —
+         * nghĩa là kế toán đã xác nhận "bỏ số lẻ không thu tiếp".
+         */
+        private java.math.BigDecimal totalWaivedRevenue;
+
+        /** Số phiếu thanh toán trong tháng. */
+        private Integer transactionCount;
+
+        /** Đã bấm "Tính hoa hồng" hay chưa — FE dùng để quyết định hiển thị cột bonus hay "—". */
+        private boolean commissionCalculated;
+        /** Đơn giá hoa hồng OWNER đã nhập cho tháng này (null nếu chưa tính). */
+        private Long commissionUnitPrice;
+        /** Đơn giá OWNER nhập cho THÁNG GẦN NHẤT TRƯỚC đó (null nếu chưa từng). FE dùng làm placeholder. */
+        private Long lastCommissionUnitPrice;
+
+        /** Tổng pool đã tính (null nếu chưa tính). */
+        private Long totalBonusPool;
+        private Long computedAt;
+        private String computedByName;
+
+        private java.util.List<OfficeBonusPreviewRowDto> items;
+    }
+
+    /** 1 dòng preview cho 1 nhân viên. */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class OfficeBonusPreviewRowDto {
+        private Long   userId;
+        private String userFullName;
+        private String roleLabel;
+        /** Thứ tự sắp xếp theo chức vụ trong bộ phận (0 = cao nhất). */
+        private Integer roleSortOrder;
+        /** Trọng số chia pool — chỉ có ý nghĩa cho ACCOUNTING (KTT=2, CV=1). */
+        private Integer weight;
+
+        /** Doanh thu đơn tạo trong tháng — SALES: của seller này; ACCOUNTING: tổng phòng. */
+        private java.math.BigDecimal totalMonthOrderRevenue;
+        /** Doanh thu thực thu trong tháng — SALES: riêng seller; ACCOUNTING: tổng phòng. */
+        private java.math.BigDecimal totalCollectedRevenue;
+        /** Doanh thu PENDING_PAYMENT đang hold — SALES: riêng seller; ACCOUNTING: tổng phòng. */
+        private java.math.BigDecimal totalHoldRevenue;
+        /** Σ COMPLETED còn chênh — SALES: riêng seller; ACCOUNTING: tổng phòng. */
+        private java.math.BigDecimal totalWaivedRevenue;
+        private Integer transactionCount;
+
+        /** Số hoa hồng đã tính — null khi chưa bấm "Tính hoa hồng". */
+        private Long bonusAmount;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // BACKFILL PAYMENT TRANSACTION (admin tool)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class PaymentBackfillReportDto {
+        private boolean dryRun;
+        private long scannedLogs;
+        private long createdTransactions;
+        private long skippedExisting;      // đã có PT cùng (order, time) → bỏ
+        private long skippedUnparseable;   // note không match regex "Thu: ..."
+        private long skippedZeroAmount;
+        private java.util.List<String> warnings;  // mẫu vài dòng không parse được
     }
 }

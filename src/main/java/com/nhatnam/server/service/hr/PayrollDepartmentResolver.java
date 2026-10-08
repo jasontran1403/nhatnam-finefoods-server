@@ -79,13 +79,34 @@ public class PayrollDepartmentResolver {
         return PayrollDepartment.of(payrollRoleOf(user));
     }
 
-    /** Nhãn vị trí hiển thị trên phiếu lương. */
+    /**
+     * Nhãn vị trí hiển thị trên phiếu lương.
+     *
+     * <p><b>Ưu tiên {@code user.position}</b> nếu OWNER đã đặt chức vụ tùy biến
+     * ở trang Nhân sự (VD "Nhân viên tạp vụ" cho một nhân viên có role WAREHOUSE
+     * thay vì nhãn mặc định "Nhân viên kho"). Fallback về nhãn mặc định của
+     * role khi position để trống hoặc trùng đúng nhãn role.
+     *
+     * <p>Không hiển thị nếu position là chuỗi rỗng — coi như không đặt.
+     */
     public String roleLabelOf(User user) {
         Role r = payrollRoleOf(user);
-        if (r == null) return user != null ? user.getPosition() : null;
-        String factoryLabel = FactoryKpiService.ROLE_LABELS.get(r);
-        if (factoryLabel != null) return factoryLabel;
-        return EXTRA_ROLE_LABELS.getOrDefault(r, r.name());
+        String defaultLabel = null;
+        if (r != null) {
+            String factoryLabel = FactoryKpiService.ROLE_LABELS.get(r);
+            defaultLabel = factoryLabel != null
+                    ? factoryLabel
+                    : EXTRA_ROLE_LABELS.getOrDefault(r, r.name());
+        }
+
+        if (user != null) {
+            String pos = user.getPosition();
+            if (pos != null && !pos.isBlank()) return pos.trim();
+        }
+
+        // Position chưa đặt → dùng nhãn mặc định của role. Với nhân viên không
+        // thuộc bộ phận nào (role == null) → null luôn, để nơi gọi tự xử lý.
+        return defaultLabel;
     }
 
     /** Nhãn vị trí theo role (dùng khi chỉ có role, không có user). */
@@ -121,10 +142,19 @@ public class PayrollDepartmentResolver {
      * Nhân viên của bộ phận CÓ THEO DÕI CHẤM CÔNG — dùng khi import bảng chấm công.
      * Khác {@link #employeesOf} ở chỗ đã loại người hưởng khoán, để họ không bị
      * báo "thiếu trong file" mỗi lần OWNER tải bảng chấm công lên.
+     *
+     * <p>BAO GỒM CẢ tài khoản đang bị KHOÁ: nhân viên có thể đi làm phần đầu
+     * tháng rồi bị khoá tài khoản (nghỉ ngang) trước khi upload file, nhưng
+     * TÊN & DỮ LIỆU chấm công của họ vẫn nằm trong file máy chấm công. Không
+     * đưa vào danh sách này thì block dữ liệu của họ bị coi là "không khớp"
+     * và bị bỏ ⇒ mất công thực tế đã làm ⇒ sang bước tính lương lại phải
+     * fallback về "đủ 208 giờ" (sai). Đưa vào để lưu AttendanceEntry đúng
+     * theo file, còn phần THƯỞNG/KPI của họ sẽ bị các bước sau (HrService,
+     * FactoryKpiService) chặn riêng.
      */
     @Transactional(readOnly = true)
     public List<User> attendanceEmployeesOf(PayrollDepartment department) {
-        return employeesOf(department).stream()
+        return employeesWithLockedOf(department).stream()
                 .filter(u -> !isAttendanceExempt(u))
                 .toList();
     }
@@ -140,6 +170,12 @@ public class PayrollDepartmentResolver {
 
     /**
      * Toàn bộ nhân viên đang hoạt động của 1 bộ phận, xếp theo họ tên.
+     *
+     * <p>KHÔNG bao gồm nhân viên đã bị khoá tài khoản hoặc xoá mềm — dùng cho các
+     * bước tính THƯỞNG/KPI/BONUS (tài khoản tạm ngưng không được nhận thưởng).
+     * Với các bước tính LƯƠNG (dựa trên chấm công/km giao hàng thực tế), gọi
+     * {@link #employeesWithLockedOf} để nhân viên tạm ngưng vẫn được trả lương
+     * cho phần công đã làm trước khi bị khoá.
      *
      * <p>Nhân viên kiêm nhiệm CHỈ xuất hiện ở bộ phận của role nhận lương —
      * Trần Mộng Thuỳ (SELLER + WAREHOUSE) chỉ nằm trong danh sách Kinh doanh,
@@ -167,6 +203,67 @@ public class PayrollDepartmentResolver {
                 // đang hưởng lương ở bộ phận khác.
                 .filter(u -> departmentOf(u) == department)
                 .sorted(Comparator.comparing(u -> u.getFullName() != null ? u.getFullName() : ""))
+                .toList();
+    }
+
+    /**
+     * Giống {@link #employeesOf} nhưng BAO GỒM cả nhân viên đang bị KHOÁ tài
+     * khoản (chỉ loại nhân viên đã xoá mềm).
+     *
+     * <p>Dùng cho các bước tính LƯƠNG: nhân viên tạm ngưng có thể đã đi làm và
+     * có chấm công trong tháng trước khi bị khoá, vẫn phải trả lương theo phần
+     * công đã làm. Riêng phần THƯỞNG/KPI/BONUS thì dùng {@link #employeesOf} để
+     * loại các tài khoản này.
+     */
+    @Transactional(readOnly = true)
+    public List<User> employeesWithLockedOf(PayrollDepartment department) {
+        if (department == null) return List.of();
+
+        Map<Long, User> merged = new LinkedHashMap<>();
+        for (Role r : department.getRoles()) {
+            userRepo.findByRole(r).forEach(u -> merged.put(u.getId(), u));
+            userRepo.findByRolesContaining(r).forEach(u -> merged.put(u.getId(), u));
+            userRepo.findByPayrollRole(r).forEach(u -> merged.put(u.getId(), u));
+        }
+
+        return merged.values().stream()
+                .filter(u -> !u.isDeleted())
+                .filter(u -> departmentOf(u) == department)
+                .sorted(Comparator.comparing(u -> u.getFullName() != null ? u.getFullName() : ""))
+                .toList();
+    }
+
+    /**
+     * TẤT CẢ nhân viên đang hoạt động (không khoá, không xoá) của 5 bộ phận
+     * CỘNG THÊM các vai trò LÃNH ĐẠO: OWNER, ADMIN, SUPER_ACCOUNTANT.
+     *
+     * <p>FIX (10/2026 — Phase 7): template Thưởng và Phụ cấp dùng chung cho
+     * cả công ty nên phải prefill cả quản lý cấp cao / kế toán trưởng — là
+     * nhóm KHÔNG có {@link PayrollDepartment} nhưng vẫn có thể nhận thưởng /
+     * phụ cấp. Trước đây template chỉ gọi {@link #employeesOf} 1 bộ phận nên
+     * HR phải tự gõ tay dòng cho ban giám đốc, dễ bỏ sót.
+     *
+     * <p>Sắp xếp: lãnh đạo (OWNER, ADMIN, SUPER_ACCOUNTANT) ĐẦU danh sách,
+     * sau đó đến từng bộ phận theo thứ tự {@link PayrollDepartment#values},
+     * trong mỗi bộ phận sort theo họ tên — khớp cách HR đọc bảng.
+     */
+    @Transactional(readOnly = true)
+    public List<User> allActiveWithExec() {
+        Map<Long, User> merged = new LinkedHashMap<>();
+
+        // Lãnh đạo trước — thứ tự ưu tiên: OWNER → ADMIN → SUPER_ACCOUNTANT.
+        for (Role r : List.of(Role.OWNER, Role.ADMIN, Role.SUPER_ACCOUNTANT)) {
+            userRepo.findByRole(r).forEach(u -> merged.putIfAbsent(u.getId(), u));
+            userRepo.findByRolesContaining(r).forEach(u -> merged.putIfAbsent(u.getId(), u));
+        }
+
+        // Sau đó đến các bộ phận, giữ thứ tự ổn định.
+        for (PayrollDepartment d : PayrollDepartment.values()) {
+            for (User u : employeesOf(d)) merged.putIfAbsent(u.getId(), u);
+        }
+
+        return merged.values().stream()
+                .filter(u -> !u.isDeleted() && !u.isLockAccount())
                 .toList();
     }
 

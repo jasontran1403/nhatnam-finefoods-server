@@ -16,6 +16,8 @@ public class CreateIncomeVoucherRequest {
     @NotBlank(message = "Lý do thu là bắt buộc")
     private String reason;
 
+    private String customerName;
+
     /** CASH | BANK_TRANSFER */
     private String paymentType;
 

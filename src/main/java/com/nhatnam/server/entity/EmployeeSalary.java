@@ -95,4 +95,13 @@ public class EmployeeSalary {
 
     private Long createdAt;
     private Long updatedAt;
+
+    /**
+     * Nhân viên part-time (bán thời gian) — làm nửa buổi (4h/ngày).
+     * <p>Khi tính công: part-time mỗi ngày đi làm = 0.5 công thay vì 1.0.
+     * <p>Giá trị này được snapshot vào {@link AttendanceEntry#partTime} khi tính
+     * lương mỗi tháng, nên khi tính lại tháng cũ vẫn giữ đúng trạng thái.
+     */
+    @Builder.Default
+    private Boolean partTime = false;
 }

@@ -68,6 +68,36 @@ public class Product {
     @Column(name = "storage_instruction", length = 500)
     private String storageInstruction;
 
+    /**
+     * Đơn vị tính quy đổi (VD: "kg") — chỉ dùng khi đơn vị gốc ≠ Kg.
+     * Null = không có quy đổi.
+     */
+    @Column(name = "conversion_unit", length = 50)
+    private String conversionUnit;
+
+    /**
+     * Quy cách quy đổi: 1 đơn vị gốc = bao nhiêu đơn vị quy đổi.
+     * VD: 1 hộp = 0.454 kg → conversionFactor = 0.454
+     * Cho phép tối đa 3 số thập phân.
+     */
+    @Column(name = "conversion_factor", precision = 10, scale = 3)
+    private java.math.BigDecimal conversionFactor;
+
+    /**
+     * Quy cách (gr/đơn vị): VD 500, 424, 410, 210, 1000.
+     * Dùng khi đơn vị tính ≠ Kg để quy đổi ra Kg: qty × specification / 1000 = kg.
+     * Null = không có quy cách (hoặc đơn vị đã là Kg).
+     */
+    @Column(name = "specification")
+    private Integer specification;
+
+    /**
+     * Danh mục tạo hóa đơn MISA: Kem, Xúc xích bò, Xúc xích heo, Xúc xích gà.
+     * Dùng để gộp sản phẩm khi xuất hóa đơn MISA.
+     */
+    @Column(name = "misa_category", length = 100)
+    private String misaCategory;
+
     // ProductPriceTier vẫn có @ManyToOne Product → cascade ALL an toàn
     @Builder.Default
     @OneToMany(mappedBy = "product", cascade = CascadeType.ALL,

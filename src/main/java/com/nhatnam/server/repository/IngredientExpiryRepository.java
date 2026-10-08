@@ -4,7 +4,9 @@
 package com.nhatnam.server.repository;
 
 import com.nhatnam.server.entity.IngredientExpiry;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -102,6 +104,24 @@ public interface IngredientExpiryRepository extends JpaRepository<IngredientExpi
             "ORDER BY CASE WHEN e.expiryDate IS NULL THEN 1 ELSE 0 END ASC, e.expiryDate ASC, e.id ASC")
     List<IngredientExpiry> findFifoLots(@Param("warehouseId") Long warehouseId,
                                         @Param("ingredientId") Long ingredientId);
+
+    /**
+     * FIFO với PESSIMISTIC_WRITE — khóa các row lô cho tới khi transaction commit.
+     * Dùng cho các flow bán hàng (createOrder, updateOrderItems, exportForOrder)
+     * để tránh race 2 request cùng trừ 1 lô → lô âm hoặc tổng lô vượt số hàng thực.
+     *
+     * <p><b>Deadlock guard</b>: caller PHẢI sort theo ingredientId ASC khi trừ
+     * nhiều ingredient trong 1 transaction. Nếu không, 2 transaction có thể
+     * lock chéo nhau và deadlock.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT e FROM IngredientExpiry e " +
+            "WHERE e.warehouse.id = :warehouseId AND e.ingredientId = :ingredientId " +
+            "AND e.quantity > 0 " +
+            "ORDER BY CASE WHEN e.expiryDate IS NULL THEN 1 ELSE 0 END ASC, e.expiryDate ASC, e.id ASC")
+    List<IngredientExpiry> findFifoLotsForUpdate(@Param("warehouseId") Long warehouseId,
+                                                 @Param("ingredientId") Long ingredientId);
+
 
     @Query("SELECT e FROM IngredientExpiry e " +
             "WHERE e.warehouse.id = :warehouseId " +

@@ -169,6 +169,25 @@ public class ExpenseVoucher {
     @Column(name = "created_by_role", length = 40)
     private String createdByRole;
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // ỨNG LƯƠNG — chỉ dùng khi vendorType = SALARY_ADVANCE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * ID nhân viên được ứng lương.
+     * Chỉ set khi {@code vendorType = "SALARY_ADVANCE"}.
+     * Dùng để tổng hợp tổng tiền đã ứng trong tháng của nhân viên đó.
+     */
+    @Column(name = "salary_advance_user_id")
+    private Long salaryAdvanceUserId;
+
+    /**
+     * Tháng ứng lương — định dạng "YYYY-MM" (VD: "2026-09").
+     * Dùng để giới hạn và cộng dồn ứng lương trong đúng tháng.
+     */
+    @Column(name = "salary_advance_month", length = 7)
+    private String salaryAdvanceMonth;
+
     /** Danh sách khoản chi */
     @Builder.Default
     @OneToMany(mappedBy = "voucher", cascade = CascadeType.ALL, orphanRemoval = true)

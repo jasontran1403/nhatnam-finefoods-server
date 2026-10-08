@@ -30,6 +30,8 @@ public class HrDtos {
         /** Kỳ lương — nếu có, HR sẽ nạp thêm phụ cấp/thưởng import từ MonthlyAdjustment. */
         private Integer month;
         private Integer year;
+        /** Nhân viên part-time (bán thời gian) — mỗi ngày đi làm = 0.5 công. */
+        private Boolean partTime;
     }
 
     /** Một khoản phụ cấp: nhãn + số tiền + có tính thuế TNCN không. */
@@ -71,11 +73,13 @@ public class HrDtos {
         private Long bonus;
         /** Số người phụ thuộc — áp dụng chung cho tất cả nhân viên trong batch */
         private Integer dependents;
+        /** Nhân viên part-time (bán thời gian) — áp dụng chung cho cả batch. */
+        private Boolean partTime;
     }
 
     @Data
     public static class ApproveSalaryRequest {
-        // no body needed; approved by current user
+        // nobody needed; approved by current user
     }
 
     @Data
@@ -111,6 +115,8 @@ public class HrDtos {
         private String rejectReason;
         private Long createdAt;
         private Long updatedAt;
+        /** Nhân viên part-time (bán thời gian). */
+        private Boolean partTime;
         private String createdByName;
         private String approvedByName;
     }
@@ -273,7 +279,17 @@ public class HrDtos {
         private Long amount;
     }
 
-    /** Chi tiết thưởng đơn hàng của tài xế — tách theo loại xe (moto/truck). */
+    /**
+     * Chi tiết thưởng "KPI 100%" của tài xế — GOM cả 3 nguồn:
+     *   1. Tiền xăng (chỉ xe máy) = totalKm × giá xăng/km
+     *   2. Thưởng đơn hàng xe máy = motorbikeTrips × đơn giá thưởng xe máy
+     *   3. Thưởng đơn hàng xe tải = truckTrips × đơn giá thưởng xe tải
+     *
+     * <p>{@code totalAmount = gasAmount + motorbikeAmount + truckAmount} và
+     * chính là số hiển thị ở dòng "Thưởng KPI — đạt 100%" trên phiếu lương
+     * của tài xế. Ba trường {@code gas*} là mới (2026) — bản trước chỉ có
+     * moto/truck, gas đứng ở allowances.
+     */
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
     public static class DriverOrderBonusDto {
         /** Số lượt xe máy trong tháng. */
@@ -284,7 +300,13 @@ public class HrDtos {
         private Integer truckTrips;
         /** Thưởng xe tải = truckTrips × đơn giá thưởng xe tải. */
         private Long truckAmount;
-        /** Tổng = motorbikeAmount + truckAmount. */
+        /** Tổng số km xe máy đã chạy trong tháng (chỉ xe máy tính tiền xăng). */
+        private Double gasKm;
+        /** Đơn giá xăng (đồng/km) OWNER nhập ngày tính lương. */
+        private Long gasPrice;
+        /** Tiền xăng = round(gasKm × gasPrice). */
+        private Long gasAmount;
+        /** Tổng = gasAmount + motorbikeAmount + truckAmount. */
         private Long totalAmount;
     }
 
@@ -331,6 +353,28 @@ public class HrDtos {
          * xử lý của 3 field trên. Muốn XOÁ ngày vào làm thì gửi {@code 0}.
          */
         private Long workStartDate;
+
+        /**
+         * SỐ TÀI KHOẢN NGÂN HÀNG (để chi lương qua NH).
+         *
+         * <p>{@code null} = KHÔNG ĐỔI. Chuỗi RỖNG {@code ""} = xoá trắng
+         * (nhân viên không còn tài khoản, cột số TK trong file NH sẽ để trống).
+         * Chuỗi khác rỗng = ghi đè.
+         */
+        private String bankAccountNumber;
+
+        /**
+         * TÊN NGÂN HÀNG. Quy ước null / rỗng giống {@link #bankAccountNumber}.
+         */
+        private String bankName;
+
+        /**
+         * ĐANG NGHỈ THAI SẢN — {@code true} = tạm dừng chi lương qua ngân hàng.
+         *
+         * <p>{@code null} = KHÔNG ĐỔI. Gửi {@code true}/{@code false} rõ ràng
+         * khi HR muốn bật/tắt trạng thái.
+         */
+        private Boolean onMaternityLeave;
     }
 
     // ── Leave ─────────────────────────────────────────────────────────────────

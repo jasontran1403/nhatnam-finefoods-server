@@ -13,6 +13,9 @@ import com.nhatnam.server.enumtype.Role;
 import com.nhatnam.server.repository.*;
 import com.nhatnam.server.service.FifoDeductService;
 import com.nhatnam.server.service.NotificationService;
+import com.nhatnam.server.service.StockMutationResult;
+import com.nhatnam.server.service.StockMutationService;
+import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.*;
@@ -29,7 +32,6 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 @Slf4j
 public class WarehouseService {
-
     private final WarehouseRepository        warehouseRepository;
     private final WarehouseReceiptRepository warehouseReceiptRepository;
     private final IngredientExpiryRepository ingredientExpiryRepository;
@@ -39,6 +41,10 @@ public class WarehouseService {
     private final ObjectMapper               objectMapper;
     private final IngredientStockRepository  ingredientStockRepository;
     private final NotificationService        notificationService;
+
+    // BUG FIX layer: race-safe mutation + check pending deductions
+    private final com.nhatnam.server.service.StockMutationService stockMutationService;
+    private final com.nhatnam.server.repository.OrderStockDeductionRepository orderStockDeductionRepository;
     // Mục 4.2 — chuyển kho sang kho sản xuất (xưởng)
     private final com.nhatnam.server.repository.ProductionFactoryRepository productionFactoryRepository;
     private final com.nhatnam.server.repository.FactoryMaterialStockRepository factoryMaterialStockRepository;
@@ -126,7 +132,7 @@ public class WarehouseService {
      *         lấy hạn xa nhất theo yêu cầu nghiệp vụ.
      */
     private LocalDate transferExpiryLots(Warehouse source, Warehouse dest,
-                                    Ingredient ingredient, BigDecimal qty, long now) {
+                                         Ingredient ingredient, BigDecimal qty, long now) {
         Long srcId = source.getId();
         Long dstId = dest.getId();
         Long ingId = ingredient.getId();
@@ -204,6 +210,7 @@ public class WarehouseService {
 
     // ── TỒN KHO ──────────────────────────────────────────────────────────────
 
+    @Transactional
     public List<StockResponse> getStockByWarehouse(Long warehouseId) {
         // IngredientStock.ingredientId là plain column — không cần JOIN FETCH ingredient
         List<IngredientStock> stocks = ingredientStockRepository.findByWarehouseIdWithIngredient(warehouseId);
@@ -240,7 +247,9 @@ public class WarehouseService {
             r.setIngredientName(ing != null ? ing.getName()     : s.resolvedName());
             r.setUnit         (ing != null ? ing.getUnit()     : s.resolvedUnit());
             r.setImageUrl     (ing != null ? ing.getImageUrl() : null);
-            r.setStockQuantity(s.getStockQuantity());
+            // ĐỪNG setStockQuantity ở đây — số cuối cùng phụ thuộc vào tổng lô
+            // (xem block SELF-HEAL bên dưới). Đặt trước rồi ghi đè dễ gây sót
+            // khi có ai đó chỉ đọc field này trước khi block dưới chạy.
 
             java.time.LocalDate today = java.time.LocalDate.now();
             List<IngredientExpiry> lots = expiryMap
@@ -266,11 +275,41 @@ public class WarehouseService {
                 return ei;
             }).collect(Collectors.toList());
 
-            // Dòng bù phần tồn chưa gắn lô, để tổng lô khớp stockQuantity.
+            // ── SELF-HEAL: lô là chân lý vật lý ─────────────────────────────
+            //   IngredientStock.stockQuantity chỉ là CACHE aggregate được các
+            //   luồng nhập/xuất/chuyển/đổi/đơn hàng/kho xưởng… cùng cộng trừ
+            //   (~15 chỗ trong codebase gọi setStockQuantity). Chỉ cần MỘT
+            //   luồng bị bug hoặc dữ liệu bị chỉnh tay dưới DB là cache lệch
+            //   với tổng lô — dẫn tới hiện tượng: bảng Quản lý kho báo tồn 0,
+            //   nhưng Chi tiết lô + form Điều chỉnh kho vẫn đọc thấy hàng.
+            //
+            //   Xử lý ưu tiên tính đúng đắn: lấy MAX(cache, tổng lô) làm số
+            //   trả về, và nếu cache < tổng lô thì SYNC NGƯỢC cache về theo
+            //   lô để mọi nơi khác (dashboard, guard xuất kho, picker nguyên
+            //   liệu, /stock-check của đơn nháp…) đọc s.getStockQuantity()
+            //   trực tiếp cũng thấy số đúng. Không sửa cache khi cache > lô
+            //   để giữ hàng "untracked" hợp lệ (dữ liệu cũ chưa gắn lô).
             BigDecimal trackedQty = lots.stream()
                     .map(IngredientExpiry::getQuantity).reduce(BigDecimal.ZERO, BigDecimal::add);
-            BigDecimal stockQty = s.getStockQuantity() != null ? s.getStockQuantity() : BigDecimal.ZERO;
-            BigDecimal untracked = stockQty.subtract(trackedQty);
+            BigDecimal cachedQty = s.getStockQuantity() != null
+                    ? s.getStockQuantity() : BigDecimal.ZERO;
+
+            BigDecimal effectiveQty;
+            if (trackedQty.compareTo(cachedQty) > 0) {
+                effectiveQty = trackedQty;
+                s.setStockQuantity(trackedQty);
+                s.setUpdatedAt(System.currentTimeMillis());
+                ingredientStockRepository.save(s);
+                log.warn("[Stock] Cache lệch cho ingredient={} tại kho={}: cache={} < tổng lô={}. Đã sync về theo lô.",
+                        s.getIngredientId(), warehouseId, cachedQty, trackedQty);
+            } else {
+                effectiveQty = cachedQty;
+            }
+            r.setStockQuantity(effectiveQty);
+
+            // Dòng bù phần tồn CHƯA GẮN LÔ (dữ liệu cũ, ít gặp), để tổng các
+            // dòng trong Chi tiết lô khớp stockQuantity ở bảng ngoài.
+            BigDecimal untracked = effectiveQty.subtract(trackedQty);
             if (untracked.compareTo(BigDecimal.ZERO) > 0) {
                 ExpiryInfo ei = new ExpiryInfo();
                 ei.setQuantity(untracked);
@@ -346,20 +385,29 @@ public class WarehouseService {
                 .items(new ArrayList<>())
                 .build();
 
-        for (ImportItemRequest ir : req.getItems()) {
+        // BUG FIX (deadlock guard): sort ingredientId ASC trước khi loop, để nếu
+        // 2 phiếu nhập có ingredient chung, chúng lock theo cùng thứ tự → không deadlock.
+        java.util.List<ImportItemRequest> sortedItems = req.getItems().stream()
+                .sorted(java.util.Comparator.comparing(ImportItemRequest::getIngredientId))
+                .toList();
+
+        for (ImportItemRequest ir : sortedItems) {
             Ingredient ing = getIngredient(ir.getIngredientId());
             BigDecimal qty = ir.getQuantity();
             if (qty == null || qty.compareTo(BigDecimal.ZERO) <= 0)
                 throw new com.nhatnam.server.common.BusinessException(
                         "Số lượng nhập phải lớn hơn 0: " + ing.getName());
 
-            // 1) Cộng tồn kho tổng
-            IngredientStock stock = getOrCreateStock(warehouse, ing, now);
-            BigDecimal before = stock.getStockQuantity();
-            BigDecimal after  = before.add(qty);
-            stock.setStockQuantity(after);
-            stock.setUpdatedAt(now);
-            ingredientStockRepository.save(stock);
+            // 1) Đảm bảo row IngredientStock tồn tại
+            getOrCreateStock(warehouse, ing, now);
+
+            // BUG FIX (race lost update): atomic increase thay cho read-modify-write.
+            // Trước: 2 phiếu nhập cùng ingredient tại cùng warehouse → cả 2 đọc cùng
+            // snapshot → cả 2 save đè → mất số nhập của 1 phiếu.
+            // Sau: 1 câu UPDATE atomic, cộng dồn đúng.
+            StockMutationResult mut = stockMutationService.increase(ing.getId(), warehouse.getId(), qty, now);
+            BigDecimal before = mut.getBefore();
+            BigDecimal after  = mut.getAfter();
 
             // 2) Tạo lô HSD mới với GIÁ VỐN TẠM = 0 (chưa biết giá thật)
             IngredientExpiry lot = ingredientExpiryRepository.save(IngredientExpiry.builder()
@@ -434,26 +482,35 @@ public class WarehouseService {
                 .items(new ArrayList<>())
                 .build();
 
-        for (ExportItemRequest er : req.getItems()) {
-            Ingredient ing = getIngredient(er.getIngredientId());
-            IngredientStock stock = getOrCreateStock(warehouse, ing, now);
-            checkSufficientStock(stock, er.getQuantity(), ing.getName());
+        // BUG FIX (deadlock guard): sort ingredientId ASC
+        java.util.List<ExportItemRequest> sortedItems = req.getItems().stream()
+                .sorted(java.util.Comparator.comparing(ExportItemRequest::getIngredientId))
+                .toList();
 
-            BigDecimal before = stock.getStockQuantity();
-            BigDecimal after  = before.subtract(er.getQuantity());
-            stock.setStockQuantity(after);
-            stock.setUpdatedAt(now);
-            ingredientStockRepository.save(stock);
+        for (ExportItemRequest er : sortedItems) {
+            Ingredient ing = getIngredient(er.getIngredientId());
+            getOrCreateStock(warehouse, ing, now);
+
+            // BUG FIX 2.2 (race lost update xuất kho): atomic decrease thay cho
+            // check→read→save. Nếu không đủ hàng THẬT sự → InsufficientStockException
+            // với thông tin chi tiết → FE hiển thị inline error, không reload.
+            StockMutationResult mut = stockMutationService.decreaseRespectingHolds(
+                    ing.getId(), warehouse.getId(), er.getQuantity(), false, now);
+
+            // ✅ FIX: PHẢI trừ FIFO các lô — nếu không, cache stockQuantity bị trừ
+            //    nhưng tổng lô vẫn nguyên → lần đọc sau self-heal sync ngược cache
+            //    về theo lô → mất phần vừa xuất (bug "xuất kho không trừ").
+            fifoDeductService.deduct(warehouse, ing, er.getQuantity(), now);
 
             receipt.getItems().add(WarehouseReceiptItem.builder()
                     .receipt(receipt)
-                    .ingredientId(ing.getId())                    // ← plain id
+                    .ingredientId(ing.getId())
                     .ingredientNameSnapshot(ing.getName())
                     .ingredientUnitSnapshot(ing.getUnit())
                     .ingredientImageUrlSnapshot(ing.getImageUrl())
                     .quantity(er.getQuantity().negate())
-                    .quantityBefore(before).quantityAfter(after)
-                    .difference(after.subtract(before))
+                    .quantityBefore(mut.getBefore()).quantityAfter(mut.getAfter())
+                    .difference(mut.getAfter().subtract(mut.getBefore()))
                     .build());
         }
         return mapReceipt(warehouseReceiptRepository.save(receipt));
@@ -484,17 +541,21 @@ public class WarehouseService {
                 .items(new ArrayList<>())
                 .build();
 
-        for (ExportItemRequest er : items) {
+        // BUG FIX (deadlock guard): sort ingredientId ASC
+        List<ExportItemRequest> sortedItems = items.stream()
+                .sorted(java.util.Comparator.comparing(ExportItemRequest::getIngredientId))
+                .toList();
+
+        for (ExportItemRequest er : sortedItems) {
             Ingredient ing = getIngredient(er.getIngredientId());
-            IngredientStock stock = getOrCreateStock(warehouse, ing, now);
-            checkSufficientStock(stock, er.getQuantity(), ing.getName());
+            getOrCreateStock(warehouse, ing, now);
 
-            BigDecimal before = stock.getStockQuantity();
-            BigDecimal after  = before.subtract(er.getQuantity());
-            stock.setStockQuantity(after);
-            stock.setUpdatedAt(now);
-            ingredientStockRepository.save(stock);
+            // BUG FIX (race): atomic decrease. Không cần chừa held vì đây là
+            // chốt đơn - request này CHÍNH LÀ đang cầm giỏ.
+            StockMutationResult mut = stockMutationService.decrease(
+                    ing.getId(), warehouse.getId(), er.getQuantity(), now);
 
+            // FIFO trừ lô (đã có PESSIMISTIC_WRITE trong FifoDeductService)
             fifoDeductService.deduct(warehouse, ing, er.getQuantity(), now);
 
             receipt.getItems().add(WarehouseReceiptItem.builder()
@@ -504,8 +565,8 @@ public class WarehouseService {
                     .ingredientUnitSnapshot(ing.getUnit())
                     .ingredientImageUrlSnapshot(ing.getImageUrl())
                     .quantity(er.getQuantity().negate())
-                    .quantityBefore(before).quantityAfter(after)
-                    .difference(after.subtract(before))
+                    .quantityBefore(mut.getBefore()).quantityAfter(mut.getAfter())
+                    .difference(mut.getAfter().subtract(mut.getBefore()))
                     .build());
         }
         return mapReceipt(warehouseReceiptRepository.save(receipt));
@@ -553,21 +614,29 @@ public class WarehouseService {
                 .createdBy(user).createdByName(resolveUserName(user))
                 .createdAt(now).updatedAt(now).items(new ArrayList<>()).build();
 
-        for (TransferItemRequest tr : req.getItems()) {
+        // BUG FIX 2.3 (transfer partial rollback + race): dùng atomic transfer
+        // trong 1 transaction. Nếu bất kỳ bước nào fail (trừ kho A hoặc cộng kho B)
+        // → toàn bộ rollback → không có trạng thái "A trừ nhưng B chưa cộng".
+        //
+        // Deadlock guard: sort ingredientId ASC
+        List<TransferItemRequest> sortedItems = req.getItems().stream()
+                .sorted(java.util.Comparator.comparing(TransferItemRequest::getIngredientId))
+                .toList();
+
+        for (TransferItemRequest tr : sortedItems) {
             Ingredient ing = getIngredient(tr.getIngredientId());
+            getOrCreateStock(fromWarehouse, ing, now);
+            getOrCreateStock(toWarehouse, ing, now);
 
-            IngredientStock fromStock = getOrCreateStock(fromWarehouse, ing, now);
-            checkSufficientStock(fromStock, tr.getQuantity(), ing.getName());
-            BigDecimal fromBefore = fromStock.getStockQuantity();
-            BigDecimal fromAfter  = fromBefore.subtract(tr.getQuantity());
-            fromStock.setStockQuantity(fromAfter); fromStock.setUpdatedAt(now);
-            ingredientStockRepository.save(fromStock);
+            // Atomic transfer: trừ from + cộng to trong 1 transaction
+            StockMutationService.TransferResult trResult = stockMutationService.transfer(
+                    ing.getId(), fromWarehouse.getId(), toWarehouse.getId(),
+                    tr.getQuantity(), false, now);
 
-            IngredientStock toStock = getOrCreateStock(toWarehouse, ing, now);
-            BigDecimal toBefore = toStock.getStockQuantity();
-            BigDecimal toAfter  = toBefore.add(tr.getQuantity());
-            toStock.setStockQuantity(toAfter); toStock.setUpdatedAt(now);
-            ingredientStockRepository.save(toStock);
+            BigDecimal fromBefore = trResult.getFrom().getBefore();
+            BigDecimal fromAfter  = trResult.getFrom().getAfter();
+            BigDecimal toBefore   = trResult.getTo().getBefore();
+            BigDecimal toAfter    = trResult.getTo().getAfter();
 
             // HSD xa nhất trong các lô được chuyển — dùng cho phiếu đi đường
             LocalDate furthestExpiry = transferExpiryLots(fromWarehouse, toWarehouse, ing, tr.getQuantity(), now);
@@ -638,21 +707,25 @@ public class WarehouseService {
                 .createdBy(user).createdByName(resolveUserName(user))
                 .createdAt(now).updatedAt(now).items(new ArrayList<>()).build();
 
-        for (TransferItemRequest tr : req.getItems()) {
+        // BUG FIX (deadlock guard): sort ingredientId ASC
+        List<TransferItemRequest> sortedFactoryItems = req.getItems().stream()
+                .sorted(java.util.Comparator.comparing(TransferItemRequest::getIngredientId))
+                .toList();
+
+        for (TransferItemRequest tr : sortedFactoryItems) {
             Ingredient ing = getIngredient(tr.getIngredientId());
             String key = ing.getName() == null ? "" : ing.getName().trim().toLowerCase();
             if (!factoryNames.contains(key))
                 throw new RuntimeException("Kho sản xuất [" + factory.getName()
                         + "] không có nguyên liệu: " + ing.getName());
 
-            // Trừ tồn kho nguồn + giảm lô HSD nguồn (FIFO). deduct() trả về TỔNG giá vốn
-            // đã trừ → chia số lượng để ra giá vốn/đơn vị mang sang kho xưởng.
-            IngredientStock fromStock = getOrCreateStock(fromWarehouse, ing, now);
-            checkSufficientStock(fromStock, tr.getQuantity(), ing.getName());
-            BigDecimal fromBefore = fromStock.getStockQuantity();
-            BigDecimal fromAfter  = fromBefore.subtract(tr.getQuantity());
-            fromStock.setStockQuantity(fromAfter); fromStock.setUpdatedAt(now);
-            ingredientStockRepository.save(fromStock);
+            getOrCreateStock(fromWarehouse, ing, now);
+
+            // BUG FIX (race): atomic decrease kho nguồn
+            StockMutationResult mut = stockMutationService.decreaseRespectingHolds(
+                    ing.getId(), fromWarehouse.getId(), tr.getQuantity(), false, now);
+            BigDecimal fromBefore = mut.getBefore();
+            BigDecimal fromAfter  = mut.getAfter();
 
             // Lấy HSD sớm nhất trong các lô sắp bị trừ (trước khi trừ) để mang sang kho xưởng
             Long carriedExpiry = earliestExpiryMs(fromWarehouse, ing);
@@ -720,19 +793,25 @@ public class WarehouseService {
                 .createdBy(user).createdByName(resolveUserName(user))
                 .createdAt(now).updatedAt(now).items(new ArrayList<>()).build();
 
-        for (TransferItemRequest tr : req.getItems()) {
+        // BUG FIX (deadlock guard): sort ingredientId ASC
+        List<TransferItemRequest> sortedFgItems = req.getItems().stream()
+                .sorted(java.util.Comparator.comparing(TransferItemRequest::getIngredientId))
+                .toList();
+
+        for (TransferItemRequest tr : sortedFgItems) {
             Ingredient ing = getIngredient(tr.getIngredientId());
             String key = ing.getName() == null ? "" : ing.getName().trim().toLowerCase();
             if (!fgNames.contains(key))
                 throw new RuntimeException("Kho thành phẩm xưởng [" + factory.getName()
                         + "] không có thành phẩm: " + ing.getName());
 
-            IngredientStock fromStock = getOrCreateStock(fromWarehouse, ing, now);
-            checkSufficientStock(fromStock, tr.getQuantity(), ing.getName());
-            BigDecimal fromBefore = fromStock.getStockQuantity();
-            BigDecimal fromAfter  = fromBefore.subtract(tr.getQuantity());
-            fromStock.setStockQuantity(fromAfter); fromStock.setUpdatedAt(now);
-            ingredientStockRepository.save(fromStock);
+            getOrCreateStock(fromWarehouse, ing, now);
+
+            // BUG FIX (race): atomic decrease
+            StockMutationResult mut = stockMutationService.decreaseRespectingHolds(
+                    ing.getId(), fromWarehouse.getId(), tr.getQuantity(), false, now);
+            BigDecimal fromBefore = mut.getBefore();
+            BigDecimal fromAfter  = mut.getAfter();
 
             Long carriedExpiry = earliestExpiryMs(fromWarehouse, ing);
             BigDecimal totalCost = fifoDeductService.deduct(fromWarehouse, ing, tr.getQuantity(), now);
@@ -839,24 +918,125 @@ public class WarehouseService {
         // Các lô MỚI được tạo trong phiếu này → gửi cho kế toán trưởng định giá
         List<LotPricingRequest> newLotRequests = new ArrayList<>();
 
-        for (AdjustItemRequest ar : req.getItems()) {
+        // BUG FIX (deadlock guard): sort ingredientId ASC
+        List<AdjustItemRequest> sortedAdjItems = req.getItems().stream()
+                .sorted(java.util.Comparator.comparing(AdjustItemRequest::getIngredientId))
+                .toList();
+
+        for (AdjustItemRequest ar : sortedAdjItems) {
             Ingredient ing = getIngredient(ar.getIngredientId());
             IngredientStock stock = getOrCreateStock(warehouse, ing, now);
 
-            BigDecimal before = stock.getStockQuantity();
+//            // ═══════════════════════════════════════════════════════════════
+//            // BUG FIX 2.6: Chặn adjust khi có đơn PREPARING đang giữ hàng.
+//            // Trước: kiểm kê giảm số → cancel đơn sau đó → restoreStock cộng lại
+//            //         → hệ thống có dư ảo, kho vật lý không có hàng thật.
+//            // Sau: bắt buộc admin xử lý các đơn pending trước khi kiểm kê.
+//            // ═══════════════════════════════════════════════════════════════
+//            List<OrderStockDeduction> pendingDeductions = orderStockDeductionRepository
+//                    .findPendingByIngredientAndWarehouse(ing.getId(), warehouse.getId());
+//            if (!pendingDeductions.isEmpty()) {
+//                BigDecimal totalPending = pendingDeductions.stream()
+//                        .map(OrderStockDeduction::getQuantity)
+//                        .filter(java.util.Objects::nonNull)
+//                        .reduce(BigDecimal.ZERO, BigDecimal::add);
+//                throw new com.nhatnam.server.common.BusinessException(String.format(
+//                        "Không thể điều chỉnh '%s' tại kho '%s': đang có %d đơn hàng " +
+//                                "giữ tổng %s%s. Vui lòng hoàn tất/huỷ các đơn này trước khi kiểm kê.",
+//                        ing.getName(), warehouse.getName(),
+//                        pendingDeductions.size(),
+//                        totalPending.toPlainString(),
+//                        ing.getUnit() != null ? ing.getUnit() : ""));
+//            }
+
+            BigDecimal before = stock.getStockQuantity() != null ? stock.getStockQuantity() : BigDecimal.ZERO;
             BigDecimal after;
 
             boolean lotMode = ar.getLots() != null && !ar.getLots().isEmpty();
             if (lotMode) {
-                after = applyLotAdjustments(warehouse, ing, ar.getLots(), receipt,
+                BigDecimal lotSum = applyLotAdjustments(warehouse, ing, ar.getLots(), receipt,
                         user, now, newLotRequests);
+
+                // SET tuyệt đối theo tổng lô — lô là nguồn chân lý khi adjust
+                // theo lô, không cần delta atomic như luồng bán hàng.
+                // flushAutomatically + clearAutomatically trong @Query đảm bảo
+                // câu UPDATE chạy ngay và L1 cache được clear để lần đọc tiếp
+                // theo không trả về stock_quantity cũ.
+                ingredientStockRepository.setStockQuantity(
+                        ing.getId(), warehouse.getId(), lotSum, now);
+                after = lotSum;
+
+                // Reload sau khi clear cache — đọc giá trị mới nhất
+                IngredientStock reload = ingredientStockRepository
+                        .findByIngredientIdAndWarehouseId(ing.getId(), warehouse.getId())
+                        .orElseThrow();
+                reload.setTotalCostValue(recalcTotalCostValue(warehouse.getId(), ing.getId()));
+                reload.setUpdatedAt(now);
+                ingredientStockRepository.save(reload);
             } else {
-                // ── Chế độ cũ: chỉnh theo tổng, phân bổ chênh lệch vào lô FIFO ──
+                // ── Chế độ không lô: adjust về physicalQty ──
                 if (ar.getPhysicalQty() == null)
                     throw new com.nhatnam.server.common.BusinessException(
                             "Thiếu số lượng điều chỉnh cho: " + ing.getName());
-                after = ar.getPhysicalQty();
-                adjustExpiryLot(warehouse, ing, after.subtract(before), now);
+
+                BigDecimal physical = ar.getPhysicalQty();
+                BigDecimal delta = physical.subtract(before);
+
+                // ═══════════════════════════════════════════════════════════════
+                // BUG FIX 2.5: KHÔNG dồn 3kg dư vào lô có HSD sớm nhất.
+                // Trước: adjustExpiryLot(delta > 0) cộng toàn bộ dư vào allLots.get(0)
+                //         → 3kg hàng mới bị gán HSD sớm → báo cáo HSD sai, giá vốn sai.
+                // Sau: nếu dư → tạo lô riêng "SURPLUS" với HSD=null (cần kế toán review)
+                //       và giá vốn tạm = 1 → gửi LotPricingRequest.
+                // ═══════════════════════════════════════════════════════════════
+                if (delta.compareTo(BigDecimal.ZERO) > 0) {
+                    // Tạo lô mới cho phần dư — không dồn vào lô cũ
+                    IngredientExpiry surplusLot = ingredientExpiryRepository.save(
+                            IngredientExpiry.builder()
+                                    .warehouse(warehouse)
+                                    .ingredientId(ing.getId())
+                                    .expiryDate(null)         // đánh dấu cần xác định HSD
+                                    .quantity(delta)
+                                    .costPrice(BigDecimal.ONE) // tạm 1đ, kế toán confirm
+                                    .createdAt(now).updatedAt(now)
+                                    .build());
+                    // Yêu cầu kế toán trưởng nhập giá vốn thật + HSD
+                    newLotRequests.add(LotPricingRequest.builder()
+                            .ingredientExpiryId(surplusLot.getId())
+                            .warehouseId(warehouse.getId())
+                            .warehouseName(warehouse.getName())
+                            .ingredientId(ing.getId())
+                            .ingredientName(ing.getName())
+                            .ingredientUnit(ing.getUnit())
+                            .quantity(delta)
+                            .expiryDate(null)
+                            .requestedById(user.getId())
+                            .requestedByName(resolveUserName(user))
+                            .status(LotPricingRequest.Status.PENDING)
+                            .createdAt(now).build());
+                } else if (delta.compareTo(BigDecimal.ZERO) < 0) {
+                    // Nếu thiếu → trừ FIFO các lô cũ (đây vẫn là hành vi ĐÚNG)
+                    adjustExpiryLot(warehouse, ing, delta, now);
+                }
+                // delta = 0: không đụng lô
+
+                // ═══════════════════════════════════════════════════════════════
+                // BUG FIX 2.4: STALE ABSOLUTE WRITE.
+                // Trước: stock.setStockQuantity(physicalQty) ghi đè tuyệt đối →
+                //         doanh thu xảy ra trong lúc kiểm kê bị mất khỏi tồn.
+                // Sau: adjustToActual quy về DELTA atomic → apply lên số MỚI NHẤT
+                //       của DB, không phải snapshot lúc mở form.
+                // ═══════════════════════════════════════════════════════════════
+                stockMutationService.adjustToActual(ing.getId(), warehouse.getId(), physical, now);
+                after = physical;
+
+                // Cập nhật totalCostValue riêng
+                IngredientStock reload = ingredientStockRepository
+                        .findByIngredientIdAndWarehouseId(ing.getId(), warehouse.getId())
+                        .orElseThrow();
+                reload.setTotalCostValue(recalcTotalCostValue(warehouse.getId(), ing.getId()));
+                reload.setUpdatedAt(now);
+                ingredientStockRepository.save(reload);
             }
 
             BigDecimal diff = after.subtract(before);
@@ -865,11 +1045,6 @@ public class WarehouseService {
             if      (diff.compareTo(BigDecimal.ZERO) > 0) result = AdjustResult.SURPLUS;
             else if (diff.compareTo(BigDecimal.ZERO) < 0) result = AdjustResult.SHORTAGE;
             else                                           result = AdjustResult.MATCH;
-
-            stock.setStockQuantity(after);
-            stock.setTotalCostValue(recalcTotalCostValue(warehouse.getId(), ing.getId()));
-            stock.setUpdatedAt(now);
-            ingredientStockRepository.save(stock);
 
             receipt.getItems().add(WarehouseReceiptItem.builder()
                     .receipt(receipt)

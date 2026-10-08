@@ -1,5 +1,6 @@
 package com.nhatnam.server.restcontroller.hr;
 
+import com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos;
 import com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.*;
 import com.nhatnam.server.dto.response.ApiResponse;
 import com.nhatnam.server.entity.FactoryKpiBonus;
@@ -15,6 +16,10 @@ import com.nhatnam.server.service.hr.HrService;
 import com.nhatnam.server.service.hr.PayrollAdjustmentService;
 import com.nhatnam.server.service.hr.PayrollDepartmentResolver;
 import com.nhatnam.server.service.hr.PayrollPasscodeService;
+import com.nhatnam.server.service.hr.PaymentTransactionBackfillService;
+import com.nhatnam.server.service.hr.SalaryExportService;
+import com.nhatnam.server.service.hr.BankPaymentExportService;
+import com.nhatnam.server.dto.factorypayroll.SalaryExportRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ByteArrayResource;
@@ -76,6 +81,9 @@ public class FactoryPayrollController {
     private final PayrollAdjustmentService adjustmentService;
     private final HrService hrService;
     private final PayrollPasscodeService passcodeService;
+    private final SalaryExportService salaryExportService;
+    private final BankPaymentExportService bankPaymentExportService;
+    private final PaymentTransactionBackfillService ptBackfillService;
 
     /** Các role được quản trị bảng chấm công. */
     private static final String ADMIN_ROLES = "hasAnyRole('OWNER','ADMIN','HR','SUPER_ACCOUNTANT')";
@@ -353,7 +361,7 @@ public class FactoryPayrollController {
         }
     }
 
-    /** Mở lại tháng đã hoàn tất — nhân viên quay về "Đang xử lý lương". */
+    /** Mở lại tháng đã hoàn tất LƯƠNG — nhân viên quay về "Đang xử lý lương". */
     @PostMapping("/reopen")
     @PreAuthorize(ADMIN_ROLES)
     public ResponseEntity<ApiResponse<AttendanceSheetDto>> reopenPeriod(
@@ -367,6 +375,222 @@ public class FactoryPayrollController {
         } catch (IllegalArgumentException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
         } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * OWNER bấm "Hoàn tất KPI / Thưởng" — nhân viên thấy KPI và bonus.
+     * Phải gọi sau khi đã hoàn tất Lương.
+     */
+    @PostMapping("/finalize-kpi")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<AttendanceSheetDto>> finalizeKpi(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "FACTORY") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.finalizeKpi(month, year, d, user),
+                    "Đã hoàn tất KPI/Thưởng %s tháng %d/%d".formatted(d.getLabel(), month, year)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi hoàn tất KPI {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /** Mở lại KPI/Thưởng đã hoàn tất — nhân viên quay về "Đang tính thưởng". */
+    @PostMapping("/reopen-kpi")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<AttendanceSheetDto>> reopenKpi(
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "FACTORY") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.reopenKpi(month, year, d),
+                    "Đã mở lại KPI tháng %d/%d của %s".formatted(month, year, d.getLabel())));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // THƯỞNG DOANH THU — chỉ SALES và ACCOUNTING (bước 3)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Tính và chốt thưởng doanh thu cho SALES hoặc ACCOUNTING.
+     * Phải gọi sau khi đã hoàn tất KPI.
+     *
+     * <p>POST /api/factory-payroll/finalize-bonus?month=8&year=2025&department=SALES
+     */
+    @PostMapping("/finalize-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<FactoryPayrollDtos.OfficeBonusSummaryDto>> finalizeBonus(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department,
+            @RequestParam(required = false) Long unitPrice) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            FactoryPayrollDtos.OfficeBonusSummaryDto result =
+                    payrollService.finalizeBonus(month, year, d, user, unitPrice);
+            return ResponseEntity.ok(ApiResponse.success(result,
+                    "Đã tính hoa hồng %s tháng %d/%d: pool %,dđ"
+                            .formatted(d.getLabel(), month, year, result.getTotalBonusPool())));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi tính hoa hồng {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * Mở lại Thưởng doanh thu — nhân viên quay về "Đang tính thưởng".
+     *
+     * <p>POST /api/factory-payroll/reopen-bonus?month=8&year=2025&department=SALES
+     */
+    @PostMapping("/reopen-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<AttendanceSheetDto>> reopenBonus(
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.reopenBonus(month, year, d),
+                    "Đã mở lại Thưởng tháng %d/%d của %s".formatted(month, year, d.getLabel())));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * Lấy kết quả thưởng doanh thu đã tính (hoặc null nếu chưa tính).
+     *
+     * <p>GET /api/factory-payroll/office-bonus?month=8&year=2025&department=SALES
+     */
+    @GetMapping("/office-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<FactoryPayrollDtos.OfficeBonusSummaryDto>> getOfficeBonus(
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            FactoryPayrollDtos.OfficeBonusSummaryDto result =
+                    payrollService.getOfficeBonusSummary(month, year, d);
+            return ResponseEntity.ok(ApiResponse.success(result, "OK"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // HOA HỒNG DOANH THU (11/2026) — preview + đơn giá tháng trước + backfill
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Preview Thưởng/Hoa hồng cho SALES/ACCOUNTING — chạy được cả KHI CHƯA TÍNH
+     * (bonusAmount = null) và SAU KHI đã tính. Trả 3 stat phòng + mỗi nhân viên 1 dòng.
+     *
+     * <p>GET /api/factory-payroll/office-bonus-preview?month=9&year=2026&department=SALES
+     */
+    @GetMapping("/office-bonus-preview")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<FactoryPayrollDtos.OfficeBonusPreviewDto>> officeBonusPreview(
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.getOfficeBonusPreview(month, year, d), "OK"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi preview office-bonus {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * Trả về đơn giá hoa hồng của THÁNG GẦN NHẤT có record (null nếu chưa từng).
+     * FE dùng làm placeholder cho ô input "Đơn giá".
+     *
+     * <p>GET /api/factory-payroll/office-bonus/last-unit-price?month=9&year=2026&department=SALES
+     */
+    @GetMapping("/office-bonus/last-unit-price")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<Map<String, Object>>> lastCommissionUnitPrice(
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            Long price = payrollService.findLastCommissionUnitPrice(month, year, d);
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("department", d.name());
+            body.put("month", month);
+            body.put("year", year);
+            body.put("lastCommissionUnitPrice", price);
+            return ResponseEntity.ok(ApiResponse.success(body, "OK"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * BACKFILL PaymentTransaction từ order_log — dùng 1 lần sau khi deploy để
+     * tạo PT cho các đơn thu CŨ (trước khi code mới ghi PT trực tiếp).
+     *
+     * <p>POST /api/factory-payroll/payment-transactions/backfill
+     *      ?dryRun=true                     — scan + đếm, không ghi (MẶC ĐỊNH để an toàn)
+     *      [&month=9&year=2026]             — chỉ 1 tháng (giờ VN)
+     *      [&fromMs=...&toMs=...]           — khoảng epoch ms tuỳ ý
+     *      (bỏ trống cả 2 → backfill TOÀN BỘ từ 2020-01-01 VN)
+     *
+     * <p>Chỉ OWNER / ADMIN được chạy.
+     */
+    @PostMapping("/payment-transactions/backfill")
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN')")
+    public ResponseEntity<ApiResponse<FactoryPayrollDtos.PaymentBackfillReportDto>> backfillPaymentTransactions(
+            @RequestParam(defaultValue = "true") boolean dryRun,
+            @RequestParam(required = false) Integer month,
+            @RequestParam(required = false) Integer year,
+            @RequestParam(required = false) Long fromMs,
+            @RequestParam(required = false) Long toMs) {
+        try {
+            FactoryPayrollDtos.PaymentBackfillReportDto report;
+            if (month != null && year != null) {
+                report = ptBackfillService.backfillMonth(month, year, dryRun);
+            } else if (fromMs != null && toMs != null) {
+                report = ptBackfillService.backfillRange(fromMs, toMs, dryRun);
+            } else {
+                report = ptBackfillService.backfillAll(dryRun);
+            }
+            String msg = dryRun
+                    ? "DRY-RUN: scan %d, sẽ tạo %d, bỏ qua %d (đã tồn tại) + %d (ko parse được)"
+                    .formatted(report.getScannedLogs(), report.getCreatedTransactions(),
+                            report.getSkippedExisting(), report.getSkippedUnparseable())
+                    : "Đã tạo %d PaymentTransaction (bỏ qua %d đã tồn tại)"
+                    .formatted(report.getCreatedTransactions(), report.getSkippedExisting());
+            return ResponseEntity.ok(ApiResponse.success(report, msg));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi backfill PaymentTransaction", e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
     }
@@ -473,7 +697,7 @@ public class FactoryPayrollController {
     }
 
     public record DriverConfigRequest(int month, int year, Long gasPrice,
-                                       Long bonusUnitPrice, Long truckBonusUnitPrice) {}
+                                      Long bonusUnitPrice, Long truckBonusUnitPrice) {}
 
     /** Chi tiết lương 1 tài xế trong tháng — dùng cho Tab 2 modal chi tiết. */
     @GetMapping("/driver-salary-detail")
@@ -540,36 +764,43 @@ public class FactoryPayrollController {
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Template import THƯỞNG — ID + Họ tên điền sẵn theo bộ phận đang chọn,
-     * nhãn thưởng gõ 1 lần ở ô B2 và áp dụng cho cả file.
+     * Template import THƯỞNG — prefill TOÀN BỘ nhân viên công ty đang hoạt
+     * động (bao gồm Chủ tịch / Giám đốc / Kế toán trưởng), nhãn thưởng gõ 1
+     * lần ở ô B2 áp dụng cho cả file.
+     *
+     * <p>FIX (10/2026 — Phase 7): bỏ phân mảnh theo {@code department}. Luồng
+     * thưởng giờ import 1 file cho cả công ty (xem CompanyPayrollPanel). Tham
+     * số {@code department} vẫn chấp nhận để tương thích API cũ nhưng KHÔNG
+     * còn tác dụng — mọi lần tải đều ra cùng 1 danh sách công ty.
      */
     @GetMapping("/templates/bonus")
     @PreAuthorize(ADMIN_ROLES)
     public ResponseEntity<Resource> bonusTemplate(
             @RequestParam int month, @RequestParam int year,
-            @RequestParam(defaultValue = "FACTORY") String department) throws Exception {
-        PayrollDepartment d = requireDept(department);
+            @RequestParam(required = false, defaultValue = "FACTORY") String department) throws Exception {
         byte[] data = PayrollAdjustmentTemplateService.buildBonusTemplate(
-                month, year, payrollService.employeesOf(d), d.getLabel());
+                month, year, deptResolver.allActiveWithExec(), "Cả công ty");
         return xlsx(data, PayrollAdjustmentTemplateService.bonusFileName(month, year));
     }
 
     /**
-     * Template import PHỤ CẤP — mỗi nhân viên có sẵn 4 cặp (Khoản, Số tiền),
-     * ô Khoản là dropdown lấy từ danh mục {@code AllowanceLabel}.
+     * Template import PHỤ CẤP — prefill TOÀN BỘ nhân viên công ty đang hoạt
+     * động (gồm Chủ tịch / Giám đốc / Kế toán trưởng); mỗi nhân viên có 4 cặp
+     * (Khoản, Số tiền), ô Khoản là dropdown lấy từ {@code AllowanceLabel}.
+     *
+     * <p>FIX (10/2026 — Phase 7): xem chú thích {@link #bonusTemplate}.
      */
     @GetMapping("/templates/allowance")
     @PreAuthorize(ADMIN_ROLES)
     public ResponseEntity<Resource> allowanceTemplate(
             @RequestParam int month, @RequestParam int year,
-            @RequestParam(defaultValue = "FACTORY") String department) throws Exception {
-        PayrollDepartment d = requireDept(department);
+            @RequestParam(required = false, defaultValue = "FACTORY") String department) throws Exception {
         List<String> labels = hrService.listAllowanceLabels().stream()
                 .map(l -> l.getName())
                 .filter(n -> n != null && !n.isBlank())
                 .toList();
         byte[] data = PayrollAdjustmentTemplateService.buildAllowanceTemplate(
-                month, year, payrollService.employeesOf(d), labels, d.getLabel());
+                month, year, deptResolver.allActiveWithExec(), labels, "Cả công ty");
         return xlsx(data, PayrollAdjustmentTemplateService.allowanceFileName(month, year));
     }
 
@@ -858,5 +1089,108 @@ public class FactoryPayrollController {
         PayrollDepartment d = PayrollDepartment.parse(raw);
         if (d == null) throw new IllegalArgumentException("Bộ phận không hợp lệ: " + raw);
         return d;
+    }
+
+    // ── EXPORT FILE LƯƠNG TỔNG HỢP ─────────────────────────────────────────────
+
+    /**
+     * Export file lương tổng hợp theo phòng ban — chỉ OWNER/ADMIN.
+     *
+     * <p>Request body:
+     * <pre>{ "departments": ["MANAGEMENT","ACCOUNTING","FACTORY","SALES","WAREHOUSE"],
+     *   "exportType": "SALARY_AND_BONUS" }</pre>
+     *
+     * exportType: SALARY_ONLY | BONUS_ONLY | SALARY_AND_BONUS
+     */
+    @PostMapping("/salary-export")
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN')")
+    public ResponseEntity<?> exportSalaryReport(
+            @RequestParam int month,
+            @RequestParam int year,
+            @RequestBody SalaryExportRequest request) {
+        // KHÔNG chặn khi tháng chưa có PayrollBatch APPROVED/PENDING_APPROVAL.
+        //
+        // File "lương tổng hợp" này được dùng để XEM TRƯỚC (preview) trong lúc
+        // HR đang tính lương — HR cần thấy con số chi tiết trên Excel ĐỂ QUYẾT
+        // ĐỊNH có tạo batch chính thức hay không, hoặc có phải sửa lại hồ sơ
+        // lương / thưởng KPI trước không. Chặn ở đây sẽ tạo vòng lặp con-gà-quả-
+        // trứng: muốn tính lương phải có batch, muốn có batch phải xem lại lương.
+        //
+        // Bug về "dùng lương tháng cũ" chỉ còn nguy cơ ở file NH (chuyển khoản
+        // thật) → giữ check ở endpoint đó thôi. File preview thì cứ tính ra
+        // theo hồ sơ lương + attendance hiện có, có khác tháng cũ hay không là
+        // trách nhiệm của HR khi review.
+        try {
+            byte[] bytes = salaryExportService.exportSalaryReport(
+                    month, year, request.getDepartments(), request.getExportType());
+
+            String typeSlug = switch (request.getExportType()) {
+                case "BONUS_ONLY" -> "thuong";
+                case "SALARY_ONLY" -> "luong";
+                default -> "luong-thuong";
+            };
+            String filename = "bang-" + typeSlug + "-thang-" + month + "-" + year + ".xlsx";
+
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                    .contentType(MediaType.parseMediaType(
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                    .body(bytes);
+        } catch (Exception e) {
+            log.error("[SALARY-EXPORT] error month={} year={}", month, year, e);
+            return ResponseEntity.ok(
+                    ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
+    }
+
+    /**
+     * Xuất file chi lương theo mẫu ngân hàng — chỉ OWNER/ADMIN.
+     *
+     * <p>File .xlsx 1 sheet {@code NHẤT NAM} với layout đúng mẫu VietinBank CN2:
+     * STT · Họ tên · Số TK · Ngân hàng · Số tiền. Cột Số tiền = LƯƠNG THỰC NHẬN
+     * (lương cơ bản đã trừ công + phụ cấp, KHÔNG thưởng/KPI). Cột Số TK / Ngân
+     * hàng để trống, quản lý tự điền vì app không lưu thông tin ngân hàng của
+     * từng nhân viên.
+     *
+     * <p>GET /api/factory-payroll/bank-payment-export?month=9&amp;year=2026
+     */
+    @GetMapping("/bank-payment-export")
+    @PreAuthorize("hasAnyRole('OWNER','ADMIN')")
+    public ResponseEntity<?> exportBankPayment(
+            @RequestParam int month,
+            @RequestParam int year) {
+        try {
+            if (month < 1 || month > 12)
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST,
+                        "Tháng phải nằm trong 1..12"));
+
+            // KHÔNG chặn khi tháng chưa có PayrollBatch APPROVED/PENDING_APPROVAL.
+            //
+            // Giống "Xuất file lương tổng hợp": file NH tính theo cơ chế PREVIEW
+            // — BankPaymentExportService dùng cùng công thức (hrService.
+            // getSalaryBreakdownForUser cho văn phòng, factoryPayrollService.
+            // driverSalaryDetail cho tài xế) để dựng số ngay từ hồ sơ lương
+            // hiện hành + attendance đã upload. HR xuất ra để REVIEW số sẽ gửi
+            // ngân hàng; nếu chưa chốt batch cũng không sao — file này chỉ là
+            // bản làm việc, OWNER có thể quay lại điều chỉnh hồ sơ / chấm công
+            // rồi xuất lại.
+            //
+            // Giữ các filter khác trong service (không có TK NH, chưa có hồ sơ
+            // lương APPROVED, nghỉ thai sản, Q9…) — chúng vẫn chặn người không
+            // thể/không nên nhận chuyển khoản.
+
+            byte[] bytes = bankPaymentExportService.exportBankPaymentReport(month, year);
+            String filename = String.format("danh-sach-chi-luong-thang-%02d-%d.xlsx", month, year);
+
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                    .contentType(MediaType.parseMediaType(
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                    .body(bytes);
+        } catch (Exception e) {
+            log.error("[BANK-PAYMENT-EXPORT] error month={} year={}", month, year, e);
+            return ResponseEntity.ok(
+                    ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
     }
 }

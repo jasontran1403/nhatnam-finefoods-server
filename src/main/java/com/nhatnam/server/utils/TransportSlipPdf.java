@@ -45,7 +45,7 @@ import java.util.Locale;
  *       specifier và ném FormatFlagsConversionMismatchException lúc chạy, không
  *       phải lúc biên dịch.</li>
  *   <li>Tổ chức/cá nhân nhận hàng = tên kho đích; Nơi đến = địa chỉ kho đích;
- *       Phương tiện vận chuyển = "Xe tải".</li>
+ *       Phương tiện vận chuyển = "Xe tải 500kg: 51D-625.99 || Xe tải 1 tấn 2: 51D-873.48".</li>
  * </ul>
  */
 @Service
@@ -280,7 +280,7 @@ public class TransportSlipPdf {
                   <div class="sec sec-dest">
                     <p>Tổ chức/ cá nhân nhận lô hàng: <span class="b">%s</span></p>
                     <p>Nơi đến <i>(cuối cùng)</i>: %s</p>
-                    <p>Phương tiện vận chuyển: %s</p>
+                    <p>Phương tiện vận chuyển: Xe tải 500Kg: 51D-625.99 || Xe tải 1 Tấn 2: 51D-873.48</p>
                     <p class="oath">Tôi xin cam đoan các thông tin trên đây hoàn toàn đúng sự thật, nếu có sai sót tôi sẽ hoàn toàn chịu trách
                        nhiệm trước pháp luật.</p>
                   </div>

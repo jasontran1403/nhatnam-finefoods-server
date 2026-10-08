@@ -9,9 +9,12 @@ import com.nhatnam.server.enumtype.StatusCode;
 import com.nhatnam.server.repository.*;
 import com.nhatnam.server.service.WarehouseReceiptCostService;
 import com.nhatnam.server.service.WarehouseReceiptCostService.ConfirmCostRequest;
+import jakarta.persistence.OptimisticLockException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.ResponseEntity;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
@@ -95,6 +98,14 @@ public class AccountantWarehouseController {
             return ResponseEntity.ok(ApiResponse.success(result, "Đã xác nhận giá vốn"));
         } catch (BusinessException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (OptimisticLockingFailureException
+                 | OptimisticLockException e) {
+            // BUG FIX KB6: race — phiếu đã bị người khác sửa/confirm giữa lúc user
+            // đang thao tác. Trả message rõ ràng để FE hiện toast + tự reload.
+            log.warn("confirmCost race lock receiptId={}: {}", id, e.getMessage());
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST,
+                    "Phiếu đã được người khác chỉnh sửa hoặc xác nhận cùng lúc. "
+                            + "Vui lòng tải lại trang và thử lại."));
         } catch (Exception e) {
             log.error("confirmCost error", e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
@@ -115,6 +126,7 @@ public class AccountantWarehouseController {
         m.put("createdByName", r.getCreatedByName());
         m.put("createdAt",     r.getCreatedAt());
         m.put("itemCount",     r.getItems().size());
+        m.put("version",       r.getVersion());   // ← THÊM cho optimistic lock (KB6)
         return m;
     }
 

@@ -43,6 +43,12 @@ public class OrderItem {
     @Column(name = "max_discount_rate_snapshot")
     private Integer maxDiscountRateSnapshot; // snapshot: product.maxDiscountRate
 
+    @Column(name = "specification_snapshot")
+    private Integer specificationSnapshot; // snapshot: product.specification
+
+    @Column(name = "misa_category_snapshot", length = 100)
+    private String misaCategorySnapshot; // snapshot: product.misaCategory
+
     // ── Quy cách bán ──
     @Builder.Default
     @Column(name = "sale_type", length = 10)
@@ -104,6 +110,14 @@ public class OrderItem {
     // ── Fields cũ không dùng nữa, giữ lại để không break DB ──
     @Column(name = "variant_id")   private Long variantId;
     @Column(name = "variant_name") private String variantName;
+
+    /**
+     * Số lượng đã hoàn/đổi (tính theo đơn vị của OrderItem — thùng với BOX, đơn vị thường với RETAIL).
+     * null = chưa hoàn/đổi; > 0 = đã hoàn/đổi một phần hoặc toàn bộ.
+     * Không dùng để tính tiền, chỉ dùng để hiển thị trạng thái và lọc báo cáo.
+     */
+    @Column(name = "returned_qty", precision = 10, scale = 3)
+    private BigDecimal returnedQty;
 
     @OneToMany(mappedBy = "orderItem", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     private List<OrderItemIngredient> orderItemIngredients;

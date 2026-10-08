@@ -43,7 +43,7 @@ public interface IncomeVoucherRepository extends JpaRepository<IncomeVoucher, Lo
      * danh sách orderCode liên kết).
      */
     @Query("SELECT v FROM IncomeVoucher v WHERE LOWER(v.receiptNumber) LIKE LOWER(CONCAT('%', :receiptNumber, '%')) " +
-           "AND v.linkedOrderCodes IS NOT NULL AND v.linkedOrderCodes != ''")
+            "AND v.linkedOrderCodes IS NOT NULL AND v.linkedOrderCodes != ''")
     List<IncomeVoucher> findByReceiptNumberContainingWithLinkedOrders(@Param("receiptNumber") String receiptNumber);
 
     @Query("SELECT v.voucherCode FROM IncomeVoucher v WHERE v.voucherCode LIKE CONCAT(:prefix, '%') ORDER BY v.voucherCode DESC LIMIT 1")
@@ -113,7 +113,7 @@ public interface IncomeVoucherRepository extends JpaRepository<IncomeVoucher, Lo
 
     /** Tổng tiền phiếu thu trong khoảng ngày */
     @Query("SELECT COALESCE(SUM(i.amount), 0) FROM IncomeVoucher v JOIN v.items i " +
-           "WHERE v.createdAt BETWEEN :from AND :to")
+            "WHERE v.createdAt BETWEEN :from AND :to")
     java.math.BigDecimal sumByDateRange(@Param("from") Long from, @Param("to") Long to);
 
     /** Tổng tiền theo từ khoá tìm kiếm (không lọc ngày) */
@@ -145,6 +145,47 @@ public interface IncomeVoucherRepository extends JpaRepository<IncomeVoucher, Lo
                                                 @Param("amountExact") java.math.BigDecimal amountExact,
                                                 @Param("from") Long from,
                                                 @Param("to") Long to);
+
+    // ── Tổng số tiền ĐÃ CẤN TRỪ SANG phiếu khác, dùng để trừ khỏi các SUM ở trên
+    // để báo cáo/dashboard không bị DOUBLE-COUNT: phần dư của phiếu A đã sinh ra
+    // phiếu con B gắn vào đơn khác, nên nếu không trừ, A + B > thực thu.
+
+    @Query("SELECT COALESCE(SUM(v.offsetUsedAmount), 0) FROM IncomeVoucher v")
+    java.math.BigDecimal sumOffsetUsedAll();
+
+    @Query("SELECT COALESCE(SUM(v.offsetUsedAmount), 0) FROM IncomeVoucher v " +
+            "WHERE v.createdAt BETWEEN :from AND :to")
+    java.math.BigDecimal sumOffsetUsedByDateRange(@Param("from") Long from,
+                                                  @Param("to") Long to);
+
+    @Query("""
+        SELECT COALESCE(SUM(v.offsetUsedAmount), 0) FROM IncomeVoucher v
+        WHERE LOWER(v.voucherCode)    LIKE LOWER(CONCAT('%', :q, '%'))
+           OR LOWER(v.receiptNumber)  LIKE LOWER(CONCAT('%', :q, '%'))
+           OR LOWER(v.reason)         LIKE LOWER(CONCAT('%', :q, '%'))
+           OR LOWER(v.payerName)      LIKE LOWER(CONCAT('%', :q, '%'))
+           OR CAST(v.id AS string)    LIKE CONCAT('%', :q, '%')
+           OR (:amountExact IS NOT NULL AND
+               (SELECT COALESCE(SUM(it.amount), 0) FROM IncomeItem it WHERE it.voucher = v) = :amountExact)
+        """)
+    java.math.BigDecimal sumOffsetUsedSearchAll(@Param("q") String q,
+                                                @Param("amountExact") java.math.BigDecimal amountExact);
+
+    @Query("""
+        SELECT COALESCE(SUM(v.offsetUsedAmount), 0) FROM IncomeVoucher v
+        WHERE v.createdAt BETWEEN :from AND :to
+          AND (LOWER(v.voucherCode)   LIKE LOWER(CONCAT('%', :q, '%'))
+           OR LOWER(v.receiptNumber)  LIKE LOWER(CONCAT('%', :q, '%'))
+           OR LOWER(v.reason)         LIKE LOWER(CONCAT('%', :q, '%'))
+           OR LOWER(v.payerName)      LIKE LOWER(CONCAT('%', :q, '%'))
+           OR CAST(v.id AS string)    LIKE CONCAT('%', :q, '%')
+           OR (:amountExact IS NOT NULL AND
+               (SELECT COALESCE(SUM(it.amount), 0) FROM IncomeItem it WHERE it.voucher = v) = :amountExact))
+        """)
+    java.math.BigDecimal sumOffsetUsedSearchWithDateRange(@Param("q") String q,
+                                                          @Param("amountExact") java.math.BigDecimal amountExact,
+                                                          @Param("from") Long from,
+                                                          @Param("to") Long to);
 
     /** Đếm tương ứng — dùng chung với các SUM ở trên */
     @Query("SELECT COUNT(v) FROM IncomeVoucher v")
@@ -183,7 +224,7 @@ public interface IncomeVoucherRepository extends JpaRepository<IncomeVoucher, Lo
 
     /** Phiếu thu KHÔNG bị từ chối trong [from,to] theo createdAt — dùng cho dòng tiền. */
     @Query("SELECT v FROM IncomeVoucher v WHERE v.status <> :excludeStatus " +
-           "AND v.createdAt BETWEEN :from AND :to ORDER BY v.createdAt ASC")
+            "AND v.createdAt BETWEEN :from AND :to ORDER BY v.createdAt ASC")
     java.util.List<IncomeVoucher> findCountedBetween(@org.springframework.data.repository.query.Param("excludeStatus") IncomeVoucher.VoucherStatus excludeStatus,
                                                      @org.springframework.data.repository.query.Param("from") Long from,
                                                      @org.springframework.data.repository.query.Param("to") Long to);

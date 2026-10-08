@@ -1468,6 +1468,155 @@ public class SellerController {
         }
     }
 
+    /**
+     * Tính tỷ lệ thanh toán (payment score) của khách hàng dựa trên lịch sử công nợ.
+     *
+     * <p>Chỉ tính các đơn có {@code debtDays > 0} và đã COMPLETED hoặc PENDING_PAYMENT.
+     * Nếu khách không có đơn công nợ nào → trả về score = null (FE không hiển thị).
+     *
+     * <p>Thuật toán:
+     * <ul>
+     *   <li>Mỗi đơn: deadline = createdAt + debtDays ngày.</li>
+     *   <li>Đơn đã PAID (paidAmount >= finalAmount): ngày TT thực tế = updatedAt.</li>
+     *   <li>Đơn chưa trả: tính lateDays từ thời điểm hiện tại (đang trễ).</li>
+     *   <li>lateDays = max(0, ngày_TT_thực_tế - deadline).</li>
+     *   <li>score từng đơn: 0 trễ → 1.0; [0,n) → [0.7,1.0]; [n,2n) → [0.3,0.7]; ≥2n → [0,0.3].</li>
+     *   <li>Score tổng = trung bình có trọng số (đơn gần nhất weight=1, cũ hơn giảm dần).</li>
+     * </ul>
+     */
+    @GetMapping("/customers/{customerId}/payment-score")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getCustomerPaymentScore(
+            @PathVariable Long customerId) {
+        try {
+            Customer customer = customerRepository.findById(customerId).orElse(null);
+            if (customer == null)
+                return ResponseEntity.ok(ApiResponse.error(StatusCode.NOT_FOUND, "Không tìm thấy khách hàng"));
+
+            // Chỉ tính nếu khách có thiết lập công nợ
+            int customerDebtDays = customer.getDebtDays() != null ? customer.getDebtDays() : 0;
+            if (customerDebtDays <= 0) {
+                Map<String, Object> empty = new LinkedHashMap<>();
+                empty.put("score", null);
+                empty.put("hasDebt", false);
+                return ResponseEntity.ok(ApiResponse.success(empty, "OK"));
+            }
+
+            // Lấy các đơn công nợ (debtDays > 0), bỏ CANCELLED/FAILED
+            List<Order> orders = orderRepository.findByCustomerIdOrderByCreatedAtDesc(customerId)
+                    .stream()
+                    .filter(o -> o.getDebtDays() > 0)
+                    .filter(o -> o.getStatus() != OrderStatus.CANCELLED
+                            && o.getStatus() != com.nhatnam.server.enumtype.OrderStatus.FAILED)
+                    .limit(50) // Chỉ lấy 50 đơn gần nhất để tránh query nặng
+                    .toList();
+
+            if (orders.isEmpty()) {
+                Map<String, Object> empty = new LinkedHashMap<>();
+                empty.put("score", null);
+                empty.put("hasDebt", true);
+                empty.put("totalDebtOrders", 0);
+                empty.put("note", "Chưa có lịch sử công nợ");
+                return ResponseEntity.ok(ApiResponse.success(empty, "OK"));
+            }
+
+            final int N = 30; // ngày base
+            long nowMs = System.currentTimeMillis();
+            long nowDays = nowMs / 86_400_000L;
+
+            double weightedSum = 0.0;
+            double weightTotal = 0.0;
+            int lateCount = 0;
+            long totalLateDays = 0;
+            int paidOnTimeCount = 0;
+
+            for (int i = 0; i < orders.size(); i++) {
+                Order o = orders.get(i);
+
+                // Deadline = ngày tạo đơn + debtDays
+                long createdDays = o.getCreatedAt() / 86_400_000L;
+                long deadlineDays = createdDays + o.getDebtDays();
+
+                // Xác định ngày thanh toán thực tế
+                boolean isPaid = o.getPaidAmount() != null && o.getFinalAmount() != null
+                        && o.getPaidAmount().compareTo(o.getFinalAmount()) >= 0;
+
+                long paidDays;
+                if (isPaid) {
+                    // Đã thanh toán đủ — dùng updatedAt làm ngày TT
+                    paidDays = o.getUpdatedAt() != null
+                            ? o.getUpdatedAt() / 86_400_000L
+                            : deadlineDays; // fallback: giả sử đúng hạn
+                } else {
+                    // Chưa TT đủ — so với ngày hiện tại (đang trong tình trạng nợ)
+                    paidDays = nowDays;
+                }
+
+                long lateDays = Math.max(0, paidDays - deadlineDays);
+
+                // Tính score từng đơn
+                double score;
+                if (lateDays == 0) {
+                    score = 1.0;
+                } else if (lateDays < N) {
+                    // Trễ < 30 ngày: giảm từ 1.0 về 0.7
+                    score = 1.0 - ((double) lateDays / N) * 0.3;
+                } else if (lateDays < 2L * N) {
+                    // Trễ 30–59 ngày: giảm từ 0.7 về 0.3
+                    score = 0.7 - ((double)(lateDays - N) / N) * 0.4;
+                } else {
+                    // Trễ ≥ 60 ngày: giảm từ 0.3 về 0
+                    double drop = ((double)(lateDays - 2L * N) / N) * 0.3;
+                    score = Math.max(0.0, 0.3 - drop);
+                }
+
+                // Trọng số: đơn mới nhất (i=0) = 1.0, cũ hơn giảm dần
+                double weight = 1.0 / (i + 1.0);
+                weightedSum += score * weight;
+                weightTotal += weight;
+
+                if (lateDays > 0) {
+                    lateCount++;
+                    totalLateDays += lateDays;
+                } else {
+                    paidOnTimeCount++;
+                }
+            }
+
+            double finalScore = weightTotal > 0 ? weightedSum / weightTotal : 1.0;
+            int scorePct = (int) Math.round(finalScore * 100);
+
+            // Phân loại
+            String color, label;
+            if (scorePct >= 85) {
+                color = "green";
+                label = "Thanh toán tốt";
+            } else if (scorePct >= 50) {
+                color = "yellow";
+                label = "Cần chú ý";
+            } else {
+                color = "red";
+                label = "Rủi ro cao";
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("score",           finalScore);
+            result.put("scorePct",        scorePct);
+            result.put("color",           color);
+            result.put("label",           label);
+            result.put("hasDebt",         true);
+            result.put("totalDebtOrders", orders.size());
+            result.put("lateOrders",      lateCount);
+            result.put("onTimeOrders",    paidOnTimeCount);
+            result.put("avgLateDays",     lateCount > 0 ? (int)(totalLateDays / lateCount) : 0);
+            result.put("customerDebtDays", customerDebtDays);
+
+            return ResponseEntity.ok(ApiResponse.success(result, "OK"));
+        } catch (Exception e) {
+            log.error("[SELLER] payment-score customerId={} error", customerId, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
     @PostMapping("/customers")
     public ResponseEntity<ApiResponse<CustomerResponse>> createCustomer(
             @Valid @RequestBody CreateCustomerRequest request,
@@ -2254,6 +2403,17 @@ public class SellerController {
         // có giá trị = chỉ seller đó thấy (công ty do SELLER thuần tạo)
         m.put("visibleToSellerId", o.getVisibleToSellerId());
 
+        // ── Hoàn/Đổi SP — FE dùng để hiện badge và disable nút ───────────────
+        m.put("linkType",             o.getLinkType());
+        m.put("sourceOrderId",        o.getSourceOrderId());
+        m.put("sourceOrderCode",      o.getSourceOrderCode());
+        m.put("returnExchangeNote",   o.getReturnExchangeNote());
+        m.put("pendingRefundAmount",  o.getPendingRefundAmount() != null
+                ? o.getPendingRefundAmount() : java.math.BigDecimal.ZERO);
+        m.put("refundedAmount",       o.getRefundedAmount() != null
+                ? o.getRefundedAmount() : java.math.BigDecimal.ZERO);
+        m.put("refundVoucherCode",    o.getRefundVoucherCode());
+
         return m;
     }
 
@@ -2682,6 +2842,8 @@ public class SellerController {
         // debtAllowed là cờ FE dùng để ẩn/hiện lựa chọn Công nợ. Khách cũ
         // (contractRequired = null) được miễn hợp đồng, vẫn bán chịu như trước.
         m.put("debtAllowed",      !c.isContractRequiredForDebt() || hasContract);
+        // Số ngày công nợ được cấp cho khách — FE dùng để quyết định gọi payment-score API
+        m.put("debtDays",         c.getDebtDays() != null ? c.getDebtDays() : 0);
 
         return m;
     }

@@ -99,14 +99,22 @@ public class PayrollService {
         usedTokens.put(token, System.currentTimeMillis());
     }
 
-    /** Số công chuẩn trong tháng: T2-T6 = 1 công, T7 = 0.5 công, CN = 0. */
+    /**
+     * Số công chuẩn trong tháng: T2-T6 = 1 công, T7 = 0.5 công, CN = 0, nghỉ lễ = 0.
+     *
+     * <p>[2026] Trừ thêm ngày lễ trong {@link com.nhatnam.server.utils.VietnameseHolidays}
+     * để khớp với {@link com.nhatnam.server.utils.PayrollTaxCalculator#standardWorkdaysOf}
+     * — trước đó cả 2 hàm cùng bỏ sót ngày lễ, khiến nhân viên bị coi là nghỉ
+     * thiếu công vào các tháng có lễ (VD Sept 2026 có 1–2/9).
+     */
     private double standardWorkdaysOf(int month, int year) {
         YearMonth ym = YearMonth.of(year, month);
         double total = 0;
         for (LocalDate d = ym.atDay(1); !d.isAfter(ym.atEndOfMonth()); d = d.plusDays(1)) {
             DayOfWeek dow = d.getDayOfWeek();
+            if (dow == DayOfWeek.SUNDAY) continue;
             if (dow == DayOfWeek.SATURDAY) total += 0.5;
-            else if (dow != DayOfWeek.SUNDAY) total += 1.0;
+            else total += 1.0;
         }
         return total;
     }
@@ -723,7 +731,7 @@ public class PayrollService {
     }
 
     private int infoRow2Ps(XSSFSheet sh, PayslipStyles s, int r, int cols,
-                            String label1, String value1, String label2, String value2) {
+                           String label1, String value1, String label2, String value2) {
         Row row = sh.createRow(r);
         row.setHeightInPoints(22);
         putCellPs(row, 0, label1, s.infoLabel);

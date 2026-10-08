@@ -40,6 +40,23 @@ public class MonthlyAdjustment {
         ALLOWANCE
     }
 
+    /**
+     * NGUỒN GỐC khoản — Phase 2.
+     *
+     * <p>Phân biệt khoản do OWNER tự import (MANUAL) với khoản hệ thống tự sinh
+     * ra khi tính lương (AUTO_OT). Hai nguồn này cần tách để:
+     * <ul>
+     *   <li>Khi OWNER bấm "Mở lại" → chỉ xoá bản ghi AUTO_OT, giữ nguyên khoản
+     *       MANUAL mà OWNER đã công sức import.</li>
+     *   <li>Khi OWNER import lại bonus/allowance (lúc chưa tính lương) → chỉ
+     *       xoá sạch bản ghi MANUAL cùng loại, không đụng vào AUTO_OT.</li>
+     * </ul>
+     */
+    public enum Source { MANUAL, AUTO_OT }
+
+    /** Nhãn chuẩn cho khoản OT tự sinh — khớp với cột phụ cấp trên bảng lương tổng hợp. */
+    public static final String LABEL_AUTO_OT = "Phụ cấp OT";
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
@@ -81,6 +98,16 @@ public class MonthlyAdjustment {
     @Column(name = "amount", nullable = false)
     @Builder.Default
     private Long amount = 0L;
+
+    /**
+     * Nguồn gốc khoản — Phase 2. Default MANUAL cho dữ liệu cũ. Khoản AUTO_OT
+     * do CompanyAttendanceService tự tạo khi bấm "Tính lương" và bị xoá khi
+     * bấm "Mở lại".
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "source", nullable = false, length = 20)
+    @Builder.Default
+    private Source source = Source.MANUAL;
 
     @Column(name = "created_at")
     private Long createdAt;

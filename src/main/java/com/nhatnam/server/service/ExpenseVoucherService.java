@@ -54,23 +54,13 @@ public interface ExpenseVoucherService {
      */
     byte[] exportReport(Long from, Long to, String exportedBy, String paymentType) throws Exception;
 
-    /**
-     * Danh sách phiếu chi lọc theo PHÒNG BAN của người gọi ({@code callerRole}):
-     * ACCOUNTANT/SUPER_ACCOUNTANT thấy phiếu của phòng kế toán; SUPER_WAREHOUSE
-     * thấy phòng kho; SUPER_FACTORY_WORKER thấy phòng xưởng; ADMIN/OWNER thấy tất cả.
-     * {@code callerRole} = null ⇒ không lọc (tất cả).
-     */
-//    PageResponse<ExpenseVoucherDto> listAll(String callerRole, Pageable pageable);
-//    PageResponse<ExpenseVoucherDto> listByDateRange(String callerRole, Long from, Long to, Pageable pageable);
-//    PageResponse<ExpenseVoucherDto> search(String callerRole, String q, Long from, Long to, Pageable pageable);
-
     PageResponse<ExpenseVoucherDto> listAll(String callerRole, Long callerUserId, Pageable pageable);
 
     PageResponse<ExpenseVoucherDto> listByExpenseDateRange(String callerRole, Long callerUserId,
-                                                    Long from, Long to, Pageable pageable);
+                                                           Long from, Long to, Pageable pageable);
 
     PageResponse<ExpenseVoucherDto> searchByExpenseDateRange(String callerRole, Long callerUserId,
-                                           String q, Long from, Long to, Pageable pageable);
+                                                             String q, Long from, Long to, Pageable pageable);
 
     ExpenseVoucherDto approve(Long id, Long approverUserId, String note);
     ExpenseVoucherDto reject(Long id, Long approverUserId, String reason);
@@ -85,6 +75,13 @@ public interface ExpenseVoucherService {
     /** Từ chối NHIỀU phiếu chi một lần (cùng một lý do từ chối). */
     com.nhatnam.server.dto.expense.BulkExpenseActionResultDto bulkReject(
             Long approverUserId, com.nhatnam.server.dto.expense.BulkExpenseActionRequest req);
+
+    /**
+     * One-time service: duyệt TẤT CẢ phiếu chi đang {@code PENDING} bằng Owner có
+     * {@code user_id = 2}. {@code approvedAt} = {@link System#currentTimeMillis()}.
+     * Trả về số phiếu đã duyệt.
+     */
+    int approveAllPendingByOwner2();
 
     /**
      * Chuyển phiếu ĐÃ DUYỆT hoặc ĐÃ TỪ CHỐI về lại CHỜ DUYỆT — chỉ OWNER/ADMIN.

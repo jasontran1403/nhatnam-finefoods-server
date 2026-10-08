@@ -12,6 +12,9 @@ import java.util.Optional;
 @Repository
 public interface ProductRepository extends JpaRepository<Product, Long> {
     List<Product> findByIsActiveTrue();
+
+    @Query("SELECT p.sku FROM Product p WHERE p.sku LIKE :prefix% AND p.isActive = true")
+    List<String> findSkusByPrefix(@Param("prefix") String prefix);
     List<Product> findByCategoryAndIsActiveTrue(String category);
     Optional<Product> findByIdAndIsActiveTrue(Long id);
     long countByIsActiveTrueAndCreatedAtBetween(long from, long to);

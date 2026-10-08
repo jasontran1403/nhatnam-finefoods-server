@@ -49,4 +49,58 @@ public interface GiftOrderRepository extends JpaRepository<GiftOrder, Long> {
     List<GiftOrder> findPendingForWarehouses(@Param("warehouseIds") List<Long> warehouseIds);
 
     long countByStatus(GiftOrder.GiftOrderStatus status);
+
+    // ── QUẢN LÝ QUÀ TẶNG (trang gift-management) ─────────────────────────────
+    // Chỉ lấy phiếu ĐÃ ĐƯỢC DUYỆT — tức status ∈ {APPROVED, DELIVERING, COMPLETED}.
+    // Bỏ PENDING (chưa duyệt = chưa thực sự tặng), REJECTED và CANCELLED (không phát sinh
+    // quà). Cùng nguyên tắc lọc "đơn có KM" bên OrderRepository, để hai nguồn dữ liệu
+    // trên trang chỉ hiển thị hàng đã "chốt".
+    //
+    // Không JOIN FETCH items ở đây vì @OneToMany fetch=LAZY + cùng transaction đọc:
+    // service lặp items từng phiếu để flatten và các query nhỏ đủ rẻ. Nếu về sau dữ
+    // liệu lớn cần tối ưu, thay bằng "LEFT JOIN FETCH g.items" và loại bỏ trùng ở
+    // service.
+
+    /**
+     * Phiếu tặng quà đã duyệt, đã lọc thô ở tầng phiếu (khoảng ngày, người tạo,
+     * search theo tên khách / mã phiếu / SĐT). Sort desc theo createdAt để hòa vào
+     * timeline đơn hàng KM sau khi merge.
+     */
+    @Query("""
+            SELECT g FROM GiftOrder g
+             WHERE g.status IN (
+                  com.nhatnam.server.entity.GiftOrder$GiftOrderStatus.APPROVED,
+                  com.nhatnam.server.entity.GiftOrder$GiftOrderStatus.DELIVERING,
+                  com.nhatnam.server.entity.GiftOrder$GiftOrderStatus.COMPLETED)
+               AND (:from IS NULL OR g.createdAt >= :from)
+               AND (:to   IS NULL OR g.createdAt <= :to)
+               AND (:createdById IS NULL OR g.createdBy.id = :createdById)
+               AND (:q IS NULL
+                    OR LOWER(g.code)         LIKE LOWER(CONCAT('%', :q, '%'))
+                    OR LOWER(g.customerName) LIKE LOWER(CONCAT('%', :q, '%'))
+                    OR LOWER(g.customer.phone) LIKE LOWER(CONCAT('%', :q, '%')))
+             ORDER BY g.createdAt DESC
+            """)
+    List<GiftOrder> findApprovedForGiftManagement(
+            @Param("q") String q,
+            @Param("from") Long from,
+            @Param("to") Long to,
+            @Param("createdById") Long createdById);
+
+    /**
+     * Danh sách người tạo cho dropdown filter — chỉ liệt kê những seller đã tạo
+     * phiếu đã được duyệt, tương ứng với những phiếu trang gift-management sẽ trả.
+     * Bỏ tài khoản đã xoá (createdBy null) vì filter không dùng được với option
+     * "không có id".
+     */
+    @Query("""
+            SELECT DISTINCT g.createdBy.id, COALESCE(g.createdBy.fullName, g.createdBy.username)
+              FROM GiftOrder g
+             WHERE g.status IN (
+                  com.nhatnam.server.entity.GiftOrder$GiftOrderStatus.APPROVED,
+                  com.nhatnam.server.entity.GiftOrder$GiftOrderStatus.DELIVERING,
+                  com.nhatnam.server.entity.GiftOrder$GiftOrderStatus.COMPLETED)
+               AND g.createdBy IS NOT NULL
+            """)
+    List<Object[]> findApprovedGiftHandlers();
 }

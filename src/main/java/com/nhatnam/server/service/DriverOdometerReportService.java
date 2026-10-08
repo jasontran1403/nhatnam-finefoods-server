@@ -25,23 +25,15 @@ import java.util.*;
  * 2 bản ghi mỗi loại xe: START = vào ca, END = kết ca). Màn này tổng hợp lại theo một
  * KHOẢNG NGÀY do người dùng chọn.
  *
- * <h3>Quy tắc chọn số ODO đầu và cuối kỳ</h3>
- * Tài xế nghỉ, quên điểm danh, hoặc kỳ báo cáo kéo tới tương lai đều làm thiếu số liệu
- * ở đúng hai ngày biên. Nên thay vì đọc cứng ngày đầu/ngày cuối, ta DÒ:
+ * <h3>Cách tính KM</h3>
+ * KM được tính theo từng NGÀY, không phải lấy mốc đầu kỳ - cuối kỳ.
  * <ul>
- *   <li><b>Đầu kỳ</b> — đi từ ngày bắt đầu TIẾN dần: ngày nào có điểm danh thì lấy,
- *       ưu tiên START (odo đầu ngày), không có START thì lấy END của ngày đó.</li>
- *   <li><b>Cuối kỳ</b> — đi từ ngày kết thúc LÙI dần: ưu tiên END (odo cuối ngày),
- *       không có END thì lấy START của ngày đó.</li>
+ *   <li>Với mỗi ngày trong kỳ, nếu có cả START và END → km_ngày = END.odo - START.odo</li>
+ *   <li>Nếu chỉ có START hoặc chỉ có END → km_ngày = 0</li>
+ *   <li>Nếu không có điểm danh nào → km_ngày = 0</li>
+ *   <li>Sum km các ngày theo từng loại xe → km của loại xe đó</li>
+ *   <li>totalKm = sum km của tất cả loại xe</li>
  * </ul>
- * Ví dụ chọn 1/7 → 15/7 nhưng hôm nay mới 13/7: cuối kỳ sẽ dò 15 → 14 → 13, nếu 13 đã
- * điểm danh vào ca thì lấy odo ngày 13, chưa thì lùi tiếp về END ngày 12. Ngày thực tế
- * lấy được luôn được trả kèm ({@code startDate}/{@code endDate}) để giao diện hiển thị
- * đúng mốc, tránh hiểu nhầm là số của ngày biên.
- *
- * <h3>Vì sao tách theo loại xe</h3>
- * Tài xế {@code BOTH} có hai đồng hồ độc lập (xe máy + xe tải). Trừ odo của hai xe khác
- * nhau sẽ ra số vô nghĩa, nên km được tính riêng từng loại rồi mới cộng tổng.
  */
 @Slf4j
 @Service
@@ -97,12 +89,14 @@ public class DriverOdometerReportService {
             for (Driver.VehicleType vt : vehicleTypesOf(d)) {
                 List<DriverAttendance> ofVehicle = records.stream()
                         .filter(a -> a.getVehicleType() == vt).toList();
-                if (ofVehicle.isEmpty()) continue;
 
                 DriverOdometerReportDto.VehicleOdometer vo =
                         buildVehicleOdometer(vt, ofVehicle, fromDate, toDate);
                 vehicles.add(vo);
-                if (vo.getKm() != null) totalKm = (totalKm == null ? 0 : totalKm) + vo.getKm();
+
+                if (vo.getKm() != null) {
+                    totalKm = (totalKm == null ? 0 : totalKm) + vo.getKm();
+                }
             }
 
             result.add(DriverOdometerReportDto.builder()
@@ -128,59 +122,109 @@ public class DriverOdometerReportService {
     }
 
     /**
-     * Dò ODO đầu/cuối kỳ theo quy tắc mô tả ở javadoc lớp.
+     * Tính ODO và KM theo từng ngày cho một loại xe.
      *
-     * <p>Danh sách truyền vào đã lọc sẵn theo một loại xe.
+     * <p>KM = sum(END.odo - START.odo) cho những ngày có đủ cả START và END.
+     * Ngày thiếu START hoặc END → km_ngày = 0.
      */
     private DriverOdometerReportDto.VehicleOdometer buildVehicleOdometer(
             Driver.VehicleType vt, List<DriverAttendance> records,
             LocalDate fromDate, LocalDate toDate) {
 
-        // Gom theo ngày để dò tuần tự
-        Map<String, Map<DriverAttendance.SessionType, DriverAttendance>> byDate = new HashMap<>();
+        // Gom theo ngày
+        Map<String, Map<DriverAttendance.SessionType, DriverAttendance>> byDate = new LinkedHashMap<>();
         for (DriverAttendance a : records) {
             byDate.computeIfAbsent(a.getAttendanceDate(), k -> new EnumMap<>(DriverAttendance.SessionType.class))
-                    // Cùng ngày + cùng session trùng nhau thì lấy bản ghi mới nhất
                     .merge(a.getSessionType(), a,
                             (x, y) -> (y.getUpdatedAt() != null ? y.getUpdatedAt() : 0L)
                                     >= (x.getUpdatedAt() != null ? x.getUpdatedAt() : 0L) ? y : x);
         }
 
-        // ── Đầu kỳ: tiến dần từ ngày bắt đầu, ưu tiên START ──────────────────
-        DriverAttendance start = null;
+        // ── Dữ liệu đầu kỳ và cuối kỳ (để hiển thị mốc) ──────────────────
+        // Đầu kỳ: tiến dần từ ngày bắt đầu, ưu tiên START
+        DriverAttendance firstStart = null;
+        DriverAttendance firstEnd = null;
         for (LocalDate d = fromDate; !d.isAfter(toDate); d = d.plusDays(1)) {
             var sessions = byDate.get(d.toString());
             if (sessions == null || sessions.isEmpty()) continue;
-            start = sessions.getOrDefault(DriverAttendance.SessionType.START,
-                    sessions.get(DriverAttendance.SessionType.END));
-            if (start != null) break;
+            firstStart = sessions.get(DriverAttendance.SessionType.START);
+            firstEnd = sessions.get(DriverAttendance.SessionType.END);
+            if (firstStart != null || firstEnd != null) break;
         }
 
-        // ── Cuối kỳ: lùi dần từ ngày kết thúc, ưu tiên END ───────────────────
-        DriverAttendance end = null;
+        // Cuối kỳ: lùi dần từ ngày kết thúc, ưu tiên END
+        DriverAttendance lastStart = null;
+        DriverAttendance lastEnd = null;
         for (LocalDate d = toDate; !d.isBefore(fromDate); d = d.minusDays(1)) {
             var sessions = byDate.get(d.toString());
             if (sessions == null || sessions.isEmpty()) continue;
-            end = sessions.getOrDefault(DriverAttendance.SessionType.END,
-                    sessions.get(DriverAttendance.SessionType.START));
-            if (end != null) break;
+            lastStart = sessions.get(DriverAttendance.SessionType.START);
+            lastEnd = sessions.get(DriverAttendance.SessionType.END);
+            if (lastStart != null || lastEnd != null) break;
         }
 
-        // Cả kỳ chỉ có đúng MỘT lần điểm danh → đầu và cuối trỏ cùng bản ghi,
-        // km = 0 chứ không phải null: có số liệu, chỉ là chưa chạy thêm.
-        Integer km = null;
-        if (start != null && end != null) km = end.getOdometer() - start.getOdometer();
+        // ── TÍNH KM THEO TỪNG NGÀY ──────────────────────────────────────
+        int totalKm = 0;
+        int daysWithData = 0;
+
+        for (LocalDate d = fromDate; !d.isAfter(toDate); d = d.plusDays(1)) {
+            var sessions = byDate.get(d.toString());
+            if (sessions == null || sessions.isEmpty()) continue;
+
+            DriverAttendance start = sessions.get(DriverAttendance.SessionType.START);
+            DriverAttendance end = sessions.get(DriverAttendance.SessionType.END);
+
+            // Chỉ tính km khi có đủ START và END trong cùng ngày
+            if (start != null && end != null) {
+                int kmDay = end.getOdometer() - start.getOdometer();
+                if (kmDay >= 0) { // km không thể âm
+                    totalKm += kmDay;
+                    daysWithData++;
+                } else {
+                    log.warn("[DRIVER_ODO] km âm ngày {}: start={}, end={}",
+                            d, start.getOdometer(), end.getOdometer());
+                }
+            }
+            // Nếu chỉ có START hoặc chỉ có END → km_ngày = 0, không tính vào daysWithData
+        }
+
+        // Xác định mốc đầu/cuối để hiển thị
+        DriverAttendance startRecord = firstStart != null ? firstStart : firstEnd;
+        DriverAttendance endRecord = lastEnd != null ? lastEnd : lastStart;
+
+        // Nếu có dữ liệu nhưng totalKm = 0 (chỉ có START hoặc END lẻ) thì vẫn trả 0
+        boolean hasData = !records.isEmpty();
+
+        List<DriverOdometerReportDto.OdoNote> odoNotes = new ArrayList<>();
+        for (DriverAttendance a : records) {
+            if (a.getNote() != null && !a.getNote().isBlank()) {
+                odoNotes.add(DriverOdometerReportDto.OdoNote.builder()
+                        .date(a.getAttendanceDate())
+                        .session(a.getSessionType().name())
+                        .odometer(a.getOdometer())
+                        .note(a.getNote())
+                        .build());
+            }
+        }
+        // Sắp theo ngày tăng dần
+        odoNotes.sort(Comparator.comparing(DriverOdometerReportDto.OdoNote::getDate));
+
+// ════════════════════════════════════════════════════════════════
+// Rồi trong .builder() THÊM 1 dòng:
+// ════════════════════════════════════════════════════════════════
 
         return DriverOdometerReportDto.VehicleOdometer.builder()
                 .vehicleType(vt.name())
-                .startOdometer(start != null ? start.getOdometer() : null)
-                .startDate(start != null ? start.getAttendanceDate() : null)
-                .startSession(start != null ? start.getSessionType().name() : null)
-                .endOdometer(end != null ? end.getOdometer() : null)
-                .endDate(end != null ? end.getAttendanceDate() : null)
-                .endSession(end != null ? end.getSessionType().name() : null)
-                .km(km)
+                .startOdometer(startRecord != null ? startRecord.getOdometer() : null)
+                .startDate(startRecord != null ? startRecord.getAttendanceDate() : null)
+                .startSession(startRecord != null ? startRecord.getSessionType().name() : null)
+                .endOdometer(endRecord != null ? endRecord.getOdometer() : null)
+                .endDate(endRecord != null ? endRecord.getAttendanceDate() : null)
+                .endSession(endRecord != null ? endRecord.getSessionType().name() : null)
+                .km(hasData ? totalKm : null)
                 .recordCount(records.size())
+                .daysWithData(daysWithData)
+                .odoNotes(odoNotes.isEmpty() ? null : odoNotes)   // ← MỚI
                 .build();
     }
 
