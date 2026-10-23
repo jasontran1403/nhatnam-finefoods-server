@@ -854,28 +854,97 @@ public class CompanyAttendanceService {
 
     private AttendanceEntry buildEntryFromBlock(AttendanceSheet sheet, User u, EmployeeBlock b) {
         boolean isPartTime = isPartTime(u);
-        DayCount dc = computeDayCount(b, isPartTime);
+        // (10/2026) Nạp DayEffect từ EmployeeRequest đã duyệt để cộng công cho
+        // các ngày KHÔNG CÓ CHẤM CÔNG nhưng CÓ PHIẾU NGHỈ PHÉP ĐÃ DUYỆT (có
+        // lương, trừ công hoặc mức sàn 0.5). Trước đây computeDayCount chỉ nhìn
+        // vào punch → phiếu "Đã duyệt - có lương" bị bỏ sót, lương ra 0 công
+        // ngày đó. Map rỗng nếu nhân viên không có phiếu nào trong tháng.
+        Map<Integer, EmployeeRequestService.DayEffect> effects;
+        try {
+            effects = employeeRequestService.effectsForUser(
+                    u.getId(), sheet.getMonth(), sheet.getYear());
+        } catch (Exception e) {
+            log.warn("[CompanyPayroll] Không nạp được DayEffect của {}: {}",
+                    u.getFullName(), e.getMessage());
+            effects = Map.of();
+        }
+        DayCount dc = computeDayCount(b, isPartTime, effects);
 
-        // ── TRỪ PHÚT ĐI TRỄ VÀO QUỸ PHÉP, HẾT PHÉP → TRỪ NGÀY CÔNG ──────────
+        // ── (10/2026) PER-DAY ATTRIBUTION cho đi trễ/về sớm ─────────────────
         //
-        // Chính sách (10/2026, user confirm):
-        //   1. GỘP cả tháng rồi mới trừ (không trừ từng ngày).
-        //   2. Du di 5 phút PER NGÀY: 8:00-8:05 vào = 0 phút trễ; 8:06 = 6 phút
-        //      trễ (phạt FULL số phút sau mốc chuẩn).
-        //   3. Trừ vào quỹ phép trước (1 ngày phép = 480 phút).
-        //   4. Hết phép → phần còn thừa chia 480 ra ngày công trừ thẳng vào
-        //      actualDays.
-        //   5. CHỈ TRỪ phút ĐI TRỄ. Về sớm KHÔNG trừ (cho MỌI bộ phận, kể cả
-        //      Xưởng).
-        //   6. Part-time không áp (họ chỉ có 0.5 công/ngày sẵn, trễ chỉ ghi
-        //      nhận KPI).
-        int monthlyLateMinutes = isPartTime ? 0 : dc.lateMinutesForPenalty;
+        // Chính sách MỚI (owner confirm):
+        //   1. Mỗi ngày tính riêng phút TRỄ (VÀO) + VỀ SỚM (RA) — cả fulltime
+        //      lẫn parttime. Du di 5 phút MỖI đầu.
+        //   2. Duyệt NGÀY THEO THỨ TỰ. Mỗi ngày: trừ min(deductMin, phép còn)
+        //      vào quỹ phép. Phần CHƯA bù (uncovered) → giảm công NGÀY ĐÓ:
+        //          cong_day = baseActual × (standardMin − uncovered) / standardMin
+        //        CEIL 2 chữ số (fulltime standardMin=480; parttime standardMin=240,
+        //        baseActual trần 0.5).
+        //   3. Quỹ phép KHÔNG được âm — "nếu còn 0 thì ko trừ phép, trừ vào công".
+        //   4. Phép dư còn lại dùng ĐỂ NÂNG NGÀY NỬA CÔNG → công đầy đủ (Issue 1).
         int leaveBalanceMinutes = loadLeaveBalanceMinutes(u, sheet.getYear());
-        int consumedFromLeave   = Math.min(monthlyLateMinutes, leaveBalanceMinutes);
-        int remainingLate       = monthlyLateMinutes - consumedFromLeave;
-        int leaveBalanceAfter   = leaveBalanceMinutes - consumedFromLeave;
-        double lateDaysDeduct   = remainingLate / (double) LEAVE_MINUTES_PER_DAY;
-        double adjustedActualDays = Math.max(0.0, dc.actualDays - lateDaysDeduct);
+        int remainingBalance = leaveBalanceMinutes;
+        int consumedFromLeave = 0;
+        double actualFromPunch = 0.0, mealFromPunch = 0.0;
+
+        // Sắp xếp ngày theo thứ tự: user quy định tiêu phép theo lịch (ngày 7
+        // tiêu trước ngày 8). Ngày không có date (hiếm) để cuối cho an toàn.
+        java.util.List<DayDetail> sorted = new java.util.ArrayList<>(dc.days);
+        sorted.sort(java.util.Comparator.comparing(
+                DayDetail::date,
+                java.util.Comparator.nullsLast(java.util.Comparator.naturalOrder())));
+
+        int standardMin = isPartTime ? 240 : LEAVE_MINUTES_PER_DAY;   // parttime ca 4h
+        for (DayDetail dd : sorted) {
+            double dayActual = dd.baseActual();
+            double dayMeal   = dd.baseMeal();
+            int deduct = dd.deductMinutes();
+            if (deduct > 0 && dayActual > 0) {
+                int take = Math.min(deduct, remainingBalance);
+                remainingBalance -= take;
+                consumedFromLeave += take;
+                int uncovered = deduct - take;
+                if (uncovered > 0) {
+                    // cong = base × (standard − uncovered) / standard — CEIL 2 chữ số
+                    double ratio = Math.max(0.0, (standardMin - uncovered) / (double) standardMin);
+                    double raw = dayActual * ratio;
+                    // CEIL 2 decimals: 0.9937 → 1.00; 0.9375 → 0.94
+                    dayActual = Math.ceil(raw * 100.0) / 100.0;
+                    if (dayActual < 0) dayActual = 0;
+                    // Ngày phải cắt công nhẹ vẫn hưởng cơm (ăn trưa đã có); chỉ
+                    // bỏ cơm khi cong_day rơi xuống 0.
+                    if (dayActual <= 0) dayMeal = 0;
+                }
+            }
+            actualFromPunch += dayActual;
+            mealFromPunch   += dayMeal;
+        }
+
+        // (10/2026 — Issue 1) Dùng phép CÒN LẠI nâng ngày NỬA CÔNG → đầy đủ.
+        // Chỉ áp cho fulltime (parttime max 0.5/ngày, không có khái niệm "nâng").
+        int promotedCount = 0;
+        int consumedForPromote = 0;
+        if (!isPartTime && dc.halfDayShortfalls != null && !dc.halfDayShortfalls.isEmpty()) {
+            java.util.List<Integer> sfs = new java.util.ArrayList<>(dc.halfDayShortfalls);
+            java.util.Collections.sort(sfs);
+            for (int sf : sfs) {
+                if (remainingBalance >= sf) {
+                    remainingBalance -= sf;
+                    consumedForPromote += sf;
+                    promotedCount++;
+                } else {
+                    break;
+                }
+            }
+        }
+        consumedFromLeave += consumedForPromote;
+        int leaveBalanceAfter = Math.max(0, leaveBalanceMinutes - consumedFromLeave);
+        double promotionBonus = promotedCount * 0.5;
+        double mealBonus      = promotedCount * 1.0;
+
+        double adjustedActualDays = Math.max(0.0,
+                dc.actualDays + actualFromPunch + promotionBonus);
+        double adjustedMealDays = dc.mealDays + mealFromPunch + mealBonus;
 
         return AttendanceEntry.builder()
                 .sheet(sheet)
@@ -894,7 +963,7 @@ public class CompanyAttendanceService {
                 .leaveBalanceMinutesAfter(leaveBalanceAfter)
                 .standardDays((double) calc.standardWorkdaysInMonth(sheet.getMonth(), sheet.getYear()))
                 .actualDays(adjustedActualDays)
-                .mealDays(dc.mealDays)
+                .mealDays(adjustedMealDays)
                 .partTime(isPartTime)
                 .dailyJson(serializeDaily(b.getDays()))
                 .build();
@@ -930,9 +999,38 @@ public class CompanyAttendanceService {
         }
     }
 
-    /** Kết quả đếm công/cơm/phút trễ từ 1 block. */
+    /**
+     * Kết quả đếm công/cơm/phút trễ từ 1 block.
+     *
+     * <p>{@code halfDayShortfalls} = danh sách phút thiếu để đạt FULL day
+     * (6h) của từng ngày hiện đang được tính 0.5 công. buildEntryFromBlock
+     * dùng list này + quỹ phép còn lại để nâng ngày nửa công thành công đầy
+     * đủ (Issue 1).
+     *
+     * <p>{@code days} = danh sách CHI TIẾT từng ngày (10/2026 — per-day
+     * attribution): mỗi ngày biết `baseActual` (chưa trừ), `deductMinutes`
+     * (trễ+sớm sau du di 5'). buildEntryFromBlock duyệt theo thứ tự ngày,
+     * trừ phút trễ/sớm vào phép TRƯỚC; nếu phép hết thì trừ vào công của
+     * ngày đó: {@code cong = baseActual × (standardMin − uncovered) /
+     * standardMin}, CEIL 2 chữ số (fulltime standardMin=480; parttime
+     * standardMin=240, cap baseActual=0.5).
+     */
     private record DayCount(int presentDays, double actualDays, double mealDays,
-                            int lateMinutesForPenalty) {}
+                            int lateMinutesForPenalty,
+                            java.util.List<Integer> halfDayShortfalls,
+                            java.util.List<DayDetail> days) {}
+
+    /**
+     * (10/2026) Chi tiết 1 ngày — base + phút trễ/sớm chưa áp phép.
+     * {@code deductMinutes} = (lateVÀO + earlyRA) đã trừ du di 5' mỗi đầu.
+     * Chỉ ngày có chấm công mới có record này; ngày paid-leave full (DayEffect
+     * phủ hết) được cộng vào {@code actualDays} nền ở computeDayCount, không
+     * cần per-day attribution.
+     */
+    private record DayDetail(java.time.LocalDate date,
+                             double baseActual,
+                             double baseMeal,
+                             int deductMinutes) {}
 
     /** Ca chuẩn (khớp FactoryPayrollService). */
     private static final LocalTime SHIFT_START = LocalTime.of(8, 0);
@@ -962,15 +1060,47 @@ public class CompanyAttendanceService {
      * </ul>
      * Về sớm KHÔNG trừ cho mọi bộ phận (theo yêu cầu 10/2026).
      */
-    private DayCount computeDayCount(EmployeeBlock b, boolean isPartTime) {
-        if (b.getDays() == null) return new DayCount(0, 0.0, 0.0, 0);
+    private DayCount computeDayCount(EmployeeBlock b, boolean isPartTime,
+                                     Map<Integer, EmployeeRequestService.DayEffect> effects) {
+        if (b.getDays() == null) return new DayCount(0, 0.0, 0.0, 0,
+                java.util.List.of(), java.util.List.of());
 
         int present = 0;
         double actual = 0.0, meal = 0.0;
         int lateMinSum = 0;
+        java.util.List<Integer> halfDayShortfalls = new java.util.ArrayList<>();
+        // (10/2026) Ngày có chấm công — ghi lại để buildEntryFromBlock trừ
+        // phép theo thứ tự ngày và quy số phút chưa bù về công của chính ngày đó.
+        java.util.List<DayDetail> dayDetails = new java.util.ArrayList<>();
+        Map<Integer, EmployeeRequestService.DayEffect> eff =
+                effects == null ? Map.of() : effects;
 
         for (DayRecord d : b.getDays()) {
-            if (!d.hasPunch()) continue;
+            EmployeeRequestService.DayEffect e = (d.getDate() != null)
+                    ? eff.get(d.getDate().getDayOfMonth()) : null;
+
+            // (10/2026) Ngày KHÔNG CÓ CHẤM CÔNG mà có phiếu nghỉ phép đã
+            // duyệt vẫn phải cộng công tương ứng:
+            //   • fullDayCredit  → "đủ công của ngày đó" — fulltime 1.0,
+            //                      parttime 0.5 (do nhân viên parttime chỉ
+            //                      làm nửa ngày, 1 công của họ = 0.5).
+            //   • minCredit > 0  → sàn công; parttime cap tại 0.5.
+            //   • zeroDay        → 0 công (nghỉ không phép đã duyệt — giữ nguyên).
+            // Không có phiếu → giữ hành vi cũ (skip, 0 công).
+            double fullDayCredit = isPartTime ? 0.5 : 1.0;
+            if (!d.hasPunch()) {
+                if (e == null || e.zeroDay()) continue;
+                if (e.fullDayCredit()) {
+                    present++;
+                    actual += fullDayCredit;
+                    if (e.mealEligible() && !isPartTime) meal += 1.0;
+                } else if (e.minCredit() > 0) {
+                    present++;
+                    actual += Math.min(fullDayCredit, e.minCredit());
+                    // Nửa công = không có cơm (khớp rule half-day của ngày có chấm công).
+                }
+                continue;
+            }
             present++;
 
             LocalTime in = d.firstIn(), out = d.lastOut();
@@ -995,24 +1125,80 @@ public class CompanyAttendanceService {
                     : 0;
 
             // Công
+            double dayActual = 0.0, dayMeal = 0.0;
+            boolean dayIsHalf = false;
             if (isPartTime) {
-                if (worked >= PART_TIME_MIN_WORKED) actual += 0.5;
-                if (worked >= FULL_DAY_MIN_WORKED)  meal   += 1.0;
+                if (worked >= PART_TIME_MIN_WORKED) dayActual = 0.5;
+                if (worked >= FULL_DAY_MIN_WORKED)  dayMeal   = 1.0;
             } else {
-                if      (worked >= FULL_DAY_MIN_WORKED) { actual += 1.0; meal += 1.0; }
-                else if (worked >= HALF_DAY_MIN_WORKED) { actual += 0.5; }
+                if (worked >= FULL_DAY_MIN_WORKED) { dayActual = 1.0; dayMeal = 1.0; }
+                else if (worked >= HALF_DAY_MIN_WORKED) { dayActual = 0.5; dayIsHalf = true; }
             }
 
-            // Phút trễ ngày này (áp du di 5' per-day) — chỉ cộng cho full-time.
-            // Dùng `in` đã có thể đã được default 08:00 ở trên → ngày thiếu
-            // giờ vào sẽ coi như KHÔNG trễ (lateMin = 0), đúng tinh thần
-            // "nhân viên có đi làm, chỉ quên quẹt" không bị phạt.
+            // (10/2026 — Issue 2) Ngày CÓ CHẤM CÔNG + có phiếu nghỉ phép đã
+            // duyệt (nửa buổi hoặc cả ngày) → merge:
+            //   • fullDayCredit  → nâng về "đủ công của ngày đó". Fulltime
+            //     1.0, parttime 0.5 — không ép parttime lên 1 công, vì 1 công
+            //     của họ đã là 0.5 công hệ thống (ví dụ: parttime sáng đi
+            //     làm 4h + chiều có phiếu nghỉ nửa buổi = vẫn chỉ 0.5 công).
+            //   • minCredit > 0  → đảm bảo tối thiểu sàn này (cap theo parttime).
+            //   • zeroDay        → ép về 0 công (phiếu nghỉ không phép đã duyệt).
+            if (e != null) {
+                if (e.zeroDay()) {
+                    dayActual = 0.0; dayMeal = 0.0; dayIsHalf = false;
+                } else if (e.fullDayCredit()) {
+                    dayActual = Math.max(dayActual, fullDayCredit);
+                    if (e.mealEligible() && !isPartTime) dayMeal = Math.max(dayMeal, 1.0);
+                    dayIsHalf = false;   // đã đủ công của ngày đó
+                } else if (e.minCredit() > 0) {
+                    dayActual = Math.max(dayActual, Math.min(fullDayCredit, e.minCredit()));
+                }
+            }
+
+            // KHÔNG cộng dayActual/dayMeal vào tổng ở đây nữa — buildEntryFromBlock
+            // sẽ cộng SAU khi áp per-day leave offset (xem DayDetail). actual/meal
+            // ở hàm này chỉ gom các ngày KHÔNG có chấm công (paid-leave) để tránh
+            // double-count.
+
+            // Nếu ngày này VẪN là nửa công (chưa được DayEffect nâng), ghi
+            // nhận shortfall để buildEntryFromBlock có thể dùng quỹ phép nâng
+            // lên công đầy đủ (Issue 1).
+            if (dayIsHalf) {
+                int shortfall = Math.max(1, FULL_DAY_MIN_WORKED - worked);
+                halfDayShortfalls.add(shortfall);
+            }
+
+            // (10/2026) Phút TRỄ (VÀO) + VỀ SỚM (RA) ngày này — ÁP CHO CẢ
+            // FULLTIME LẪN PARTTIME. Du di 5 phút MỖI đầu. Không áp cho ngày
+            // được DayEffect fullDayCredit (đã nhận đủ công theo phiếu).
+            //   • Fulltime: in so với 08:00, out so với 17:00.
+            //   • Parttime: in so với 08:00, out so với 12:00 (ca sáng 4h) —
+            //     dùng PART_TIME_END nếu khai; tạm mặc định 12:00 trong class
+            //     này nếu không có constant riêng.
+            int dayDeduct = 0;
+            if (!(e != null && e.fullDayCredit())) {
+                java.time.LocalTime expectedEnd = isPartTime
+                        ? java.time.LocalTime.of(12, 0)
+                        : SHIFT_END;
+                if (in != null) {
+                    int lateMin = (int) java.time.Duration.between(SHIFT_START, in).toMinutes();
+                    if (lateMin > GRACE_MINUTES) dayDeduct += lateMin;
+                }
+                if (out != null) {
+                    int earlyMin = (int) java.time.Duration.between(out, expectedEnd).toMinutes();
+                    if (earlyMin > GRACE_MINUTES) dayDeduct += earlyMin;
+                }
+            }
+            // Giữ `lateMinSum` cho báo cáo (chỉ phút VÀO trễ, như luật cũ),
+            // mục đích hiển thị cho OWNER biết tháng này ai trễ nhiều.
             if (!isPartTime && in != null) {
                 int lateMin = (int) java.time.Duration.between(SHIFT_START, in).toMinutes();
                 if (lateMin > GRACE_MINUTES) lateMinSum += lateMin;
             }
+
+            dayDetails.add(new DayDetail(d.getDate(), dayActual, dayMeal, dayDeduct));
         }
-        return new DayCount(present, actual, meal, lateMinSum);
+        return new DayCount(present, actual, meal, lateMinSum, halfDayShortfalls, dayDetails);
     }
 
     /**

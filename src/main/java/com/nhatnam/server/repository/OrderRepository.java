@@ -395,12 +395,13 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
-     * TỔNG DOANH THU THÁNG — Σ finalAmount các đơn tạo trong khoảng.
-     * Chỉ loại đơn HỦY (CANCELLED). Mọi status khác (CREATED / DELIVERING /
-     * PENDING_PAYMENT / COMPLETED, …) đều tính.
+     * TỔNG DOANH THU THÁNG (EX-VAT) — Σ (finalAmount − vatAmount) các đơn tạo
+     * trong khoảng. Chỉ loại đơn HỦY. Mọi status khác đều tính.
+     *
+     * <p>Trừ VAT để nhất quán với doanh thu chia hoa hồng (ex-VAT).
      */
     @Query("""
-            SELECT COALESCE(SUM(o.finalAmount), 0)
+            SELECT COALESCE(SUM(o.finalAmount - COALESCE(o.vatAmount, 0)), 0)
             FROM Order o
             WHERE o.createdAt >= :from
               AND o.createdAt <  :to
@@ -409,9 +410,9 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     BigDecimal sumFinalAmountCreatedInRange(@Param("from") long from,
                                             @Param("to")   long to);
 
-    /** Như trên nhưng chỉ của 1 seller — dùng cho SALES per-row. */
+    /** Như trên nhưng chỉ của 1 seller — dùng cho SALES per-row. (EX-VAT) */
     @Query("""
-            SELECT COALESCE(SUM(o.finalAmount), 0)
+            SELECT COALESCE(SUM(o.finalAmount - COALESCE(o.vatAmount, 0)), 0)
             FROM Order o
             WHERE o.createdAt >= :from
               AND o.createdAt <  :to
@@ -423,8 +424,12 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
                                                   @Param("userId") Long userId);
 
     /**
-     * DOANH THU ĐANG HOLD — Σ (finalAmount − paidAmount) của các đơn tạo trong
-     * khoảng mà CHƯA CHỐT (status NOT IN COMPLETED, CANCELLED).
+     * DOANH THU ĐANG HOLD (EX-VAT) — Σ (finalAmount − paidAmount) × netRatio
+     * cho các đơn tạo trong khoảng mà CHƯA CHỐT (status NOT IN COMPLETED, CANCELLED).
+     *
+     * <p>netRatio = {@code (finalAmount − vatAmount) / finalAmount}
+     * — vì thế phần hold được quy đổi về giá trị ex-VAT, nhất quán với doanh
+     * thu chia hoa hồng. finalAmount > paidAmount nên không có div-by-zero.
      *
      * <p>Nghiệp vụ:
      * <ul>
@@ -438,7 +443,9 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
      * <p>Luôn có: HOLD ≤ TỔNG DOANH THU THÁNG.
      */
     @Query("""
-            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            SELECT COALESCE(SUM(
+                (o.finalAmount - o.paidAmount) * (o.finalAmount - COALESCE(o.vatAmount, 0)) / o.finalAmount
+            ), 0)
             FROM Order o
             WHERE o.createdAt >= :from
               AND o.createdAt <  :to
@@ -449,8 +456,11 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     BigDecimal sumHoldAmountCreatedInRange(@Param("from") long from,
                                            @Param("to")   long to);
 
+    /** Hold EX-VAT theo seller — xem {@link #sumHoldAmountCreatedInRange}. */
     @Query("""
-            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            SELECT COALESCE(SUM(
+                (o.finalAmount - o.paidAmount) * (o.finalAmount - COALESCE(o.vatAmount, 0)) / o.finalAmount
+            ), 0)
             FROM Order o
             WHERE o.createdAt >= :from
               AND o.createdAt <  :to
@@ -464,12 +474,16 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
                                                  @Param("userId") Long userId);
 
     /**
-     * SỐ TIỀN BỎ QUA KHÔNG THU — đơn COMPLETED còn chênh (final > paid), coi
-     * như kế toán đã xác nhận "bỏ số lẻ". Đây KHÔNG tính vào doanh thu được
-     * chia hoa hồng, nhưng OWNER cần nhìn thấy để nắm tình hình.
+     * SỐ TIỀN BỎ QUA KHÔNG THU (EX-VAT) — đơn COMPLETED còn chênh (final > paid),
+     * coi như kế toán đã xác nhận "bỏ số lẻ". Theo nghiệp vụ: phần waived vẫn
+     * tính vào doanh thu chia hoa hồng (xem FactoryPayrollService.finalizeBonus),
+     * nhưng ở đây trừ VAT theo tỷ trọng để nhất quán.
+     * finalAmount > paidAmount ≥ 0 → không có div-by-zero.
      */
     @Query("""
-            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            SELECT COALESCE(SUM(
+                (o.finalAmount - o.paidAmount) * (o.finalAmount - COALESCE(o.vatAmount, 0)) / o.finalAmount
+            ), 0)
             FROM Order o
             WHERE o.createdAt >= :from
               AND o.createdAt <  :to
@@ -479,8 +493,11 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     BigDecimal sumWaivedAmountCreatedInRange(@Param("from") long from,
                                              @Param("to")   long to);
 
+    /** Waived EX-VAT theo seller — xem {@link #sumWaivedAmountCreatedInRange}. */
     @Query("""
-            SELECT COALESCE(SUM(o.finalAmount - o.paidAmount), 0)
+            SELECT COALESCE(SUM(
+                (o.finalAmount - o.paidAmount) * (o.finalAmount - COALESCE(o.vatAmount, 0)) / o.finalAmount
+            ), 0)
             FROM Order o
             WHERE o.createdAt >= :from
               AND o.createdAt <  :to
@@ -515,4 +532,26 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             """)
     List<Long> findDistinctOrderCreatorsInRange(@Param("from") long from,
                                                 @Param("to")   long to);
+
+    /**
+     * (10/2026) Load các đơn CÓ KHẢ NĂNG có "delivery timestamp" rơi vào
+     * khoảng [from, to) — dùng cho DriverKmService.monthOf (bỏ findAll() scan toàn bộ).
+     * delivery timestamp ưu tiên: deliveryDatetime → pendingPaymentAt → createdAt.
+     * Nên lấy UNION 3 cột; sau đó code application filter chính xác.
+     */
+    @Query("""
+            SELECT o FROM Order o
+            WHERE o.status IN (
+                    com.nhatnam.server.enumtype.OrderStatus.DELIVERING,
+                    com.nhatnam.server.enumtype.OrderStatus.PENDING_PAYMENT,
+                    com.nhatnam.server.enumtype.OrderStatus.COMPLETED)
+              AND (
+                    (o.deliveryDatetime BETWEEN :from AND :to)
+                 OR (o.deliveryDatetime IS NULL AND o.pendingPaymentAt BETWEEN :from AND :to)
+                 OR (o.deliveryDatetime IS NULL AND o.pendingPaymentAt IS NULL
+                     AND o.createdAt BETWEEN :from AND :to)
+              )
+            """)
+    List<com.nhatnam.server.entity.Order> findDeliveredInRange(@Param("from") long from,
+                                                               @Param("to") long to);
 }

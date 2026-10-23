@@ -74,6 +74,20 @@ public class OfficeBonusItem {
     @Builder.Default
     private Integer transactionCount = 0;
 
+    /**
+     * ACCOUNTING: tỉ lệ (%) chia cho nhân viên này tại thời điểm tính (snapshot).
+     * NULL khi SALES hoặc record legacy.
+     */
+    @Column(name = "ratio_percent", precision = 6, scale = 2)
+    private BigDecimal ratioPercent;
+
+    /**
+     * Số thưởng CHƯA làm tròn (số raw trước ceil 5.000). Dùng để FE hiển thị
+     * nếu cần đối chiếu. {@code bonusAmount} là số thực nhận sau làm tròn.
+     */
+    @Column(name = "raw_bonus_amount")
+    private Long rawBonusAmount;
+
     @Column(name = "created_at")
     private Long createdAt;
 

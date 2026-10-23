@@ -91,6 +91,45 @@ public class OfficeBonusResult {
     @Builder.Default
     private Integer transactionCount = 0;
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Flow MỚI 2026 — Cấu hình tiers / ratios đã dùng khi tính (lưu lại tháng/
+    // phòng ban đã tính trên số nào, để mở lại thấy ngay).
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * SALES: JSON các mốc đã dùng khi tính. Dạng:
+     * {@code [{"threshold":200000000,"unitPrice":400000}, ...]}.
+     * NULL khi là ACCOUNTING hoặc record legacy.
+     */
+    @Column(name = "sales_tiers_json", columnDefinition = "TEXT")
+    private String salesTiersJson;
+
+    /**
+     * ACCOUNTING: % hoa hồng của cả phòng (0..100). VD 15.00 = 15%.
+     * NULL khi là SALES hoặc record legacy.
+     */
+    @Column(name = "accounting_percent", precision = 6, scale = 2)
+    private BigDecimal accountingPercent;
+
+    /**
+     * ACCOUNTING: JSON tỉ lệ phân chia theo nhân viên. Dạng:
+     * {@code [{"userId":12,"ratio":55.0}, ...]}.
+     * NULL khi là SALES.
+     */
+    @Column(name = "accounting_ratios_json", columnDefinition = "TEXT")
+    private String accountingRatiosJson;
+
+    /**
+     * Số tiền còn DƯ KHÔNG chia cho ai (chỉ hiển thị, không cộng vào ai).
+     * <ul>
+     *   <li>SALES: tổng phần doanh thu không đủ mốc nào.</li>
+     *   <li>ACCOUNTING: pool_raw × (100 − Σ ratio) / 100.</li>
+     * </ul>
+     */
+    @Column(name = "undistributed_amount")
+    @Builder.Default
+    private Long undistributedAmount = 0L;
+
     /** Thời điểm OWNER bấm "Tính hoa hồng" (epoch ms). */
     @Column(name = "computed_at")
     private Long computedAt;

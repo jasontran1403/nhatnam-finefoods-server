@@ -66,6 +66,12 @@ public class OrderServiceImpl implements OrderService {
     private final OrderCodePrefixRepository     orderCodePrefixRepository;
     // BUG FIX: race-safe stock layer
     private final com.nhatnam.server.service.StockMutationService stockMutationService;
+    // FIX (10/2026) bug "địa chỉ + sđt trống dù có người nhận": khi FE restore
+    // draft (hoặc chọn khách mà không mở modal chọn người nhận), customer object
+    // không có selectedReceiver → request.receiverAddress / shippingAddress rỗng
+    // trong khi receiverName vẫn được điền. BE fallback tra ReceiverInfo của
+    // khách để tránh ghi đơn trống địa chỉ + điện thoại.
+    private final CustomerReceiverInfoRepository customerReceiverInfoRepository;
 
     private static final String RETAIL_GUEST_LABEL = "Khách vãng lai";
     private static final ZoneId TZ = ZoneId.of("Asia/Ho_Chi_Minh");
@@ -1470,8 +1476,56 @@ public class OrderServiceImpl implements OrderService {
         int discountRate;
 
         String deliveryAddress = firstNonBlank(request.getReceiverAddress(), request.getShippingAddress());
+
+        // FIX (10/2026) FALLBACK ĐỊA CHỈ + SĐT NGƯỜI NHẬN
+        //
+        // Triệu chứng user báo: tạo đơn ngẫu nhiên bị trống "địa chỉ" + "sđt"
+        // trong khi "tên người nhận" vẫn hiện; tạo lại đơn sau đó không thao
+        // tác gì thì có đủ lại; import DB prod về local vẫn tạo được. Nguyên
+        // nhân là FE: khi restore draft hoặc gán khách qua state tắt tối giản
+        // (POSPage.setCustomerState({ id, name, phone })), customer object
+        // không có `selectedReceiver` → payload gửi lên có receiverName (lấy
+        // từ ô nhập tay) nhưng receiverAddress/receiverPhone/shippingAddress
+        // đều "" → BE lưu đơn trống. Fallback bên server để sửa cả cho các
+        // request cũ đã lỡ build theo pattern này: thiếu địa chỉ thì tra
+        // ReceiverInfo (ưu tiên receiverInfoId FE gửi, else mặc định của
+        // khách), lấy luôn phone + tỉnh/phường nếu đang trống.
+        String fallbackReceiverPhone = null;
+        String fallbackProvinceName  = request.getProvinceName();
+        String fallbackWardName      = request.getWardName();
+        if ((deliveryAddress == null || deliveryAddress.isBlank()) && finalCustomer != null) {
+            CustomerReceiverInfo ri = null;
+            if (request.getReceiverInfoId() != null) {
+                ri = customerReceiverInfoRepository.findById(request.getReceiverInfoId()).orElse(null);
+                // Phòng vệ: receiverInfoId phải thuộc đúng khách — nếu lệch bỏ qua.
+                if (ri != null && ri.getCustomer() != null
+                        && !finalCustomer.getId().equals(ri.getCustomer().getId())) {
+                    ri = null;
+                }
+            }
+            if (ri == null) {
+                List<CustomerReceiverInfo> ris = finalCustomer.getReceiverInfos();
+                if (ris != null && !ris.isEmpty()) {
+                    ri = ris.stream()
+                            .filter(r -> Boolean.TRUE.equals(r.getIsDefault()))
+                            .findFirst()
+                            .orElse(ris.get(0));
+                }
+            }
+            if (ri != null) {
+                deliveryAddress = ri.getReceiverAddress();
+                fallbackReceiverPhone = ri.getReceiverPhone();
+                if (fallbackProvinceName == null || fallbackProvinceName.isBlank())
+                    fallbackProvinceName = ri.getProvinceName();
+                if (fallbackWardName == null || fallbackWardName.isBlank())
+                    fallbackWardName = ri.getWardName();
+                log.warn("[Order] FE gửi địa chỉ trống cho customer {} — fallback ReceiverInfo id={} ({})",
+                        finalCustomer.getId(), ri.getId(), deliveryAddress);
+            }
+        }
+
         assertPaymentMethodAllowedForZone(finalCustomer, request.getPaymentMethod(),
-                request.getProvinceName(), request.getWardName(), deliveryAddress);
+                fallbackProvinceName, fallbackWardName, deliveryAddress);
 
         if (isCompany) {
             customerType    = "COMPANY";
@@ -1481,7 +1535,8 @@ public class OrderServiceImpl implements OrderService {
             companyPhone    = finalCustomer.getCompanyPhone();
             companyAddress  = finalCustomer.getCompanyAddress();
             customerName    = firstNonBlank(shortName, companyName, finalCustomer.getName());
-            customerPhone   = firstNonBlank(request.getCustomerPhone(), finalCustomer.getPhone());
+            // (10/2026) Thứ tự fallback: request → ReceiverInfo mặc định → customer master.
+            customerPhone   = firstNonBlank(request.getCustomerPhone(), fallbackReceiverPhone, finalCustomer.getPhone());
             customerEmail   = firstNonBlank(request.getCustomerEmail(), finalCustomer.getEmail());
             shippingAddress = deliveryAddress;
             discountRate    = finalCustomer.getDiscountRate() > 0
@@ -1490,7 +1545,9 @@ public class OrderServiceImpl implements OrderService {
         } else {
             customerType    = "RETAIL";
             customerName    = request.getCustomerName();
+            // (10/2026) Thứ tự fallback: request → ReceiverInfo mặc định → customer master.
             customerPhone   = firstNonBlank(request.getCustomerPhone(),
+                    fallbackReceiverPhone,
                     finalCustomer != null ? finalCustomer.getPhone() : null);
             customerEmail   = firstNonBlank(request.getCustomerEmail(),
                     finalCustomer != null ? finalCustomer.getEmail() : null);
@@ -1545,7 +1602,9 @@ public class OrderServiceImpl implements OrderService {
                         && Boolean.TRUE.equals(finalCustomer.getRequirePrepayment()))
                 .shortName(shortName).taxCode(taxCode).contactName(contactName)
                 .shippingAddress(deliveryAddress).deliveryAddress(deliveryAddress)
-                .provinceName(request.getProvinceName()).wardName(request.getWardName())
+                // (10/2026) Dùng province/ward đã fallback (ReceiverInfo mặc định
+                // khi FE gửi trống) để quy tắc COD + hiển thị địa chỉ đầy đủ nhất quán.
+                .provinceName(fallbackProvinceName).wardName(fallbackWardName)
                 .orderedByName(orderedByName).createdAt(now).updatedAt(now)
                 .deliveryDatetime(request.getDeliveryDatetime())
                 .showPrices(showPrices).hideAllPrices(hideAllPrices)

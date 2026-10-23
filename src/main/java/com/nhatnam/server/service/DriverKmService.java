@@ -103,9 +103,12 @@ public class DriverKmService {
             long from = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
             long to = ym.atEndOfMonth().atTime(23, 59, 59).atZone(VN).toInstant().toEpochMilli();
 
-            for (Order o : orderRepo.findAll()) {
-                if (o.getStatus() == null || !COUNTED_STATUSES.contains(o.getStatus())) continue;
-
+            // (10/2026 FIX perf) Trước đây dùng orderRepo.findAll() → scan toàn bộ
+            // bảng order mỗi lần monthOf chạy. Với N drivers + M non-driver được
+            // gọi liên tục trong computeDriverPayrollConfigLive → O(N × TOTAL_ORDERS).
+            // Giờ query theo range + status → chỉ load ~đơn trong tháng.
+            for (Order o : orderRepo.findDeliveredInRange(from, to)) {
+                // Status đã lọc trong query — bỏ qua check thừa.
                 Long ts = deliveryTimestamp(o);
                 if (ts == null || ts < from || ts > to) continue;
 
@@ -254,8 +257,8 @@ public class DriverKmService {
         // ngày → loại xe → [startOdo, endOdo, startRecordedBy, endRecordedBy]
         Map<Integer, Map<Driver.VehicleType, Object[]>> raw = new HashMap<>();
 
-        for (DriverAttendance a : driverAttendanceRepo.findByDateRange(from, to)) {
-            if (a.getDriver() == null || !Objects.equals(a.getDriver().getId(), driver.getId())) continue;
+        // (10/2026 FIX perf) Query theo driver_id trực tiếp thay vì load all + filter.
+        for (DriverAttendance a : driverAttendanceRepo.findByDriverAndDateRange(driver.getId(), from, to)) {
             if (a.getOdometer() == null || a.getAttendanceDate() == null) continue;
 
             int day;

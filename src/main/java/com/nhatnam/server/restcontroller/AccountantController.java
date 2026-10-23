@@ -294,6 +294,14 @@ public class AccountantController {
             @RequestParam(required = false, defaultValue = "false") boolean excludeCancelled,
             Authentication auth) {
         try {
+            // (10/2026) Không chặn access — tất cả role vào được endpoint này
+            // qua rule /api/accountant/**. Chỉ FILTER data: SELLER thuần không
+            // trong whitelist chỉ thấy đơn mình tạo; role khác (SUPER_SELLER /
+            // ACCOUNTANT / SUPER_ACCOUNTANT / OWNER / ADMIN) + SELLER whitelist
+            // → thấy tất cả.
+            Long scopeSellerId = auth == null ? null
+                    : com.nhatnam.server.common.ReportAccessGuard.sellerScopeId(
+                    (com.nhatnam.server.entity.User) auth.getPrincipal());
             boolean hasKeyword = keyword != null && !keyword.isBlank();
 
             List<Order> orders;
@@ -338,6 +346,16 @@ public class AccountantController {
                         .collect(Collectors.toList());
             }
 
+            // (10/2026) Scope cuối cùng: SELLER thuần không whitelist chỉ thấy
+            // đơn của chính họ. Phải filter SAU các filter khác để không bị
+            // mất đơn do composition logic nằm trước.
+            if (scopeSellerId != null) {
+                final Long sid = scopeSellerId;
+                orders = orders.stream()
+                        .filter(o -> o.getUser() != null && sid.equals(o.getUser().getId()))
+                        .collect(Collectors.toList());
+            }
+
             boolean isAccountant = auth.getAuthorities().stream()
                     .anyMatch(a -> a.getAuthority().equals("ROLE_ACCOUNTANT") || a.getAuthority().equals("ROLE_SUPER_ACCOUNTANT"));
 
@@ -345,8 +363,10 @@ public class AccountantController {
 
             orders.sort(Comparator.comparingLong(Order::getId));
 
-            byte[] bytes = exporter.exportForAccountant(orders, "Tất cả đơn hàng", actorName, isAccountant);
-            String filename = "don-hang-all-" + LocalDate.now() + ".xlsx";
+            String reportTitle = scopeSellerId != null ? "Đơn hàng của tôi" : "Tất cả đơn hàng";
+            byte[] bytes = exporter.exportForAccountant(orders, reportTitle, actorName, isAccountant);
+            String filename = (scopeSellerId != null ? "don-hang-cua-toi-" : "don-hang-all-")
+                    + LocalDate.now() + ".xlsx";
             return ResponseEntity.ok()
                     .header("Content-Disposition", "attachment; filename=\"" + filename + "\"")
                     .header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

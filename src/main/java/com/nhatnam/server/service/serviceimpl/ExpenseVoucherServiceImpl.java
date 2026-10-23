@@ -177,6 +177,13 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
         boolean isAccountant = roles.contains(Role.ACCOUNTANT) || roles.contains(Role.SUPER_ACCOUNTANT);
 
         // ── 1. Kiểm tra quyền theo trạng thái ────────────────────────────────
+        //
+        // Từ khi bật auto-approve phiếu chi (Owner id=2 duyệt tự động khi tạo),
+        // mọi phiếu đều ở trạng thái APPROVED → nếu giữ ràng buộc cũ "chỉ Owner/
+        // Admin được sửa phiếu đã duyệt" thì Kế toán sẽ không bao giờ sửa được.
+        // Mở cho ACCOUNTANT + SUPER_ACCOUNTANT sửa luôn phiếu APPROVED (vẫn chặn
+        // phiếu REJECTED). Mỗi lần sửa đều ghi log qua writeLog(VOUCHER_UPDATED)
+        // ở cuối hàm — nhật ký đầy đủ để truy vết sau này.
         ExpenseVoucher.VoucherStatus status = v.getStatus();
         if (status == ExpenseVoucher.VoucherStatus.REJECTED) {
             throw new BusinessException("Phiếu chi đã bị từ chối, không thể sửa");
@@ -184,9 +191,8 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
         if (!isOwnerAdmin && !isAccountant) {
             throw new BusinessException("Bạn không có quyền sửa phiếu chi này");
         }
-        if (!isOwnerAdmin && status != ExpenseVoucher.VoucherStatus.PENDING) {
-            throw new BusinessException("Phiếu đã duyệt — chỉ Owner/Admin mới được sửa");
-        }
+        // (Đã gỡ) check "!isOwnerAdmin && status != PENDING" — kế toán được sửa
+        // cả phiếu đã duyệt, miễn là đã có log.
 
         // ── 2. Validate và chuẩn bị dữ liệu ──────────────────────────────────
 
@@ -1053,17 +1059,28 @@ public class ExpenseVoucherServiceImpl implements ExpenseVoucherService {
         }
 
         BigDecimal amount = parseAmount(q);
-        if (amount != null) {
-            if (hasRange) {
-                all = voucherRepo.searchByAmountAndExpenseDateRange(amount, f, t);
-            } else {
-                all = voucherRepo.searchAllByAmount(amount);
-            }
-        } else if (q != null && !q.trim().isEmpty()) {
+        boolean hasText = q != null && !q.trim().isEmpty();
+        if (hasText) {
+            // Luôn chạy TEXT search (match số phiếu / nội dung / NCC) — nhờ vậy
+            // gõ "00062" vẫn tìm được phiếu số 00062 dù chuỗi này cũng parse
+            // được thành số tiền = 62.
             if (hasRange) {
                 all = voucherRepo.searchByExpenseDateRangeList(q, f, t);
             } else {
                 all = voucherRepo.searchAllByExpenseDate(q);
+            }
+            // Nếu q cũng là 1 số tiền hợp lệ → gộp thêm kết quả search theo
+            // tổng tiền (loại trùng theo id). Khớp cả 2 ngữ nghĩa.
+            if (amount != null) {
+                List<ExpenseVoucher> byAmount = hasRange
+                        ? voucherRepo.searchByAmountAndExpenseDateRange(amount, f, t)
+                        : voucherRepo.searchAllByAmount(amount);
+                if (byAmount != null && !byAmount.isEmpty()) {
+                    java.util.Set<Long> seen = new java.util.HashSet<>();
+                    for (ExpenseVoucher v : all) seen.add(v.getId());
+                    for (ExpenseVoucher v : byAmount)
+                        if (seen.add(v.getId())) all.add(v);
+                }
             }
         } else {
             if (hasRange) {

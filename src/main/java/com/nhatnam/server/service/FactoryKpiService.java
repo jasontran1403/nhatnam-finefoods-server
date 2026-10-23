@@ -38,20 +38,25 @@ import java.util.*;
  *   bonusPool      = làm tròn(totalOutputTon × RATE_PER_TON) về hàng NGHÌN
  * </pre>
  *
- * <h3>2. Phân bổ — MÔ HÌNH "ĐƠN GIÁ CHUẨN"</h3>
+ * <h3>2. Phân bổ — MÔ HÌNH "ĐƠN GIÁ CHUẨN × TỈ LỆ" (10/2026)</h3>
  * <pre>
- *   B1. đơn giá chuẩn = làm tròn XUỐNG trăm nghìn( quỹ chia / tổng hệ số )
- *   B2. tiền mỗi người = làm tròn LÊN trăm nghìn( đơn giá chuẩn × hệ số hiệu dụng )
- *   B1b. TRẦN QUỸ: hạ đơn giá chuẩn xuống từng bậc 100.000 cho tới khi vừa quỹ.
- *   Phần lẻ → carryOverOut
+ *   B1.  đơn giá chuẩn (baseUnit) = làm tròn XUỐNG 100.000đ( quỹ chia / Σ roleWeight )
+ *   B2.  thưởng gốc(u)            = baseUnit × roleWeight(u)
+ *   B3.  tiền thực nhận(u)        = làm tròn LÊN 5.000đ(
+ *                                     thưởng gốc(u) × parttimeFactor(u) × attendanceRatio(u)
+ *                                   )
+ *   B1b. TRẦN QUỸ: hạ baseUnit theo bước 100.000đ cho tới khi
+ *        Σ(tiền thực nhận) ≤ quỹ (dùng realTotalForBaseUnit).
+ *   Phần lẻ (bao gồm cả phần parttime/ratio bỏ lại) → carryOverOut.
  * </pre>
  *
- * <h3>3. Ngưỡng ngày / buổi công (thang 2026)</h3>
+ * <h3>3. Hệ số parttime & tỉ lệ ngày công (10/2026)</h3>
  * <pre>
- *   công < 15         → 0%
- *   15 ≤ công < 19    → 80%
- *   19 ≤ công ≤ 22    → 90%
- *   công > 22         → 100%
+ *   parttimeFactor   = 1.0 (fulltime) · 0.7 (parttime).
+ *   attendanceRatio  = ngàyĐiLàm / standardDays, continuous (không còn bậc 15/19/22).
+ *   ngàyĐiLàm        = union(ngày có chấm công, ngày có phiếu nghỉ phép đã duyệt,
+ *                            ngày lễ) — không trùng, bất kể trễ/sớm/nửa buổi.
+ *   standardDays     = ngày trong tháng − chủ nhật (lễ vẫn tính là chuẩn).
  * </pre>
  */
 @Slf4j
@@ -77,8 +82,17 @@ public class FactoryKpiService {
     /** Cách làm tròn quỹ. FLOOR = làm tròn xuống (khớp phiếu thưởng thực tế). */
     public static final RoundingMode POOL_ROUNDING = RoundingMode.FLOOR;
 
-    /** Bước làm tròn hàng TRĂM NGHÌN. */
+    /**
+     * Bước làm tròn ĐƠN GIÁ CHUẨN (base per role weight) — hàng TRĂM NGHÌN.
+     * Giữ nguyên để bảng thưởng vẫn hiển thị đơn giá tròn đẹp.
+     */
     public static final long EMPLOYEE_ROUNDING_STEP = 100_000L;
+
+    /**
+     * (10/2026) Bước làm tròn TIỀN TỪNG NGƯỜI sau khi × parttime × tỉ lệ ngày
+     * công — bước 5.000đ, theo yêu cầu owner (vd 846.153,8 → 850.000).
+     */
+    public static final long FINAL_ROUNDING_STEP = 5_000L;
 
     /** Làm tròn XUỐNG khi tính ĐƠN GIÁ CHUẨN. */
     public static final RoundingMode BASE_UNIT_ROUNDING = RoundingMode.FLOOR;
@@ -258,16 +272,22 @@ public class FactoryKpiService {
     // NGƯỠNG NGÀY / BUỔI CÔNG
     // ══════════════════════════════════════════════════════════════════════════
 
-    /** Số công / buổi tối thiểu để được nhận thưởng KPI. */
-    public static final double MIN_DAYS_FOR_BONUS = 15.0;
+    /**
+     * (10/2026 — ĐÃ BỎ) Thang bậc cũ 15/19/22 công KHÔNG còn dùng.
+     *
+     * <p>Owner yêu cầu đổi sang tỉ lệ liên tục: {@code ngàyĐiLàm / standardDays}.
+     * Giữ các hằng số dưới làm reference để không ai dùng nhầm lại — mọi điểm
+     * đọc cũ đã được thay bằng {@link #attendanceRatio(User, int, int, boolean)}
+     * phiên bản mới.
+     */
+    @Deprecated public static final double MIN_DAYS_FOR_BONUS = 15.0;
+    @Deprecated public static final double TIER_90_THRESHOLD  = 19.0;
+    @Deprecated public static final double TIER_100_THRESHOLD = 22.0;
 
-    /** Ngưỡng vào bậc 90%. */
-    public static final double TIER_90_THRESHOLD = 19.0;
-
-    /** Ngưỡng vào bậc 100% (STRICTLY greater). */
-    public static final double TIER_100_THRESHOLD = 22.0;
-
-    /** Hệ số cho nhân viên parttime — nhân vào trọng số vị trí (base). 60% = 0.6. */
+    /**
+     * Hệ số cho nhân viên parttime — áp SAU khi đã tính "thưởng gốc".
+     * 70% theo yêu cầu owner.
+     */
     public static final double PARTTIME_WEIGHT_FACTOR = 0.7;
 
     /** @deprecated Giữ lại để không break code cũ nếu có nơi tham chiếu. */
@@ -296,6 +316,10 @@ public class FactoryKpiService {
     private final AttendanceSheetRepository attendanceSheetRepo;
     private final AttendanceEntryRepository attendanceEntryRepo;
     private final com.nhatnam.server.repository.FactoryKpiCarryOverSeedRepository carryOverSeedRepo;
+    // (10/2026) Tỉ lệ thưởng mới: cần ngày lễ + phiếu nghỉ phép đã duyệt để
+    // tính "ngày đi làm hợp lệ" / standardDays.
+    private final com.nhatnam.server.service.hr.HolidayService holidayService;
+    private final com.nhatnam.server.service.hr.EmployeeRequestService employeeRequestService;
 
     private final ObjectProvider<FactoryKpiService> selfProvider;
 
@@ -408,9 +432,27 @@ public class FactoryKpiService {
                     .build());
         }
 
-        // ── 6. Các vị trí còn lại — chia theo trọng số hiệu dụng ─────────────
+        // ── 6. Các vị trí còn lại — chia theo trọng số vị trí ─────────────────
+        //      (10/2026) Trọng số CHỈ còn roleWeight; parttime (0.7) & tỉ lệ
+        //      ngày công áp SAU khi tính "thưởng gốc", làm tròn LÊN 5.000đ.
         Map<User, Double> weighted = effectiveWeights(month, year, hasAttendance);
         double totalWeight = weighted.values().stream().mapToDouble(Double::doubleValue).sum();
+
+        // Tính TRƯỚC hệ số parttime × tỉ lệ ngày công của từng người để dùng
+        // chung cho vòng hạ baseUnit lẫn vòng chia tiền (đảm bảo cùng công thức).
+        Map<User, Double> perUserFactor = new LinkedHashMap<>();
+        for (User u : weighted.keySet()) {
+            double parttimeFactor = 1.0;
+            if (hasAttendance && !isAlwaysFullAttendance(u)) {
+                AttendanceEntry pe = attendanceEntryRepo
+                        .findByUserAndPeriod(u.getId(), month, year).orElse(null);
+                if (pe != null && Boolean.TRUE.equals(pe.getPartTime())) {
+                    parttimeFactor = PARTTIME_WEIGHT_FACTOR;
+                }
+            }
+            double ratio = attendanceRatio(u, month, year, hasAttendance);
+            perUserFactor.put(u, parttimeFactor * ratio);
+        }
 
         long distributable = Math.max(0L, bonusPool - securityTotal + carryOverIn);
         long distributedTotal = 0L;
@@ -418,14 +460,21 @@ public class FactoryKpiService {
         long baseUnit = 0L;
 
         if (totalWeight > 0 && distributable > 0) {
-            // ── B1. ĐƠN GIÁ CHUẨN ─────────────────────────────────────────────
+            // ── B1. ĐƠN GIÁ CHUẨN theo trọng số vị trí thuần ──────────────────
+            //      baseUnit = quỹ / Σ(roleWeight), làm tròn XUỐNG bước 100.000đ.
+            //      Nhân viên "ăn full" (parttime=1, ratio=1) sẽ ra "thưởng gốc"
+            //      = baseUnit × roleWeight — đây chính là số 1.000.000đ ở
+            //      ví dụ owner.
             BigDecimal perWeight = BigDecimal.valueOf(distributable)
                     .divide(BigDecimal.valueOf(totalWeight), 6, RoundingMode.HALF_UP);
             long rawPerWeight = perWeight.setScale(0, RoundingMode.HALF_UP).longValue();
             baseUnit = roundToStep(rawPerWeight, EMPLOYEE_ROUNDING_STEP, BASE_UNIT_ROUNDING);
 
-            // ── B1b. HẠ ĐƠN GIÁ CHUẨN CHO TỚI KHI TỔNG CHI NẰM GỌN TRONG QUỸ ──
-            while (baseUnit > 0 && totalForBaseUnit(weighted, baseUnit) > distributable)
+            // ── B1b. HẠ baseUnit TỚI KHI TỔNG CHI THỰC TẾ ≤ QUỸ ──────────────
+            //      Dùng realTotalForBaseUnit (áp parttime × ratio + ceiling 5k)
+            //      để không hạ oan. Trước đây check qua base-only ceiling 100k
+            //      → mọi người bị cắt bớt, phần dư thừa ra quỹ dư.
+            while (baseUnit > 0 && realTotalForBaseUnit(weighted, perUserFactor, baseUnit) > distributable)
                 baseUnit -= EMPLOYEE_ROUNDING_STEP;
 
             if (baseUnit <= 0) {
@@ -438,13 +487,20 @@ public class FactoryKpiService {
 
             for (Map.Entry<User, Double> e : weighted.entrySet()) {
                 User u = e.getKey();
-                double w = e.getValue();
+                double w = e.getValue();                // trọng số vị trí thuần
+                double factor = perUserFactor.getOrDefault(u, 0.0);   // parttime × ratio
                 Role kpiRole = kpiRoleOf(u);
 
-                // ── B2. Tiền từng người = làm tròn LÊN(đơn giá chuẩn × hệ số) ──
-                long raw = BigDecimal.valueOf(baseUnit).multiply(BigDecimal.valueOf(w))
+                // ── B2. "Thưởng gốc" theo vị trí = đơn giá chuẩn × trọng số.
+                // ── B3. Nhân với hệ số parttime × tỉ lệ ngày công.
+                // ── B4. Làm tròn LÊN bước 5.000đ.
+                long raw = BigDecimal.valueOf(baseUnit)
+                        .multiply(BigDecimal.valueOf(w))
+                        .multiply(BigDecimal.valueOf(factor))
                         .setScale(0, RoundingMode.HALF_UP).longValue();
-                long amount = roundToStep(raw, EMPLOYEE_ROUNDING_STEP, EMPLOYEE_ROUNDING);
+                long amount = raw > 0
+                        ? roundToStep(raw, FINAL_ROUNDING_STEP, EMPLOYEE_ROUNDING)
+                        : 0L;
 
                 distributedTotal += amount;
 
@@ -454,7 +510,7 @@ public class FactoryKpiService {
                         .userFullName(u.getFullName())
                         .role(kpiRole)
                         .roleLabel(ROLE_LABELS.getOrDefault(kpiRole, kpiRole != null ? kpiRole.name() : "—"))
-                        .weight(w)
+                        .weight(w * factor)   // trọng số hiệu dụng để báo cáo
                         .fixedAmountRole(false)
                         .rawAmount(raw)
                         .amount(amount)
@@ -521,6 +577,29 @@ public class FactoryKpiService {
             long raw = BigDecimal.valueOf(baseUnit).multiply(BigDecimal.valueOf(w))
                     .setScale(0, RoundingMode.HALF_UP).longValue();
             sum += roundToStep(raw, EMPLOYEE_ROUNDING_STEP, EMPLOYEE_ROUNDING);
+        }
+        return sum;
+    }
+
+    /**
+     * (10/2026) Tổng chi THỰC TẾ cho 1 giá trị baseUnit đã cho — tính theo
+     * đúng công thức B2–B5 trong {@link #generateFactoryKpi}
+     * (base × parttime × ratio, làm tròn LÊN 5.000đ). Dùng cho vòng "hạ
+     * baseUnit cho tới khi vừa quỹ": trước đây check dùng công thức cũ
+     * (chỉ base × 100k ceiling) nên baseUnit bị hạ oan, mọi người ăn ít đi.
+     */
+    private long realTotalForBaseUnit(Map<User, Double> weighted,
+                                      Map<User, Double> perUserFactor,
+                                      long baseUnit) {
+        long sum = 0L;
+        for (Map.Entry<User, Double> e : weighted.entrySet()) {
+            double factor = perUserFactor.getOrDefault(e.getKey(), 0.0);
+            long raw = BigDecimal.valueOf(baseUnit)
+                    .multiply(BigDecimal.valueOf(e.getValue()))
+                    .multiply(BigDecimal.valueOf(factor))
+                    .setScale(0, RoundingMode.HALF_UP).longValue();
+            if (raw <= 0) continue;
+            sum += roundToStep(raw, FINAL_ROUNDING_STEP, EMPLOYEE_ROUNDING);
         }
         return sum;
     }
@@ -616,78 +695,156 @@ public class FactoryKpiService {
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
-     * HỆ SỐ THƯỞNG theo số ngày/buổi công thực tế — thang bậc mới 2026.
+     * TỈ LỆ NGÀY CÔNG của nhân viên trong tháng (10/2026 — mới).
      *
      * <pre>
-     *   công < 15         → 0.0   (không được thưởng)
-     *   15 ≤ công < 19    → 0.8   (80%)
-     *   19 ≤ công ≤ 22    → 0.9   (90%)
-     *   công > 22         → 1.0   (100%)
+     *   attendanceRatio = ngàyĐiLàm / standardDays
+     *   standardDays    = số ngày trong tháng − chủ nhật (lễ VẪN tính là chuẩn)
+     *   ngàyĐiLàm       = số ngày THỎA một trong các điều kiện (union, mỗi
+     *                     ngày đếm 1 lần, bất kể trễ/sớm/nửa buổi):
+     *                       1. Có chấm công (ít nhất một đầu VÀO/RA);
+     *                       2. Có phiếu nghỉ phép ĐÃ DUYỆT phủ ngày đó (cả
+     *                          ngày hay nửa buổi, có lương hay bị trừ công —
+     *                          miễn là KHÔNG phải "nghỉ không phép" bị ép 0);
+     *                       3. Là ngày lễ (file chấm công hay cấu hình công
+     *                          ty có đánh dấu lễ).
      * </pre>
      *
-     * <p><b>NGOẠI LỆ ĐẶC BIỆT:</b> nhân viên trong
-     * {@link #ALWAYS_FULL_ATTENDANCE_NAMES} LUÔN được trả về 1.0 — bỏ qua toàn
-     * bộ dữ liệu chấm công.
+     * <p>Không còn thang bậc 15/19/22; đi làm đủ 26/26 → 1.0, 22/26 → 0.8462,
+     * dưới 1 ngày vẫn tính tỉ lệ chứ không ép 0.
+     *
+     * <p>NGOẠI LỆ: {@link #ALWAYS_FULL_ATTENDANCE_NAMES} LUÔN trả 1.0; chưa
+     * có bảng chấm công tháng đó → 1.0 (không trừ oan).
      */
     public double attendanceRatio(User user, int month, int year, boolean hasAttendanceSheet) {
         if (isAlwaysFullAttendance(user)) return 1.0;
-
         if (!hasAttendanceSheet) return 1.0;
 
-        AttendanceEntry entry = attendanceEntryRepo
-                .findByUserAndPeriod(user.getId(), month, year)
-                .orElse(null);
-        if (entry == null) return 0.0;
+        YearMonth ym = YearMonth.of(year, month);
+        int daysInMonth = ym.lengthOfMonth();
 
-        Integer present = entry.getPresentDays();
-        double countBasis = present != null ? present.doubleValue() : 0.0;
+        // Mẫu số = ngày trong tháng − chủ nhật (= standardWorkdaysInMonth).
+        int sundayCount = 0;
+        for (int d = 1; d <= daysInMonth; d++) {
+            if (ym.atDay(d).getDayOfWeek() == java.time.DayOfWeek.SUNDAY) sundayCount++;
+        }
+        int standardDays = daysInMonth - sundayCount;
+        if (standardDays <= 0) return 0.0;
 
-        if (countBasis < MIN_DAYS_FOR_BONUS) return 0.0;
-        if (countBasis < TIER_90_THRESHOLD)  return 0.8;
-        if (countBasis <= TIER_100_THRESHOLD) return 0.9;
-        return 1.0;
+        int qualifying = countBonusWorkingDays(user, month, year, ym, daysInMonth);
+        if (qualifying <= 0) return 0.0;
+        return Math.min(1.0, qualifying / (double) standardDays);
     }
 
     /**
-     * Map nhân viên xưởng (trừ bảo vệ) → TRỌNG SỐ HIỆU DỤNG.
-     * <pre>
-     *   trọng số hiệu dụng = trọng số vị trí × hệ số parttime × tỉ lệ ngày công
-     *   hệ số parttime: fulltime = 1.0 · parttime = 0.6
-     * </pre>
+     * Số ngày hợp lệ trong tháng để tính tỉ lệ thưởng — xem tài liệu
+     * {@link #attendanceRatio}. Chỉ dành cho KPI xưởng; CN không tính (lễ
+     * trùng CN vẫn bỏ, không ảnh hưởng tử/mẫu).
+     */
+    private int countBonusWorkingDays(User user, int month, int year,
+                                      YearMonth ym, int daysInMonth) {
+        AttendanceEntry entry = attendanceEntryRepo
+                .findByUserAndPeriod(user.getId(), month, year)
+                .orElse(null);
+
+        // Day-of-month → có punch
+        Set<Integer> punched = new HashSet<>();
+        if (entry != null && entry.getDailyJson() != null && !entry.getDailyJson().isBlank()) {
+            try {
+                com.fasterxml.jackson.databind.JsonNode arr =
+                        new com.fasterxml.jackson.databind.ObjectMapper().readTree(entry.getDailyJson());
+                if (arr.isArray()) {
+                    for (com.fasterxml.jackson.databind.JsonNode n : arr) {
+                        Integer d = null;
+                        if (n.hasNonNull("d")) d = n.get("d").asInt();
+                        else if (n.hasNonNull("date")) {
+                            try { d = LocalDate.parse(n.get("date").asText()).getDayOfMonth(); }
+                            catch (Exception ignored) {}
+                        }
+                        if (d == null) continue;
+                        String in = n.hasNonNull("in") ? n.get("in").asText() : null;
+                        String out = n.hasNonNull("out") ? n.get("out").asText() : null;
+                        if ((in != null && !in.isBlank()) || (out != null && !out.isBlank())) {
+                            punched.add(d);
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                log.warn("[KPI] Parse dailyJson user {} lỗi: {}", user.getId(), ex.getMessage());
+            }
+        }
+
+        // Day-of-month → có phiếu nghỉ phép đã duyệt (có lương / trừ phép /
+        // mix) — KHÔNG tính "nghỉ không phép đã duyệt" (zeroDay).
+        Map<Integer, com.nhatnam.server.service.hr.EmployeeRequestService.DayEffect> effects;
+        try {
+            effects = employeeRequestService.effectsForUser(user.getId(), month, year);
+        } catch (Exception ex) {
+            effects = Map.of();
+        }
+
+        Set<LocalDate> holidays;
+        try {
+            holidays = holidayService.datesOfMonth(month, year);
+        } catch (Exception ex) {
+            holidays = Set.of();
+        }
+
+        int count = 0;
+        for (int d = 1; d <= daysInMonth; d++) {
+            LocalDate date = ym.atDay(d);
+            if (date.getDayOfWeek() == java.time.DayOfWeek.SUNDAY) continue;
+
+            boolean isHoliday = holidays.contains(date);
+            boolean hasPunch  = punched.contains(d);
+            var eff = effects.get(d);
+            boolean approvedLeave = eff != null && !eff.zeroDay()
+                    && (eff.fullDayCredit() || eff.minCredit() > 0);
+
+            if (isHoliday || hasPunch || approvedLeave) count++;
+        }
+        return count;
+    }
+
+    /**
+     * (10/2026) Map nhân viên xưởng (trừ bảo vệ) → TRỌNG SỐ VỊ TRÍ thuần.
+     *
+     * <p>Chính sách mới của owner: parttime (0.7) và tỉ lệ ngày công
+     * ({@link #attendanceRatio}) KHÔNG còn áp vào trọng số nữa — thay vào đó
+     * được nhân SAU khi đã tính "thưởng gốc" (base × đơn giá chuẩn) trong
+     * {@link #generateFactoryKpi}. Nhờ vậy, bảng thưởng gốc giữa fulltime và
+     * parttime có cùng vai trò là bằng nhau, parttime chỉ bị cắt 30% ở bước
+     * cuối, không ảnh hưởng tới việc chia quỹ cho người khác.
+     *
+     * <p>Giữ cả nhân viên ratio = 0 (không có công nào) để họ vẫn hiển thị
+     * trên bảng, nhưng nhận 0đ.
      */
     private Map<User, Double> effectiveWeights(int month, int year, boolean hasAttendanceSheet) {
         Map<User, Double> result = new LinkedHashMap<>();
-
         for (User u : usersEligibleForWeight()) {
             Role role = kpiRoleOf(u);
             if (role == null) continue;
-
-            double base  = ROLE_WEIGHTS.getOrDefault(role, 0.0);
-            boolean alwaysFull = isAlwaysFullAttendance(u);
-
-            if (hasAttendanceSheet && !alwaysFull) {
-                AttendanceEntry entry = attendanceEntryRepo
-                        .findByUserAndPeriod(u.getId(), month, year)
-                        .orElse(null);
-                if (entry != null && Boolean.TRUE.equals(entry.getPartTime())) {
-                    base *= PARTTIME_WEIGHT_FACTOR;
-                }
-            }
-
-            double ratio = attendanceRatio(u, month, year, hasAttendanceSheet);
-            double eff   = base * ratio;
-
-            if (eff > 0) result.put(u, round4(eff));
+            double base = ROLE_WEIGHTS.getOrDefault(role, 0.0);
+            if (base > 0) result.put(u, round4(base));
         }
         return result;
     }
 
-    /** Nhân viên xưởng được tham gia chia theo trọng số (không gồm bảo vệ). */
+    /**
+     * Nhân viên xưởng được tham gia chia theo trọng số (không gồm bảo vệ).
+     *
+     * <p>(10/2026) LOẠI nhân viên đang nghỉ thai sản theo chế độ ra khỏi danh
+     * sách này: owner không muốn họ xuất hiện trên bảng Bonus KPI xưởng, và
+     * cũng không cho họ "ăn phần" chia quỹ (phần họ bỏ lại tự ra `carryOverOut`
+     * — bảng thưởng tháng sau có thêm; nếu tính vào Σ roleWeight, các nhân
+     * viên còn lại bị chia nhỏ đi và baseUnit tụt mất 1 bậc 100.000đ).
+     */
     private List<User> usersEligibleForWeight() {
         Map<Long, User> merged = new LinkedHashMap<>();
         for (Role r : ROLE_WEIGHTS.keySet()) {
             for (User u : activeUsersWithRole(r)) merged.put(u.getId(), u);
         }
+        merged.values().removeIf(FactoryKpiService::isMaternityLeave);
         return new ArrayList<>(merged.values());
     }
 

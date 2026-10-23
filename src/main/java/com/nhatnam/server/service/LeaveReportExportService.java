@@ -56,6 +56,7 @@ public class LeaveReportExportService {
     private final PayrollDepartmentResolver deptResolver;
     private final AttendanceEntryRepository attendanceEntryRepo;
     private final ManualLeaveUsageRepository manualUsageRepo;
+    private final com.nhatnam.server.repository.AttendanceSheetRepository attendanceSheetRepo;
 
     /**
      * Ranh giới ô tháng "nhập tay" vs "tính từ phiếu" — phải trùng với
@@ -552,6 +553,10 @@ public class LeaveReportExportService {
      * @return số phút; 0 nếu không có bản ghi chấm công tháng đó.
      */
     private int leaveMinutesUsedInMonth(Long userId, int month, int year) {
+        // (10/2026) Mirror EmployeeRequestService + LeaveManagementService:
+        // CHỈ tính phần đã trừ vào quỹ phép nếu tháng đó đã PUBLIC. Khi OWNER
+        // "Mở lại" lương tháng đó → refund tức thì, không chờ re-import file.
+        if (!attendanceSheetRepo.isLockedForLeaveDeduction(month, year)) return 0;
         return attendanceEntryRepo
                 .findByUserAndPeriod(userId, month, year)
                 .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)

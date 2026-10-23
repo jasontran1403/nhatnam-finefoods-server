@@ -65,7 +65,9 @@ public final class EmployeeRequestDtos {
         @Max(value = 600, message = "Số phút vượt quá một ca làm việc")
         private Integer minutes;
 
-        @NotBlank(message = "Bắt buộc nhập lý do")
+        // (10/2026) KHÔNG còn @NotBlank — phiếu NGHỈ PHÉP cho phép để trống,
+        // service tự gán "Nghỉ phép có lương". Các loại khác được service
+        // check và throw nếu rỗng.
         @Size(max = 2000, message = "Lý do quá dài")
         private String reason;
     }
@@ -168,6 +170,15 @@ public final class EmployeeRequestDtos {
 
         /** Số ngày duyệt nghỉ không lương. */
         private Double unpaidLeaveDays;
+
+        /**
+         * (10/2026) Phân rã paidLeaveDays & unpaidLeaveDays về từng ngày
+         * trong phiếu — dùng cho modal "chi tiết phiếu nghỉ" ở FE để NV
+         * nhìn thấy rõ ngày nào có lương, ngày nào không lương (do hết phép).
+         * Thứ tự: ngày sớm → ngày muộn; phần có phép được phân bổ trước.
+         */
+        private List<LeaveDayBreakdownDto> daysBreakdown;
+
         private String decisionNote;
         private String decidedByName;
         private Long decidedAt;
@@ -211,6 +222,14 @@ public final class EmployeeRequestDtos {
         /** Giờ vào / tan ca chuẩn — form dùng làm giá trị gợi ý cho đồng hồ. */
         private String shiftStart;
         private String shiftEnd;
+
+        /**
+         * (10/2026) TRUE nếu nhân viên đang là PART-TIME (chỉ làm ca sáng).
+         * FE dùng để ẩn checkbox "Chiều" trong form xin nghỉ, mặc định tick
+         * sẵn Sáng cho mỗi ngày trong khoảng — tránh để parttime khai nhầm
+         * nghỉ buổi chiều (buổi họ không có ca).
+         */
+        private Boolean partTime;
     }
 
     /** Thống kê nhanh cho panel của OWNER. */
@@ -315,6 +334,22 @@ public final class EmployeeRequestDtos {
         private Boolean morning;
         /** Nghỉ buổi chiều. */
         private Boolean afternoon;
+    }
+
+    /**
+     * (10/2026) BREAKDOWN per-day của phiếu nghỉ phép đã duyệt — nói rõ ngày
+     * đó được tính CÓ LƯƠNG (trừ quỹ phép) hay KHÔNG LƯƠNG (do hết phép).
+     * Phần dayValue = 1.0 cho cả ngày, 0.5 cho nửa ngày.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class LeaveDayBreakdownDto {
+        private LocalDate date;
+        /** 1.0 = cả ngày; 0.5 = nửa ngày (sáng hoặc chiều). */
+        private Double dayValue;
+        /** true = tính vào quỹ phép (có lương); false = không lương (hết phép). */
+        private Boolean paid;
+        /** Label hiển thị gọn: "có phép" hoặc "hết phép, không lương". */
+        private String label;
     }
 
     /**

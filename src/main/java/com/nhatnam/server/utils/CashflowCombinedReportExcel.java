@@ -1,5 +1,6 @@
 package com.nhatnam.server.utils;
 
+import com.nhatnam.server.dto.cashflow.BankBalanceDto;
 import com.nhatnam.server.dto.cashflow.CashflowFlowDto;
 import com.nhatnam.server.dto.cashflow.CashflowSummaryDto;
 import org.apache.poi.ss.usermodel.*;
@@ -17,70 +18,114 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Objects;
 
 /**
- * Excel GỘP Phiếu thu + Phiếu chi — thay cho 2 báo cáo rời. Mỗi dòng là 1 phiếu,
- * có cột "Loại" (Phiếu thu / Phiếu chi) và sắp xếp theo thời gian tạo tăng dần.
+ * Excel "SỔ QUỸ" — thay cho báo cáo gộp cũ. Dạng sổ quỹ ngân hàng:
  *
- * <p>Cấu trúc:
  * <pre>
- *   Dòng đầu kỳ      : "Số dư đầu kỳ"      | 0 (hoặc opening nếu truyền vào)
- *   Các dòng phát sinh: theo thứ tự thời gian tạo
- *   Dòng cuối kỳ     : "Số dư cuối kỳ"     | tổng thu − tổng chi (+ opening nếu có)
+ *   Dòng 1 (A:G merge, center) : SỔ QUỸ
+ *   Dòng 2 (A:G merge, center) : TÀI KHOẢN: 111 - TIỀN MẶT | 112 - CHUYỂN KHOẢN
+ *   Dòng 3 (A:G merge, center) : TỪ NGÀY dd/mm/yyyy ĐẾN NGÀY dd/mm/yyyy
+ *   Dòng 4 (A:F label right, G=amount) : SỐ TỒN ĐẦU
+ *
+ *   Dòng 5-6: Header 2 tầng
+ *     A (merge 5+6)     : Ngày tháng chứng từ
+ *     B+C (merge dòng 5): Số hiệu Chứng từ    → dòng 6: B=Thu, C=Chi
+ *     D (merge 5+6)     : Diễn giải
+ *     E+F+G (merge dòng 5): Số tiền            → dòng 6: E=Thu, F=Chi, G=Tồn
+ *
+ *   Dòng 7+: Data
+ *     - Phiếu thu   : B = "Phiếu Thu - 00001", E = amount, F = "", G = running
+ *     - Phiếu chi   : C = "Phiếu chi - 00001", E = "", F = amount (DƯƠNG), G = running
+ *
+ *   Dòng cuối (A:F label right, G=amount) : SỐ TỒN CUỐI
  * </pre>
  *
- * <p>Cột "Số phiếu" (trước đây "Số PC") rộng 20% + thêm tiền tố loại:
- * {@code "Phiếu Thu - 00001"} hoặc {@code "Phiếu chi - 00001"}.
+ * <p>Chú ý: cột F (chi) KHÔNG hiển thị dấu trừ — luôn là số dương.
  */
 public final class CashflowCombinedReportExcel {
 
     private CashflowCombinedReportExcel() {}
 
     private static final ZoneId TZ = ZoneId.of("Asia/Ho_Chi_Minh");
-    private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("HH:mm dd/MM/yyyy");
-    private static final DateTimeFormatter D  = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+    private static final DateTimeFormatter D = DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
     private static final byte[] WHITE  = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
-    private static final byte[] ALT_BG = {(byte) 0xFA, (byte) 0xF7, (byte) 0xF2};
     private static final byte[] NAVY   = {(byte) 0x1A, (byte) 0x1A, (byte) 0x2E};
     private static final byte[] GOLD   = {(byte) 0xC9, (byte) 0xA8, (byte) 0x4C};
-    private static final byte[] GREEN_BG = {(byte) 0xEC, (byte) 0xFD, (byte) 0xF5};
-    private static final byte[] RED_BG   = {(byte) 0xFE, (byte) 0xF2, (byte) 0xF2};
+    private static final byte[] ALT_BG = {(byte) 0xFA, (byte) 0xF7, (byte) 0xF2};
 
     /**
-     * {@code paymentType}: null / "ALL" / "" → cả 2; "CASH" chỉ tiền mặt;
-     * "BANK_TRANSFER" chỉ chuyển khoản. Lọc áp dụng CHO các dòng thu/chi, không
-     * ảnh hưởng tiêu đề và dòng đầu/cuối kỳ.
+     * {@code paymentType}: "CASH" → sổ quỹ tài khoản 111 - Tiền mặt;
+     * "BANK_TRANSFER" → sổ ngân hàng tài khoản 112 - Ngân hàng. Mặc định (null/empty) là CASH.
+     *
+     * <p><b>Quy tắc phân sổ (giống nhau cho THU và CHI):</b>
+     * <ul>
+     *   <li>paymentType = BANK_TRANSFER <b>và</b> bank là <b>Vietinbank</b> → sổ ngân hàng.</li>
+     *   <li>Mọi trường hợp còn lại (tiền mặt, hoặc CK từ ngân hàng khác) → sổ quỹ.</li>
+     * </ul>
      */
     public static byte[] build(CashflowSummaryDto s, String exportedBy, String paymentType) throws Exception {
         try (XSSFWorkbook wb = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            XSSFSheet sheet = wb.createSheet("Báo cáo dòng tiền");
+            XSSFSheet sheet = wb.createSheet("So quy");
             DataFormat df = wb.createDataFormat();
 
-            // ── Cột (5 cột — cột Loại đã bỏ vì tiền tố "Phiếu Thu/Phiếu chi"
-            //    đã kèm trong cột Số phiếu). Cột Số phiếu ~20% bề rộng. ──
-            final int COL_TIME    = 0; // Thời gian tạo
-            final int COL_NUMBER  = 1; // Số phiếu (20% width, có tiền tố loại)
-            final int COL_REASON  = 2; // Lý do
-            final int COL_METHOD  = 3; // Hình thức
-            final int COL_AMOUNT  = 4; // Số tiền (+ thu / − chi)
-            final int LAST_COL    = COL_AMOUNT;
+            // ── Hằng cột (0..6 ↔ A..G) ──────────────────────────────────────
+            final int COL_DATE   = 0; // A: Ngày tháng chứng từ
+            final int COL_THU_NO = 1; // B: Số hiệu phiếu thu
+            final int COL_CHI_NO = 2; // C: Số hiệu phiếu chi
+            final int COL_DESC   = 3; // D: Diễn giải
+            final int COL_THU    = 4; // E: Số tiền Thu
+            final int COL_CHI    = 5; // F: Số tiền Chi (dương)
+            final int COL_TON    = 6; // G: Tồn (running balance)
+            final int LAST_COL   = COL_TON;
 
-            // ── Styles ────────────────────────────────────────────────────────
-            CellStyle titleStyle = wb.createCellStyle();
+            // ── Payment type → tên tài khoản ────────────────────────────────
+            String pt = paymentType == null ? "" : paymentType.trim().toUpperCase();
+            boolean isBank = "BANK_TRANSFER".equals(pt) || "BANK".equals(pt);
+            String sheetTitle   = isBank ? "SỔ NGÂN HÀNG" : "SỔ QUỸ";
+            String accountLabel = isBank
+                    ? "TÀI KHOẢN: 112 - NGÂN HÀNG"
+                    : "TÀI KHOẢN: 111 - TIỀN MẶT";
+
+            // ── Styles ──────────────────────────────────────────────────────
+            CellStyle title = wb.createCellStyle();
             XSSFFont titleFont = wb.createFont();
-            titleFont.setBold(true); titleFont.setFontHeightInPoints((short) 14);
-            titleStyle.setFont(titleFont);
-            titleStyle.setAlignment(HorizontalAlignment.CENTER);
-            titleStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+            titleFont.setBold(true); titleFont.setFontHeightInPoints((short) 16);
+            title.setFont(titleFont);
+            title.setAlignment(HorizontalAlignment.CENTER);
+            title.setVerticalAlignment(VerticalAlignment.CENTER);
 
-            CellStyle metaStyle = wb.createCellStyle();
-            XSSFFont metaFont = wb.createFont();
-            metaFont.setItalic(true); metaFont.setFontHeightInPoints((short) 10);
-            metaStyle.setFont(metaFont);
-            metaStyle.setAlignment(HorizontalAlignment.CENTER);
-            metaStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+            CellStyle subTitle = wb.createCellStyle();
+            XSSFFont subFont = wb.createFont();
+            subFont.setBold(true); subFont.setFontHeightInPoints((short) 11);
+            subTitle.setFont(subFont);
+            subTitle.setAlignment(HorizontalAlignment.CENTER);
+            subTitle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+            CellStyle period = wb.createCellStyle();
+            XSSFFont pf = wb.createFont();
+            pf.setItalic(true); pf.setFontHeightInPoints((short) 10);
+            period.setFont(pf);
+            period.setAlignment(HorizontalAlignment.CENTER);
+            period.setVerticalAlignment(VerticalAlignment.CENTER);
+
+            CellStyle balanceLabel = wb.createCellStyle();
+            XSSFFont blf = wb.createFont();
+            blf.setBold(true); blf.setFontHeightInPoints((short) 10);
+            balanceLabel.setFont(blf);
+            balanceLabel.setAlignment(HorizontalAlignment.RIGHT);
+            balanceLabel.setVerticalAlignment(VerticalAlignment.CENTER);
+
+            CellStyle balanceAmt = wb.createCellStyle();
+            balanceAmt.setFont(blf);
+            balanceAmt.setAlignment(HorizontalAlignment.RIGHT);
+            balanceAmt.setVerticalAlignment(VerticalAlignment.CENTER);
+            balanceAmt.setDataFormat(df.getFormat("#,##0"));
+            balanceAmt.setBorderTop(BorderStyle.THIN);
+            balanceAmt.setBorderBottom(BorderStyle.THIN);
+            balanceAmt.setBorderLeft(BorderStyle.THIN);
+            balanceAmt.setBorderRight(BorderStyle.THIN);
 
             CellStyle header = wb.createCellStyle();
             XSSFFont headerFont = wb.createFont();
@@ -91,191 +136,209 @@ public final class CashflowCombinedReportExcel {
             header.setFillPattern(FillPatternType.SOLID_FOREGROUND);
             header.setAlignment(HorizontalAlignment.CENTER);
             header.setVerticalAlignment(VerticalAlignment.CENTER);
+            header.setBorderTop(BorderStyle.THIN);
             header.setBorderBottom(BorderStyle.THIN);
             header.setBorderLeft(BorderStyle.THIN);
             header.setBorderRight(BorderStyle.THIN);
             header.setWrapText(true);
 
-            CellStyle textN  = text(wb, null);
-            CellStyle textA  = text(wb, ALT_BG);
-            CellStyle amtN   = amount(wb, df, null);
-            CellStyle amtA   = amount(wb, df, ALT_BG);
-            CellStyle amtIn  = amount(wb, df, GREEN_BG);
-            CellStyle amtEx  = amount(wb, df, RED_BG);
-
-            // Style dòng đầu/cuối kỳ: tô vàng đậm
-            CellStyle balanceLabel = wb.createCellStyle();
-            balanceLabel.cloneStyleFrom(header);
-            balanceLabel.setFillForegroundColor(new XSSFColor(GOLD, null));
-            balanceLabel.setAlignment(HorizontalAlignment.RIGHT);
-            // Ô giá trị đầu/cuối kỳ: căn phải, in đậm (clone từ balanceLabel đã
-            // dùng headerFont bold rồi), nền vàng đồng bộ với dòng đầu/cuối kỳ.
-            CellStyle balanceValue = wb.createCellStyle();
-            balanceValue.cloneStyleFrom(balanceLabel);
-            balanceValue.setAlignment(HorizontalAlignment.RIGHT);
-            balanceValue.setDataFormat(df.getFormat("#,##0"));
+            CellStyle textCenter = textStyle(wb, HorizontalAlignment.CENTER, null, true);
+            CellStyle textCenterAlt = textStyle(wb, HorizontalAlignment.CENTER, ALT_BG, true);
+            CellStyle textLeft = textStyle(wb, HorizontalAlignment.LEFT, null, true);
+            CellStyle textLeftAlt = textStyle(wb, HorizontalAlignment.LEFT, ALT_BG, true);
+            CellStyle amount = amountStyle(wb, df, null);
+            CellStyle amountAlt = amountStyle(wb, df, ALT_BG);
 
             int rowIdx = 0;
 
-            // ── Tiêu đề ────────────────────────────────────────────────────────
-            Row titleRow = sheet.createRow(rowIdx++);
-            titleRow.setHeightInPoints(26);
-            Cell tc = titleRow.createCell(0);
-            tc.setCellValue("BÁO CÁO DÒNG TIỀN");
-            tc.setCellStyle(titleStyle);
+            // ── Dòng 1: SỔ QUỸ ──────────────────────────────────────────────
+            Row rTitle = sheet.createRow(rowIdx++);
+            rTitle.setHeightInPoints(28);
+            Cell c = rTitle.createCell(0);
+            c.setCellValue(sheetTitle);
+            c.setCellStyle(title);
             sheet.addMergedRegion(new CellRangeAddress(0, 0, 0, LAST_COL));
 
-            // ── Meta ──────────────────────────────────────────────────────────
-            String fromStr = Instant.ofEpochMilli(s.getFrom()).atZone(TZ).format(D);
-            String toStr   = Instant.ofEpochMilli(s.getTo()).atZone(TZ).format(D);
-            String exportedAt = java.time.LocalDateTime.now(TZ).format(DT);
-            Row metaRow = sheet.createRow(rowIdx++);
-            metaRow.setHeightInPoints(18);
-            Cell mc = metaRow.createCell(0);
-            mc.setCellValue("Từ " + fromStr + " đến " + toStr
-                    + "  |  Xuất: " + exportedAt
-                    + "  |  Người xuất: " + (exportedBy != null ? exportedBy : ""));
-            mc.setCellStyle(metaStyle);
+            // ── Dòng 2: TÀI KHOẢN ──────────────────────────────────────────
+            Row rAcc = sheet.createRow(rowIdx++);
+            rAcc.setHeightInPoints(20);
+            c = rAcc.createCell(0);
+            c.setCellValue(accountLabel);
+            c.setCellStyle(subTitle);
             sheet.addMergedRegion(new CellRangeAddress(1, 1, 0, LAST_COL));
 
-            // Dòng trống
-            sheet.createRow(rowIdx++);
+            // ── Dòng 3: Khoảng thời gian ────────────────────────────────────
+            String fromStr = Instant.ofEpochMilli(s.getFrom()).atZone(TZ).format(D);
+            String toStr   = Instant.ofEpochMilli(s.getTo()).atZone(TZ).format(D);
+            Row rPeriod = sheet.createRow(rowIdx++);
+            rPeriod.setHeightInPoints(18);
+            c = rPeriod.createCell(0);
+            c.setCellValue("TỪ NGÀY " + fromStr + " ĐẾN NGÀY " + toStr);
+            c.setCellStyle(period);
+            sheet.addMergedRegion(new CellRangeAddress(2, 2, 0, LAST_COL));
 
-            // ── Header ────────────────────────────────────────────────────────
-            Row hRow = sheet.createRow(rowIdx++);
-            hRow.setHeightInPoints(22);
-            String[] labels = new String[LAST_COL + 1];
-            labels[COL_TIME]   = "Thời gian tạo";
-            labels[COL_NUMBER] = "Số phiếu";
-            labels[COL_REASON] = "Lý do";
-            labels[COL_METHOD] = "Hình thức";
-            labels[COL_AMOUNT] = "Số tiền";
-            for (int i = 0; i <= LAST_COL; i++) {
-                Cell c = hRow.createCell(i);
-                c.setCellValue(labels[i]);
-                c.setCellStyle(header);
-            }
+            // ── Dòng 4: SỐ TỒN ĐẦU (nhãn A..F căn phải, tiền ở G) ──────────
+            BigDecimal opening = openingTotal(s, isBank);
+            Row rOpen = sheet.createRow(rowIdx++);
+            rOpen.setHeightInPoints(20);
+            c = rOpen.createCell(0);
+            c.setCellValue("SỐ TỒN ĐẦU");
+            c.setCellStyle(balanceLabel);
+            sheet.addMergedRegion(new CellRangeAddress(3, 3, 0, COL_TON - 1));
+            Cell cOpen = rOpen.createCell(COL_TON);
+            cOpen.setCellValue(opening.doubleValue());
+            cOpen.setCellStyle(balanceAmt);
 
-            // ── Gộp 2 danh sách rồi sort theo at tăng dần ─────────────────────
+            // ── Dòng 5-6: Header 2 tầng ─────────────────────────────────────
+            final int HEADER_TOP = rowIdx;    // row 5 (0-indexed 4)
+            final int HEADER_BOT = rowIdx + 1;
+            Row rHeadTop = sheet.createRow(rowIdx++);
+            Row rHeadBot = sheet.createRow(rowIdx++);
+            rHeadTop.setHeightInPoints(22);
+            rHeadBot.setHeightInPoints(20);
+
+            // A (merge top+bot)
+            Cell hA = rHeadTop.createCell(COL_DATE);
+            hA.setCellValue("Ngày tháng chứng từ");
+            hA.setCellStyle(header);
+            rHeadBot.createCell(COL_DATE).setCellStyle(header);
+            sheet.addMergedRegion(new CellRangeAddress(HEADER_TOP, HEADER_BOT, COL_DATE, COL_DATE));
+
+            // B+C: top merged = "Số hiệu Chứng từ"
+            Cell hBC = rHeadTop.createCell(COL_THU_NO);
+            hBC.setCellValue("Số hiệu Chứng từ");
+            hBC.setCellStyle(header);
+            rHeadTop.createCell(COL_CHI_NO).setCellStyle(header);
+            sheet.addMergedRegion(new CellRangeAddress(HEADER_TOP, HEADER_TOP, COL_THU_NO, COL_CHI_NO));
+            // Bottom: B = Thu, C = Chi
+            Cell hThuNo = rHeadBot.createCell(COL_THU_NO);
+            hThuNo.setCellValue("Thu"); hThuNo.setCellStyle(header);
+            Cell hChiNo = rHeadBot.createCell(COL_CHI_NO);
+            hChiNo.setCellValue("Chi"); hChiNo.setCellStyle(header);
+
+            // D (merge top+bot)
+            Cell hD = rHeadTop.createCell(COL_DESC);
+            hD.setCellValue("Diễn giải");
+            hD.setCellStyle(header);
+            rHeadBot.createCell(COL_DESC).setCellStyle(header);
+            sheet.addMergedRegion(new CellRangeAddress(HEADER_TOP, HEADER_BOT, COL_DESC, COL_DESC));
+
+            // E+F+G: top merged = "Số tiền"
+            Cell hEFG = rHeadTop.createCell(COL_THU);
+            hEFG.setCellValue("Số tiền");
+            hEFG.setCellStyle(header);
+            rHeadTop.createCell(COL_CHI).setCellStyle(header);
+            rHeadTop.createCell(COL_TON).setCellStyle(header);
+            sheet.addMergedRegion(new CellRangeAddress(HEADER_TOP, HEADER_TOP, COL_THU, COL_TON));
+            // Bottom: E=Thu, F=Chi, G=Tồn
+            Cell hThu = rHeadBot.createCell(COL_THU);
+            hThu.setCellValue("Thu"); hThu.setCellStyle(header);
+            Cell hChi = rHeadBot.createCell(COL_CHI);
+            hChi.setCellValue("Chi"); hChi.setCellStyle(header);
+            Cell hTon = rHeadBot.createCell(COL_TON);
+            hTon.setCellValue("Tồn"); hTon.setCellStyle(header);
+
+            // ── Gộp + lọc flows ─────────────────────────────────────────────
+            // Cả thu và chi dùng CHUNG quy tắc:
+            //   · paymentType = BANK_TRANSFER + bank là Vietinbank → sổ ngân hàng.
+            //   · Còn lại → sổ quỹ.
             List<CashflowFlowDto> all = new ArrayList<>();
-            if (s.getIncomes()  != null) all.addAll(s.getIncomes());
-            if (s.getExpenses() != null) all.addAll(s.getExpenses());
-
-            // Lọc theo hình thức thanh toán (nếu không "ALL")
-            String pt = paymentType == null ? "" : paymentType.trim().toUpperCase();
-            final boolean filterAll = pt.isEmpty() || "ALL".equals(pt) || "BOTH".equals(pt);
-            if (!filterAll) {
-                final String keep = pt;
-                all.removeIf(f -> {
-                    String p = f.getPaymentType() == null ? "CASH" : f.getPaymentType();
-                    return !p.equalsIgnoreCase(keep);
-                });
+            if (s.getIncomes() != null) {
+                for (CashflowFlowDto f : s.getIncomes()) {
+                    if (isBankTransferVietin(f) == isBank) all.add(f);
+                }
             }
-
+            if (s.getExpenses() != null) {
+                for (CashflowFlowDto f : s.getExpenses()) {
+                    if (isBankTransferVietin(f) == isBank) all.add(f);
+                }
+            }
             all.sort(Comparator.comparingLong(f -> f.getAt() == null ? 0L : f.getAt()));
 
-            // ── Dòng đầu kỳ ───────────────────────────────────────────────────
-            BigDecimal opening = openingTotal(s);
-            Row openRow = sheet.createRow(rowIdx++);
-            openRow.setHeightInPoints(20);
-            Cell lblOpen = openRow.createCell(0);
-            lblOpen.setCellValue("SỐ DƯ ĐẦU KỲ");
-            lblOpen.setCellStyle(balanceLabel);
-            sheet.addMergedRegion(new CellRangeAddress(openRow.getRowNum(),
-                    openRow.getRowNum(), 0, COL_AMOUNT - 1));
-            Cell openVal = openRow.createCell(COL_AMOUNT);
-            openVal.setCellValue(opening.doubleValue());
-            openVal.setCellStyle(balanceValue);
-
-            // ── Data ──────────────────────────────────────────────────────────
-            BigDecimal totalIn  = BigDecimal.ZERO;
-            BigDecimal totalOut = BigDecimal.ZERO;
-
-            // Số ký tự ước lượng mỗi cột có thể chứa (dùng để wrap xuống dòng)
-            final int CHARS_TIME   = 14;
-            final int CHARS_NUMBER = 22;
-            final int CHARS_REASON = 30;
-            final int CHARS_METHOD = 12;
+            // ── Data rows ───────────────────────────────────────────────────
+            BigDecimal running = opening;
+            final int CHARS_DESC = 44;
 
             for (int i = 0; i < all.size(); i++) {
                 CashflowFlowDto f = all.get(i);
                 boolean income = "INCOME".equalsIgnoreCase(f.getKind());
                 boolean alt = (i % 2 == 1);
-                CellStyle sText = alt ? textA : textN;
+                CellStyle txtC = alt ? textCenterAlt : textCenter;
+                CellStyle txtL = alt ? textLeftAlt : textLeft;
+                CellStyle amt  = alt ? amountAlt : amount;
 
                 Row row = sheet.createRow(rowIdx++);
 
-                // Thời gian
-                Cell c0 = row.createCell(COL_TIME);
-                c0.setCellValue(f.getAt() != null
-                        ? Instant.ofEpochMilli(f.getAt()).atZone(TZ).format(DT) : "");
-                c0.setCellStyle(sText);
+                // A: ngày
+                Cell cDate = row.createCell(COL_DATE);
+                cDate.setCellValue(f.getAt() != null
+                        ? Instant.ofEpochMilli(f.getAt()).atZone(TZ).format(D) : "");
+                cDate.setCellStyle(txtC);
 
-                // Số phiếu (có tiền tố loại) — ví dụ: "Phiếu Thu - 00001"
+                // Số hiệu — chỉ 1 trong B/C có giá trị
                 String raw = f.getNumber() != null ? f.getNumber() : f.getVoucherCode();
                 if (raw == null) raw = "";
-                String prefixed = (income ? "Phiếu Thu" : "Phiếu Chi") + " - " + raw;
-                Cell c2 = row.createCell(COL_NUMBER);
-                c2.setCellValue(prefixed);
-                c2.setCellStyle(sText);
+                String prefixed = (income ? "Phiếu Thu - " : "Phiếu Chi - ") + raw;
 
-                // Lý do
-                Cell c3 = row.createCell(COL_REASON);
-                c3.setCellValue(nz(f.getReason()));
-                c3.setCellStyle(sText);
+                Cell cThuNo = row.createCell(COL_THU_NO);
+                cThuNo.setCellValue(income ? prefixed : "");
+                cThuNo.setCellStyle(txtC);
 
-                // Hình thức
-                Cell c4 = row.createCell(COL_METHOD);
-                String method = "BANK_TRANSFER".equalsIgnoreCase(f.getPaymentType())
-                        ? ("CK" + (f.getBankName() != null ? " · " + f.getBankName() : ""))
-                        : "Tiền mặt";
-                c4.setCellValue(method);
-                c4.setCellStyle(sText);
+                Cell cChiNo = row.createCell(COL_CHI_NO);
+                cChiNo.setCellValue(income ? "" : prefixed);
+                cChiNo.setCellStyle(txtC);
 
-                // Số tiền (+/-)
-                BigDecimal amt = f.getAmount() == null ? BigDecimal.ZERO : f.getAmount();
-                BigDecimal signed = income ? amt : amt.negate();
-                Cell c5 = row.createCell(COL_AMOUNT);
-                c5.setCellValue(signed.doubleValue());
-                c5.setCellStyle(income ? amtIn : amtEx);
+                // D: diễn giải
+                Cell cDesc = row.createCell(COL_DESC);
+                cDesc.setCellValue(nz(f.getReason()));
+                cDesc.setCellStyle(txtL);
 
-                if (income) totalIn  = totalIn.add(amt);
-                else        totalOut = totalOut.add(amt);
+                // E/F: số tiền
+                BigDecimal money = f.getAmount() == null ? BigDecimal.ZERO : f.getAmount();
+                Cell cThu = row.createCell(COL_THU);
+                Cell cChi = row.createCell(COL_CHI);
+                if (income) {
+                    cThu.setCellValue(money.doubleValue()); cThu.setCellStyle(amt);
+                    cChi.setBlank(); cChi.setCellStyle(amt);
+                    running = running.add(money);
+                } else {
+                    cThu.setBlank(); cThu.setCellStyle(amt);
+                    // CHI: hiển thị DƯƠNG, không có dấu trừ
+                    cChi.setCellValue(money.doubleValue()); cChi.setCellStyle(amt);
+                    running = running.subtract(money);
+                }
 
-                // ── Auto-fit chiều cao dòng dựa trên nội dung dài nhất ──
-                // Excel không tự tính height khi có wrapText + merged cells, nên
-                // ta tự ước lượng số dòng ngắt từ độ dài chuỗi so với bề rộng cột
-                // (chars/dòng). Mỗi dòng ≈ 14 points với font 10pt.
-                int lines = 1;
-                lines = Math.max(lines, countLines(c0.getStringCellValue(), CHARS_TIME));
-                lines = Math.max(lines, countLines(prefixed, CHARS_NUMBER));
-                lines = Math.max(lines, countLines(nz(f.getReason()), CHARS_REASON));
-                lines = Math.max(lines, countLines(method, CHARS_METHOD));
+                // G: Tồn
+                Cell cTon = row.createCell(COL_TON);
+                cTon.setCellValue(running.doubleValue());
+                cTon.setCellStyle(amt);
+
+                // Row height auto theo "Diễn giải"
+                int lines = Math.max(1, countLines(nz(f.getReason()), CHARS_DESC));
                 row.setHeightInPoints(Math.max(18f, Math.min(lines * 14f + 4f, 160f)));
             }
 
-            // ── Dòng cuối kỳ ──────────────────────────────────────────────────
-            BigDecimal closing = opening.add(totalIn).subtract(totalOut);
-            Row closeRow = sheet.createRow(rowIdx++);
-            closeRow.setHeightInPoints(20);
-            Cell lblClose = closeRow.createCell(0);
-            lblClose.setCellValue("SỐ DƯ CUỐI KỲ (= đầu kỳ + tổng thu − tổng chi)");
-            lblClose.setCellStyle(balanceLabel);
-            sheet.addMergedRegion(new CellRangeAddress(closeRow.getRowNum(),
-                    closeRow.getRowNum(), 0, COL_AMOUNT - 1));
-            Cell closeVal = closeRow.createCell(COL_AMOUNT);
-            closeVal.setCellValue(closing.doubleValue());
-            closeVal.setCellStyle(balanceValue);
+            // ── Dòng SỐ TỒN CUỐI ──────────────────────────────────────────
+            Row rClose = sheet.createRow(rowIdx++);
+            rClose.setHeightInPoints(22);
+            c = rClose.createCell(0);
+            c.setCellValue("SỐ TỒN CUỐI");
+            c.setCellStyle(balanceLabel);
+            sheet.addMergedRegion(new CellRangeAddress(rClose.getRowNum(),
+                    rClose.getRowNum(), 0, COL_TON - 1));
+            Cell cClose = rClose.createCell(COL_TON);
+            cClose.setCellValue(running.doubleValue());
+            cClose.setCellStyle(balanceAmt);
 
-            // ── Column widths ──────────────────────────────────────────────────
-            // 5 cột (đã bỏ cột Loại). Tổng ~96 ký tự. Số phiếu rộng hơn (22) để
-            // tiền tố "Phiếu Thu - 00001" đọc trọn trong 1 dòng.
-            sheet.setColumnWidth(COL_TIME,   16 * 256);  // Thời gian tạo
-            sheet.setColumnWidth(COL_NUMBER, 22 * 256);  // Số phiếu (có tiền tố)
-            sheet.setColumnWidth(COL_REASON, 36 * 256);  // Lý do
-            sheet.setColumnWidth(COL_METHOD, 14 * 256);  // Hình thức
-            sheet.setColumnWidth(COL_AMOUNT, 16 * 256);  // Số tiền
-            sheet.createFreezePane(0, 4);
+            // ── Width (A4: tổng ~110 ký tự) ─────────────────────────────────
+            sheet.setColumnWidth(COL_DATE,   14 * 256);
+            sheet.setColumnWidth(COL_THU_NO, 16 * 256);
+            sheet.setColumnWidth(COL_CHI_NO, 16 * 256);
+            sheet.setColumnWidth(COL_DESC,   44 * 256); // Diễn giải rộng, wrap text
+            sheet.setColumnWidth(COL_THU,    14 * 256);
+            sheet.setColumnWidth(COL_CHI,    14 * 256);
+            sheet.setColumnWidth(COL_TON,    16 * 256);
+            sheet.createFreezePane(0, 6);
             sheet.setDisplayGridlines(false);
 
             wb.write(out);
@@ -284,61 +347,91 @@ public final class CashflowCombinedReportExcel {
     }
 
     /**
-     * Tổng số dư đầu kỳ = tiền mặt + tổng ngân hàng. Null-safe. Nếu BE không trả về
-     * opening (dự liệu lỗi), rơi về 0 — đúng với yêu cầu "đầu kỳ thường là 0".
+     * Tồn đầu kỳ cho từng tài khoản. Với CASH → opening.cash; với BANK_TRANSFER →
+     * opening.bankTotal. Null → 0.
      */
-    private static BigDecimal openingTotal(CashflowSummaryDto s) {
+    private static BigDecimal openingTotal(CashflowSummaryDto s, boolean isBank) {
         if (s.getOpening() == null) return BigDecimal.ZERO;
-        BigDecimal cash = s.getOpening().getCash() == null ? BigDecimal.ZERO : s.getOpening().getCash();
-        BigDecimal bank = s.getOpening().getBankTotal() == null ? BigDecimal.ZERO : s.getOpening().getBankTotal();
-        return cash.add(bank);
+        if (isBank) {
+            BigDecimal b = s.getOpening().getBankTotal();
+            if (b != null) return b;
+            // Fallback: cộng tay nếu bankTotal null nhưng có list banks.
+            List<BankBalanceDto> list = s.getOpening().getBanks();
+            if (list == null || list.isEmpty()) return BigDecimal.ZERO;
+            BigDecimal sum = BigDecimal.ZERO;
+            for (BankBalanceDto x : list) {
+                if (x != null && x.getBalance() != null) sum = sum.add(x.getBalance());
+            }
+            return sum;
+        }
+        BigDecimal cash = s.getOpening().getCash();
+        return cash == null ? BigDecimal.ZERO : cash;
     }
 
-    private static CellStyle text(XSSFWorkbook wb, byte[] bg) {
-        CellStyle s = wb.createCellStyle();
+    private static CellStyle textStyle(XSSFWorkbook wb, HorizontalAlignment align, byte[] bg, boolean wrap) {
+        CellStyle st = wb.createCellStyle();
         XSSFFont f = wb.createFont();
         f.setFontHeightInPoints((short) 10);
-        s.setFont(f);
-        s.setVerticalAlignment(VerticalAlignment.CENTER);
-        s.setBorderBottom(BorderStyle.THIN);
-        s.setBorderLeft(BorderStyle.THIN);
-        s.setBorderRight(BorderStyle.THIN);
-        s.setIndention((short) 1);
-        s.setWrapText(true);
+        st.setFont(f);
+        st.setAlignment(align);
+        st.setVerticalAlignment(VerticalAlignment.CENTER);
+        st.setBorderTop(BorderStyle.THIN);
+        st.setBorderBottom(BorderStyle.THIN);
+        st.setBorderLeft(BorderStyle.THIN);
+        st.setBorderRight(BorderStyle.THIN);
+        st.setWrapText(wrap);
+        if (align == HorizontalAlignment.LEFT) st.setIndention((short) 1);
         if (bg != null) {
-            s.setFillForegroundColor(new XSSFColor(bg, null));
-            s.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            st.setFillForegroundColor(new XSSFColor(bg, null));
+            st.setFillPattern(FillPatternType.SOLID_FOREGROUND);
         }
-        return s;
+        return st;
     }
 
-    private static CellStyle amount(XSSFWorkbook wb, DataFormat df, byte[] bg) {
-        CellStyle s = wb.createCellStyle();
+    private static CellStyle amountStyle(XSSFWorkbook wb, DataFormat df, byte[] bg) {
+        CellStyle st = wb.createCellStyle();
         XSSFFont f = wb.createFont();
         f.setFontHeightInPoints((short) 10);
-        f.setBold(true);
-        s.setFont(f);
-        s.setAlignment(HorizontalAlignment.RIGHT);
-        s.setVerticalAlignment(VerticalAlignment.CENTER);
-        s.setDataFormat(df.getFormat("#,##0"));
-        s.setBorderBottom(BorderStyle.THIN);
-        s.setBorderLeft(BorderStyle.THIN);
-        s.setBorderRight(BorderStyle.THIN);
+        st.setFont(f);
+        st.setAlignment(HorizontalAlignment.RIGHT);
+        st.setVerticalAlignment(VerticalAlignment.CENTER);
+        st.setDataFormat(df.getFormat("#,##0"));
+        st.setBorderTop(BorderStyle.THIN);
+        st.setBorderBottom(BorderStyle.THIN);
+        st.setBorderLeft(BorderStyle.THIN);
+        st.setBorderRight(BorderStyle.THIN);
         if (bg != null) {
-            s.setFillForegroundColor(new XSSFColor(bg, null));
-            s.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            st.setFillForegroundColor(new XSSFColor(bg, null));
+            st.setFillPattern(FillPatternType.SOLID_FOREGROUND);
         }
-        return s;
+        return st;
     }
 
     private static String nz(String s) { return s == null ? "" : s; }
-    @SuppressWarnings("unused")
-    private static boolean isTrue(Boolean b) { return Objects.equals(b, Boolean.TRUE); }
 
     /**
-     * Ước lượng số dòng wrap của 1 chuỗi khi cell rộng {@code charsPerLine} ký tự.
-     * Chia theo khoảng trắng (không ngắt giữa từ) + đếm cả '\n' do người dùng nhập.
-     * Dùng để tự tính row height khi POI không auto-fit được dòng merged + wrapText.
+     * Quy tắc chung cho cả phiếu thu và phiếu chi:
+     * paymentType = BANK_TRANSFER <b>và</b> bank là Vietinbank → sổ ngân hàng.
+     * Mọi trường hợp còn lại (tiền mặt, hoặc CK từ ngân hàng khác) → sổ quỹ.
+     *
+     * <p>Nhận diện Vietin bằng cách bỏ dấu + lowercase rồi tìm chuỗi con "vietin"
+     * — khớp "VietinBank", "Vietin Bank", "VIETIN", "Ngân hàng Vietin"...
+     */
+    private static boolean isBankTransferVietin(CashflowFlowDto f) {
+        if (f == null) return false;
+        String pt = f.getPaymentType() == null ? "CASH" : f.getPaymentType();
+        if (!"BANK_TRANSFER".equalsIgnoreCase(pt)) return false;
+        String bank = f.getBankName();
+        if (bank == null || bank.isBlank()) return false;
+        String norm = java.text.Normalizer
+                .normalize(bank.trim().toLowerCase(), java.text.Normalizer.Form.NFD)
+                .replaceAll("\\p{InCombiningDiacriticalMarks}+", "")
+                .replace('đ', 'd');
+        return norm.contains("vietin");
+    }
+
+    /**
+     * Ước lượng số dòng wrap (POI không auto-fit cho wrapText khi merge).
      */
     private static int countLines(String text, int charsPerLine) {
         if (text == null || text.isEmpty()) return 1;
@@ -352,7 +445,6 @@ public final class CashflowCombinedReportExcel {
                 if (cur == 0) { cur = wl; }
                 else if (cur + 1 + wl > charsPerLine) { lines++; cur = wl; }
                 else { cur += 1 + wl; }
-                // Từ cực dài → chiếm nhiều dòng
                 while (cur > charsPerLine) { lines++; cur -= charsPerLine; }
             }
             total += lines;

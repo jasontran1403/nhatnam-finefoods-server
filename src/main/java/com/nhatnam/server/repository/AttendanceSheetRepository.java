@@ -66,4 +66,21 @@ public interface AttendanceSheetRepository extends JpaRepository<AttendanceSheet
                 .map(s -> s.getCalcStatus() == PayrollCalcStatus.PUBLISHED)
                 .orElse(false);
     }
+
+    /**
+     * (10/2026) TRUE nếu lương tháng đang HOÀN TẤT (nhân viên xem được).
+     * Dùng cho logic "trừ vào quỹ phép": tháng chưa finalize = chưa áp dụng
+     * phần đã trừ, phép phải trả lại cho nhân viên. Khớp cả 2 luồng:
+     *   • Luồng mới (CompanyAttendanceService.unpublish → markUnpublished):
+     *     set calcStatus=CALCULATED + finalized=false → trả về false.
+     *   • Luồng cũ (FactoryPayrollService.reopenPeriod → unfinalize):
+     *     chỉ set finalized=false (calcStatus có thể vẫn PUBLISHED stale)
+     *     → trả về false nhờ check finalized.
+     */
+    default boolean isLockedForLeaveDeduction(int month, int year) {
+        return findCompanySheet(month, year)
+                .map(s -> s.isFinalized()
+                        || s.getCalcStatus() == PayrollCalcStatus.PUBLISHED)
+                .orElse(false);
+    }
 }

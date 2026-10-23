@@ -28,6 +28,8 @@ public class FactoryPayrollDtos {
         private Boolean attendanceReady;
         /** OWNER đã bấm "Hoàn tất" cho tháng + bộ phận này chưa */
         private Boolean finalized;
+        /** (10/2026) OWNER đã Public THƯỞNG DT (KT/KD/Driver) cho tháng này chưa. */
+        private Boolean bonusReady;
     }
 
     // ─── Breakdown ngày công ──────────────────────────────────────────────────
@@ -342,6 +344,36 @@ public class FactoryPayrollDtos {
         /** Chỉ có với bộ phận Tài xế */
         private DriverMonthDto driver;
 
+        /**
+         * (10/2026) Chi tiết thưởng doanh thu — chỉ có cho KT/KD khi đã Public.
+         * KT: dùng pool phòng + bonusAmount cá nhân.
+         * KD: dùng revenue cá nhân + hold cá nhân + bonusAmount cá nhân.
+         */
+        /** KD: Tổng doanh thu tháng cá nhân (= Σ final − vat của đơn tạo trong tháng, EX-VAT, loại CANCELLED). */
+        private Long officeBonusPersonalRevenue;
+        /** KD: Doanh thu đang hold cá nhân (EX-VAT). */
+        private Long officeBonusPersonalHold;
+        /** KD: Doanh thu CHIA HOA HỒNG cá nhân (= Σ thực thu từ payment_transaction, EX-VAT). */
+        private Long officeBonusPersonalChiaHoaHong;
+        /** KT: Tổng pool phòng (= dept collected + waived EX-VAT). */
+        private Long officeBonusPoolTotal;
+
+        // ─── (10/2026) Cross-dept support bonus ──────────────────────────
+        /**
+         * Thưởng HỖ TRỢ BÁN HÀNG — cho NV ko thuộc SALES nhưng có tạo đơn
+         * trong tháng (VD NV kho, trưởng xưởng kiêm bán). Lấy từ office_bonus_item
+         * ở dept SALES. Null hoặc 0 → không hiển thị card.
+         */
+        private Long salesSupportBonus;
+        /** Doanh thu chia hoa hồng cá nhân (snapshot) để hiển thị trên card. */
+        private Long salesSupportRevenue;
+
+        // (10/2026) Cho SELLER chính: target cá nhân + % đạt (hiển thị trên phiếu lương)
+        /** Target doanh thu cá nhân (snapshot tại tháng này). null = non-SELLER. */
+        private Long salesPersonalTarget;
+        /** % đạt target = revenue / personalTarget × 100. */
+        private Double salesAchievedPercent;
+
         /** Thời điểm owner upload bảng chấm công */
         private Long attendanceUploadedAt;
         /** Thời điểm owner bấm "Hoàn tất" */
@@ -404,10 +436,25 @@ public class FactoryPayrollDtos {
          * OWNER đã bấm "Hoàn tất Thưởng" chưa.
          * Chỉ có ý nghĩa với SALES và ACCOUNTING.
          * false = thưởng đang pending (nhân viên thấy "Đang tính thưởng").
+         * (10/2026) Giờ tương đương với state == PUBLISHED — nhân viên chỉ thấy
+         * phiếu khi field này = true.
          */
         private Boolean bonusFinalized;
         private Long    bonusFinalizedAt;
         private String  bonusFinalizedByName;
+
+        /**
+         * (10/2026) State chi tiết của thưởng — 3 giá trị:
+         *   NONE       = chưa tính
+         *   CALCULATED = đã tính nhưng CHƯA public (nhân viên chưa thấy)
+         *   PUBLISHED  = đã tính và đã PUBLIC (nhân viên thấy phiếu)
+         * UI hiển thị 3 state khác nhau; bonusFinalized vẫn giữ để tương thích.
+         */
+        private String  bonusCalcStatus;
+        private Long    bonusCalculatedAt;
+        private String  bonusCalculatedByName;
+        private Long    bonusPublishedAt;
+        private String  bonusPublishedByName;
         /**
          * Bộ phận này có tính thưởng doanh thu không.
          * true  = SALES hoặc ACCOUNTING.
@@ -431,6 +478,14 @@ public class FactoryPayrollDtos {
         private Long totalBonusPool;
         /** Số phiếu thanh toán được đếm. */
         private Integer transactionCount;
+        /** Số tiền còn dư KHÔNG chia (SALES: doanh thu không đủ mốc; ACCOUNTING: pool×(100−Σratio)/100). */
+        private Long undistributedAmount;
+        /** SALES: list mốc đã dùng khi tính. NULL khi ACCOUNTING / legacy. */
+        private java.util.List<SalesTierDto> salesTiers;
+        /** ACCOUNTING: % hoa hồng của phòng khi tính. NULL khi SALES / legacy. */
+        private java.math.BigDecimal accountingPercent;
+        /** ACCOUNTING: tỉ lệ từng người đã dùng khi tính. NULL khi SALES. */
+        private java.util.List<UserRatioDto> accountingRatios;
         private Long    computedAt;
         private String  computedByName;
         /** Chi tiết từng nhân viên. */
@@ -445,11 +500,222 @@ public class FactoryPayrollDtos {
         private String roleLabel;
         /** Doanh thu tính thưởng cho người này (VNĐ). */
         private java.math.BigDecimal revenue;
-        /** Số tiền thưởng. */
+        /** Số tiền thưởng (đã làm tròn LÊN 5.000). */
         private Long bonusAmount;
+        /** Số tiền thưởng CHƯA làm tròn (raw) — chỉ để đối chiếu. */
+        private Long rawBonusAmount;
+        /** ACCOUNTING: tỉ lệ % đã dùng cho user này. NULL khi SALES. */
+        private java.math.BigDecimal ratioPercent;
         /** % KPI áp dụng (snapshot). */
         private Double kpiPercent;
         private Integer transactionCount;
+    }
+
+    // ── FLOW MỚI 2026: Request body cho POST /finalize-bonus ─────────────────
+
+    /** 1 mốc thưởng SALES (gửi từ FE khi tính). */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class SalesTierDto {
+        /** Ngưỡng doanh thu (VNĐ) cần đạt để tính 1 lần mốc này. */
+        private java.math.BigDecimal threshold;
+        /** Tiền thưởng khi đạt 1 lần ngưỡng (VNĐ). */
+        private Long unitPrice;
+    }
+
+    /** 1 tỉ lệ của 1 kế toán viên (gửi từ FE khi tính). */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class UserRatioDto {
+        private Long userId;
+        /** % (0..100). */
+        private java.math.BigDecimal ratio;
+    }
+
+    /**
+     * Body cho POST /finalize-bonus (flow mới).
+     * - SALES: dùng {@link #salesTiers}
+     * - ACCOUNTING: dùng {@link #accountingPercent} + {@link #accountingRatios}
+     * - LEGACY: nếu các field trên trống và {@link #unitPrice} có giá trị thì
+     *   fallback về công thức cũ (giữ tương thích).
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class FinalizeBonusRequest {
+        private java.util.List<SalesTierDto> salesTiers;
+        private java.math.BigDecimal accountingPercent;
+        private java.util.List<UserRatioDto> accountingRatios;
+        /** Legacy đơn giá / 100tr — vẫn chấp nhận để FE cũ còn chạy. */
+        private Long unitPrice;
+
+        // ─── (10/2026) Flow mới SALES v2: target + 1 mốc duy nhất ──────────
+        /** Doanh thu target của phòng (OWNER nhập). */
+        private Long salesTarget;
+        /** Mỗi bước doanh thu — VD 100.000.000. */
+        private Long salesStepAmount;
+        /** Đơn giá/bước full (chưa nhân multiplier) — VD 400.000. */
+        private Long salesStepUnitPrice;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SALES BONUS v2 — preview & publish-with-overrides (10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class SalesBonusPreviewDto {
+        private Integer month;
+        private Integer year;
+        /** Config đang dùng */
+        private Long target;
+        private Long stepAmount;
+        private Long stepUnitPrice;
+        /** 1.0 (đạt) hoặc 0.5 (dưới) — legacy dept-wide, giữ cho tương thích */
+        private Double multiplier;
+        /** Tổng doanh thu phòng (ex-VAT, đã trừ discount). */
+        private Long deptRevenue;
+        /** Hiển thị: deptRevenue >= target ? */
+        private Boolean targetAchieved;
+        /** (10/2026) Ladder tiers áp dụng per-seller theo % đạt target cá nhân. */
+        private java.util.List<SalesBonusTierDto> tiers;
+        private java.util.List<SalesBonusRowDto> rows;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class SalesBonusRowDto {
+        private Long userId;
+        private String fullName;
+        private String roleLabel;
+        private Long revenue;
+        private Integer steps;
+        private Long remainder;
+        /** Đơn giá / bước (sau khi nhân multiplier). Có thể OWNER sửa. */
+        private Long stepUnitPrice;
+        /** Thưởng cho phần dư (default 0). Có thể OWNER sửa. */
+        private Long remainderBonus;
+        /** = steps × stepUnitPrice + remainderBonus */
+        private Long totalBonus;
+        /** OWNER đã sửa so với default chưa */
+        private Boolean ownerEdited;
+
+        // (10/2026) Target cá nhân + achieved
+        /** TRUE nếu user là SELLER / SUPER_SELLER (có áp dụng target cá nhân). */
+        private Boolean isSalesSeller;
+        /** Target cá nhân (nếu isSalesSeller). */
+        private Long personalTarget;
+        /** % đạt = revenue / personalTarget × 100. null nếu không áp dụng. */
+        private Double achievedPercent;
+        /** Multiplier được áp dụng (từ ladder). */
+        private Double appliedMultiplier;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class SalesBonusTierDto {
+        /** Ngưỡng % hoàn thành target (0-200+). */
+        private Integer thresholdPercent;
+        /** % đơn giá (0-100+). */
+        private Integer pricePercent;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class PublishSalesBonusRequest {
+        private java.util.List<SalesBonusOverrideDto> overrides;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // BONUS TREND — biến động thưởng 12 tháng gần nhất per dept (10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BonusTrendDto {
+        private String department;             // SALES | ACCOUNTING | DRIVER | FACTORY | WAREHOUSE
+        private String departmentLabel;
+        /** 12 tháng, sắp xếp mới nhất → cũ nhất */
+        private java.util.List<BonusTrendMonthDto> months;
+        /** Union các NV từng có thưởng trong 12 tháng (kể cả đã nghỉ/khoá). */
+        private java.util.List<BonusTrendUserDto> users;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BonusTrendMonthDto {
+        private Integer month;
+        private Integer year;
+        /** Dept-specific key→value (mixed types: Long / Double / String).
+         *  SALES: deptRevenue(Long), target(Long), stepUnitPrice(Long), stepAmount(Long), totalPool(Long)
+         *  ACCOUNTING: deptRevenue(Long), commissionPercent(Double), totalPool(Long)
+         *  DRIVER: gasPrice(Long), bikeUnitPrice(Long), truckUnitPrice(Long), totalPool(Long)
+         *  FACTORY: totalOutputKg(Long), ratePerTon(Long), bonusPool(Long)
+         */
+        private java.util.Map<String, Object> stats;
+        /** TRUE nếu tháng này đã Public (có data). */
+        private Boolean published;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BonusTrendUserDto {
+        private Long userId;
+        private String fullName;
+        private String roleLabel;
+        private Boolean deleted;
+        private Boolean locked;
+        /** TRUE nếu NV ko thuộc dept đang xem (hỗ trợ bán hàng / giao hàng / …). */
+        private Boolean support;
+        /** Nhãn hỗ trợ: "hỗ trợ bán hàng" / "hỗ trợ giao hàng". Null nếu không support. */
+        private String supportLabel;
+        /** Thứ hạng chức vụ trong dept (nhỏ hơn = cao hơn). Dùng để sort. */
+        private Integer roleRank;
+        /** TRUE nếu NV nhận "thưởng cố định" (VD Bảo vệ Q9 ở xưởng SX). */
+        private Boolean fixedAmount;
+        /** key = "YYYY-MM" (VD "2026-09"), value = tiền thưởng. Null = không có. */
+        private java.util.Map<String, Long> amountsByMonth;
+        /** key = "YYYY-MM", value = % tỷ lệ (chỉ ACCOUNTING). Null nếu không có. */
+        private java.util.Map<String, Double> ratioByMonth;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // BONUS SUMMARY — tổng hợp thưởng 12 tháng theo phòng → chức vụ (10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BonusSummaryDto {
+        /** 12 tháng cùng khung với BonusTrend (newest-1 → oldest). */
+        private java.util.List<BonusTrendMonthDto> months;
+        /** Nhóm theo phòng ban, thứ tự KD → SX → KT → Kho → TX. */
+        private java.util.List<BonusSummaryGroupDto> groups;
+        /** Grand total toàn công ty mỗi tháng (= Σ group totals). */
+        private java.util.Map<String, Long> grandTotalsByMonth;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class BonusSummaryGroupDto {
+        private String department;         // SALES / FACTORY / ...
+        private String departmentLabel;
+        /** NV trong phòng (sort theo role rank asc). Mỗi NV = sum thưởng từ MỌI nguồn. */
+        private java.util.List<BonusTrendUserDto> users;
+        /** Σ của tất cả NV trong phòng mỗi tháng. */
+        private java.util.Map<String, Long> totalsByMonth;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class AttendanceBonusRowDto {
+        private Long userId;
+        private String fullName;
+        private String roleLabel;
+        private String department;
+        private String departmentLabel;
+        private Boolean deleted;
+        private Boolean locked;
+        /** Amount tháng hiện tại (0 nếu chưa có). */
+        private Long amount;
+        /** Amount tháng gần nhất trước đó (dùng làm placeholder). */
+        private Long previousAmount;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class SalesBonusOverrideDto {
+        private Long userId;
+        /** Đơn giá/bước đã sửa (null → giữ default). */
+        private Long stepUnitPrice;
+        /** Thưởng dư đã sửa (null → giữ default 0). */
+        private Long remainderBonus;
+        /** Target cá nhân mới (nullable) — chỉ áp dụng cho SELLER. */
+        private Long personalTarget;
     }
 
     /** 1 dòng trong báo cáo khớp nhân viên sau khi import. */
@@ -544,6 +810,15 @@ public class FactoryPayrollDtos {
          * được cả hai cột: nhìn là biết tháng đó bị trừ bao nhiêu vì thiếu công.
          */
         private Long standardBaseSalary;
+
+        /**
+         * (10/2026) TRUE nếu nhân viên đang nghỉ thai sản theo chế độ. FE dùng
+         * cờ này để MERGE từ cột "Lương theo chấm công" tới cột "Thực nhận"
+         * thành 1 dòng chữ "Đang nghỉ thai sản theo chế độ" (giấu toàn bộ
+         * số liệu công/phụ cấp/thưởng của tháng đó, kể cả khi vẫn có khoản
+         * nhập tay). Luồng chi lương / bank export vẫn bỏ qua người này.
+         */
+        private Boolean maternityLeave;
 
         /**
          * BREAKDOWN LƯƠNG ĐẦY ĐỦ — để mở modal "Chi tiết lương" ngay từ bảng,
@@ -708,6 +983,20 @@ public class FactoryPayrollDtos {
         private String position;
         /** TRUE nếu nhân viên này KHÔNG thuộc bộ phận Tài xế */
         private Boolean nonDriver;
+
+        /**
+         * (10/2026) TRUE nếu đây là tài xế xe tải (position = "Tài xế xe tải").
+         * Khi true, các field motorbike / truck sẽ null (vì không tính theo
+         * lượt), chỉ dùng {@link #fixedTruckBonus}.
+         */
+        private Boolean truckDriver;
+
+        /**
+         * (10/2026) Thưởng cố định tháng cho tài xế xe tải (đồng). OWNER nhập
+         * trong modal "Tính thưởng". grandTotalSalary = fixedTruckBonus (không
+         * làm tròn 5.000 vì OWNER chủ động nhập số chẵn).
+         */
+        private Long fixedTruckBonus;
     }
 
     /** Chi tiết lương của MỘT loại xe (dùng cho cả xe máy và xe tải). */
@@ -751,6 +1040,14 @@ public class FactoryPayrollDtos {
          * Phụ cấp xăng xe được tính và lưu vào phiếu lương của bộ phận gốc.
          */
         private List<DriverSalaryRowDto> nonDriverRows;
+
+        /**
+         * (10/2026) Tài xế xe tải — nhận thưởng CỐ ĐỊNH tháng (position =
+         * "Tài xế xe tải"). Tách khỏi rows (vốn là tài xế xe máy) để UI render
+         * thành section riêng + export PDF/Excel chia 3 nhóm (xe máy / xe tải /
+         * hỗ trợ). Mỗi row có fixedTruckBonus, các field tính theo lượt null.
+         */
+        private List<DriverSalaryRowDto> truckDriverRows;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -801,6 +1098,17 @@ public class FactoryPayrollDtos {
 
         /** Tổng pool đã tính (null nếu chưa tính). */
         private Long totalBonusPool;
+        /** Số tiền DƯ không chia (hiển thị, null khi chưa tính). */
+        private Long undistributedAmount;
+
+        // ── Flow MỚI 2026: cấu hình đã dùng khi tính (echo lại cho FE) ──
+        /** SALES: list mốc đã dùng khi tính (null nếu chưa tính / ACCOUNTING). */
+        private java.util.List<SalesTierDto> salesTiers;
+        /** ACCOUNTING: % hoa hồng của phòng khi tính (null nếu chưa tính / SALES). */
+        private java.math.BigDecimal accountingPercent;
+        /** ACCOUNTING: tỉ lệ từng người khi tính (null nếu chưa tính / SALES). */
+        private java.util.List<UserRatioDto> accountingRatios;
+
         private Long computedAt;
         private String computedByName;
 
@@ -830,6 +1138,10 @@ public class FactoryPayrollDtos {
 
         /** Số hoa hồng đã tính — null khi chưa bấm "Tính hoa hồng". */
         private Long bonusAmount;
+        /** Số hoa hồng CHƯA làm tròn (raw) — null khi chưa tính. */
+        private Long rawBonusAmount;
+        /** ACCOUNTING: tỉ lệ đã dùng cho user này — null khi SALES / chưa tính. */
+        private java.math.BigDecimal ratioPercent;
     }
 
     // ══════════════════════════════════════════════════════════════════════════

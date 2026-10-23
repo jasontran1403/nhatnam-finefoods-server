@@ -22,6 +22,11 @@ import com.nhatnam.server.service.hr.HrService;
 import com.nhatnam.server.service.hr.PayrollDepartmentResolver;
 import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil;
 import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.AccountingShare;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.AccountingPoolResult;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.AccountingShareV2;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.SalesBonusResult;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.SalesTier;
+import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.UserRatio;
 import com.nhatnam.server.service.hr.OfficeBonusCommissionUtil.UserWeight;
 import com.nhatnam.server.utils.SeniorityCalculator;
 import jakarta.annotation.PostConstruct;
@@ -135,8 +140,16 @@ public class FactoryPayrollService {
     /** Nguồn sự thật cho ưu đãi từ ĐƠN NHÂN VIÊN đã được OWNER duyệt. */
     private final com.nhatnam.server.service.hr.EmployeeRequestService employeeRequestService;
     private final OfficeBonusResultRepository officeBonusResultRepo;
+    private final com.nhatnam.server.repository.SalesBonusOverrideRepository salesBonusOverrideRepo;
+    private final com.nhatnam.server.repository.FactoryKpiBonusRepository factoryKpiBonusRepo;
+    private final com.nhatnam.server.repository.FactoryKpiBonusItemRepository factoryKpiBonusItemRepo;
+    private final com.nhatnam.server.repository.WarehouseBonusRepository warehouseBonusRepo;
+    private final com.nhatnam.server.repository.AttendanceBonusRepository attendanceBonusRepo;
+    // (10/2026) Thưởng cố định tài xế xe tải — tách khỏi lương tài xế xe máy
+    private final com.nhatnam.server.repository.TruckDriverFixedBonusRepository truckDriverFixedBonusRepo;
     private final PaymentTransactionRepository paymentTransactionRepo;
     private final OrderRepository orderRepository;
+    private final com.nhatnam.server.service.hr.HolidayService holidayService;
 
     @PostConstruct
     void initStorage() {
@@ -205,12 +218,33 @@ public class FactoryPayrollService {
                     : sheetRepo.findByMonthAndYearAndDepartment(
                     ym.getMonthValue(), ym.getYear(), department).orElse(null);
 
+            // (10/2026) Phase 1 refactor: lương được Public toàn công ty qua
+            // COMPANY_SENTINEL (= FACTORY sheet). Nhân viên các dept khác
+            // (KT/KD/Kho/Driver) không có per-dept sheet.finalized → UI báo
+            // sai "Đang xử lý" dù lương đã Public. Fix: coi là finalized khi
+            // EITHER per-dept finalized OR company sheet đã PUBLISHED.
+            AttendanceSheet company = sheetRepo
+                    .findCompanySheet(ym.getMonthValue(), ym.getYear()).orElse(null);
+            boolean companyPub = company != null
+                    && company.getCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+            boolean salaryReady = (s != null && s.isFinalized()) || companyPub;
+            // (10/2026) Cờ mới cho FE: thưởng đã Public chưa (hiển thị "Đã có
+            // lương/thưởng" thay vì "Đã có lương"). True khi EITHER:
+            //   - bonusCalcStatus=PUBLISHED (SALES/ACCOUNTING/DRIVER dùng bonus flow)
+            //   - kpiFinalized=true (FACTORY dùng KPI flow — không có bonus_* flags)
+            boolean bonusReady = s != null
+                    && (s.isBonusFinalized()
+                    || s.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED
+                    || s.isKpiFinalized()
+                    || s.getKpiCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED);
+
             result.add(PeriodOptionDto.builder()
                     .month(ym.getMonthValue())
                     .year(ym.getYear())
                     .label(periodLabel(ym.getMonthValue(), ym.getYear()))
                     .attendanceReady(s != null && s.getFilePath() != null)
-                    .finalized(s != null && s.isFinalized())
+                    .finalized(salaryReady)
+                    .bonusReady(bonusReady)
                     .build());
         }
         return result;
@@ -284,12 +318,41 @@ public class FactoryPayrollService {
         AttendanceSheet sheet = sheetRepo
                 .findByMonthAndYearAndDepartment(month, year, dept).orElse(null);
 
-        if (sheet == null || !sheet.isFinalized()) {
+        // (10/2026) Flow lương mới = COMPANY-WIDE: chỉ có 1 sheet dưới sentinel
+        // FACTORY (xem AttendanceSheetRepository.COMPANY_SENTINEL). OWNER Public
+        // 1 lần cho cả công ty → chỉ sentinel sheet có calcStatus=PUBLISHED.
+        // Per-dept sheet của KT/KD/Kho/Driver có thể KHÔNG tồn tại → nhân viên
+        // sẽ bị kẹt ở "Đang xử lý" dù lương toàn cty đã Public.
+        //
+        // Fix: coi là Finalized khi EITHER per-dept.finalized=true OR company
+        // sheet đã PUBLISHED. Giữ nguyên per-dept lookup bên dưới để dùng cho
+        // attendance/standardDays etc.
+        AttendanceSheet companySheet = sheetRepo.findCompanySheet(month, year).orElse(null);
+        boolean companyPublished = companySheet != null
+                && companySheet.getCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+
+        boolean salaryReady = (sheet != null && sheet.isFinalized()) || companyPublished;
+        if (!salaryReady) {
             return b.status("PROCESSING").kpiStatus("NONE").build();
         }
+        // Nếu per-dept sheet chưa có, dùng company sheet làm thay cho đoạn code
+        // bên dưới (cần sheet != null để đọc standardDays, uploadedAt, …).
+        if (sheet == null) sheet = companySheet;
 
         // Xác định trạng thái KPI — tách riêng khỏi lương
-        String kpiStatus = sheet.isKpiFinalized() ? "READY" : "PENDING";
+        // (10/2026) KT/KD KHÔNG có flow "Hoàn tất KPI" riêng — thưởng hoa hồng
+        // của họ gắn trực tiếp vào field kpiBonus trên MyPayslipDto. FE check
+        // `kpiStatus === 'READY'` mới hiện kpiBonus. Vì vậy khi bonus đã Public
+        // (bonusCalcStatus=PUBLISHED), coi kpiStatus = READY cho KT/KD/DRIVER
+        // để FE không ẩn phần thưởng hoa hồng/driver bonus.
+        boolean bonusAlreadyPublished = sheet.isBonusFinalized()
+                || sheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+        String kpiStatus;
+        if (sheet.isKpiFinalized() || bonusAlreadyPublished) {
+            kpiStatus = "READY";
+        } else {
+            kpiStatus = "PENDING";
+        }
         b.kpiStatus(kpiStatus);
 
         b.attendanceUploadedAt(sheet.getUploadedAt())
@@ -326,13 +389,80 @@ public class FactoryPayrollService {
 
             // Lương full — HrService đọc mealDays từ AttendanceEntry (hoặc full nếu null)
             SalaryBreakdownDto detail = hrService.getSalaryBreakdownForUser(user.getId(), month, year);
+            // (10/2026) Attach "Thưởng hỗ trợ giao hàng" cho NV KT/KD nào có km/trips
+            //   + gắn luôn DriverMonthDto vào b.driver(...) để FE hiện card
+            //   "Chi tiết số km theo ngày" cho NV hỗ trợ giao hàng.
+            DriverMonthDto supportDm = attachDriverSupportBonusIfAny(user, month, year, detail);
+            if (supportDm != null) b.driver(supportDm);
+            // (10/2026) Attach "Thưởng hỗ trợ bán hàng" cho NV ko thuộc SALES
+            // nhưng có tạo đơn trong tháng (NV kho, trưởng xưởng kiêm bán, …).
+            attachSalesSupportBonusIfAny(user, month, year, dept, b);
             b.salaryDetail(detail);
 
-            // Thưởng doanh thu: chỉ hiển thị khi bonusFinalized = true
+            // Thưởng doanh thu: chỉ hiển thị khi đã PUBLISHED.
+            // (10/2026) Dùng CẢ bonusCalcStatus=PUBLISHED LẪN bonusFinalized=true —
+            // trong giai đoạn migrate có thể 2 cờ không đồng bộ (OWNER đã bấm
+            // Hoàn tất xong, dữ liệu cũ chỉ có bonusFinalized nhưng bonusCalcStatus
+            // = NONE, hoặc ngược lại). Lấy OR để NV luôn thấy phiếu khi đã Public.
             long bonusAmount = 0L;
-            if (sheet != null && sheet.isBonusFinalized()) {
+            boolean bonusPublished = sheet != null && (
+                    sheet.isBonusFinalized()
+                            || sheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED
+            );
+            if (bonusPublished) {
                 Long bonus = officeBonusResultRepo.sumBonusForUser(month, year, dept, user.getId());
                 bonusAmount = bonus != null ? bonus : 0L;
+
+                // (10/2026) Thêm chi tiết cho card "Thưởng doanh thu" trên phiếu:
+                //   KT: pool phòng = collected + waived EX-VAT toàn phòng
+                //   KD: doanh thu cá nhân (thực thu EX-VAT) + hold cá nhân
+                java.time.YearMonth ymBonus = java.time.YearMonth.of(year, month);
+                long startMs = ymBonus.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+                long endMs   = ymBonus.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+
+                // (10/2026) WAREHOUSE: attach warehouse_bonus nếu sheet đã PUBLISHED
+                if (dept == PayrollDepartment.WAREHOUSE && bonusPublished) {
+                    WarehouseBonus wb = warehouseBonusRepo
+                            .findByUser_IdAndMonthAndYear(user.getId(), month, year)
+                            .orElse(null);
+                    if (wb != null && wb.getAmount() != null && wb.getAmount() > 0) {
+                        bonusAmount = wb.getAmount();
+                    }
+                }
+
+                // (10/2026) Attach personal target + achieved % cho MỌI NV có target set
+                if (dept == PayrollDepartment.SALES) {
+                    SalesBonusOverride ov = salesBonusOverrideRepo
+                            .findByUser_IdAndMonthAndYear(user.getId(), month, year)
+                            .orElse(null);
+                    if (ov != null && ov.getPersonalTarget() != null && ov.getPersonalTarget() > 0) {
+                        b.salesPersonalTarget(ov.getPersonalTarget());
+                        b.salesAchievedPercent(ov.getAchievedPercent());
+                    }
+                }
+
+                if (dept == PayrollDepartment.ACCOUNTING) {
+                    java.math.BigDecimal poolCollected = nzBd(paymentTransactionRepo.sumRevenueAllOrders(startMs, endMs));
+                    java.math.BigDecimal poolWaived    = nzBd(orderRepository.sumWaivedAmountCreatedInRange(startMs, endMs));
+                    b.officeBonusPoolTotal(poolCollected.add(poolWaived)
+                            .setScale(0, java.math.RoundingMode.HALF_UP).longValue());
+                } else { // SALES
+                    // (10/2026) Phân biệt rõ 3 chỉ số:
+                    //   Doanh thu tháng   = Σ (final − vat) đơn tạo trong tháng (EX-VAT)
+                    //   Hold              = (final − paid) × netRatio của đơn chưa chốt
+                    //   Chia hoa hồng     = Σ thực thu EX-VAT (payment_transaction)
+                    // Trước đây revenue = chia hoa hồng → UI hiển thị sai (dùng cùng
+                    // 1 giá trị cho 2 dòng khác nhau).
+                    java.math.BigDecimal personalRev   = nzBd(orderRepository.sumFinalAmountCreatedInRangeByUser(startMs, endMs, user.getId()));
+                    java.math.BigDecimal personalHold  = nzBd(orderRepository.sumHoldAmountCreatedInRangeByUser(startMs, endMs, user.getId()));
+                    java.math.BigDecimal personalChia  = nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, user.getId()));
+                    b.officeBonusPersonalRevenue(personalRev
+                            .setScale(0, java.math.RoundingMode.HALF_UP).longValue());
+                    b.officeBonusPersonalHold(personalHold
+                            .setScale(0, java.math.RoundingMode.HALF_UP).longValue());
+                    b.officeBonusPersonalChiaHoaHong(personalChia
+                            .setScale(0, java.math.RoundingMode.HALF_UP).longValue());
+                }
             }
             b.kpiBonus(bonusAmount);
 
@@ -362,7 +492,27 @@ public class FactoryPayrollService {
         //   unit price = null → driverKpi100 = 0), driver chỉ thấy base + meal.
         //   Sau khi KPI finalized: đầy đủ như trên.
         AttendanceSummaryDto attendance = null;
-        if (!dept.isAttendanceBased()) {
+        // (10/2026) Phase 5 refactor: DRIVER giờ attendanceBased=true (lương theo
+        // chấm công chung) nên nhánh !attendanceBased không chạy cho DRIVER nữa
+        // → bonus xăng + đơn hàng + driverOrderBonusDetail không được set →
+        // phiếu NV tài xế hiển thị Thưởng = 0 dù đã Public. Bổ sung "|| DRIVER"
+        // để DRIVER vẫn vào nhánh này (dùng driverSalaryDetail), nhưng vẫn dùng
+        // AttendanceEntry CHUNG cho lương cơ bản (xem driverSalaryDetail đã bọc
+        // sẵn gọi hrService.previewSalary bên trong).
+        if (!dept.isAttendanceBased() || dept == PayrollDepartment.DRIVER) {
+            // (10/2026) Driver dùng chấm công chung (Phase 5) — build attendance
+            // để FE render AttendanceCalendar bên cạnh DriverCalendar. User muốn
+            // "Chi tiết ngày công" ở mọi role.
+            if (dept.isAttendanceBased()) {
+                double defaultStd = sheet.getStandardDays() != null
+                        ? sheet.getStandardDays()
+                        : standardWorkdaysOf(month, year);
+                AttendanceEntry entry = entryRepo.findByUserAndPeriod(user.getId(), month, year).orElse(null);
+                if (entry != null) {
+                    b.attendance(buildAttendanceSummary(entry, month, year, defaultStd));
+                }
+            }
+
             DriverMonthDto dm = driverKmService.monthOf(user, month, year);
             fillDriverSalary(dm, sheet, true);  // true = chỉ tính bonus khi kpiFinalized
 
@@ -379,10 +529,14 @@ public class FactoryPayrollService {
                 driverDetail = hrService.getSalaryBreakdownForUser(user.getId(), month, year);
             }
 
-            // Khi KPI CHƯA hoàn tất → ẩn phần Thưởng KPI 100% (gas + orderBonus)
-            // trên phiếu, giữ nguyên lương cơ bản + phụ cấp cơm. Card chi tiết
-            // cũng ẩn (bỏ driverOrderBonusDetail).
-            if (driverDetail != null && !sheet.isKpiFinalized()) {
+            // (10/2026) Driver flow mới: dùng bonusCalcStatus=PUBLISHED thay vì
+            // kpiFinalized. Vẫn OR với isKpiFinalized / isBonusFinalized cho tương
+            // thích dữ liệu cũ. Khi CHƯA Public → ẩn Thưởng KPI 100% (gas +
+            // orderBonus) trên phiếu, giữ nguyên lương cơ bản + phụ cấp cơm.
+            boolean driverBonusPublished = sheet.isBonusFinalized()
+                    || sheet.isKpiFinalized()
+                    || sheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+            if (driverDetail != null && !driverBonusPublished) {
                 driverDetail.setDriverOrderBonus(0L);
                 driverDetail.setDriverOrderBonusDetail(null);
                 // Trừ phần bonus (gas + orderBonus) ra khỏi effectiveBonus và net
@@ -409,6 +563,48 @@ public class FactoryPayrollService {
             long driverAllowance  = driverDetail != null ? nz(driverDetail.getAllowance())  : 0L;
             long driverBonus      = driverDetail != null ? nz(driverDetail.getEffectiveBonus()) : 0L;
             long driverNet        = driverDetail != null ? nz(driverDetail.getNetSalary())  : 0L;
+
+            // (10/2026) Set kpiBonus + kpiStatus cho driver branch. Ưu tiên
+            // driverOrderBonusDetail.totalAmount; fallback dùng effectiveBonus
+            // (= tổng xăng + bonus) khi detail chưa populate — chẳng hạn khi
+            // driverSalaryDetail trả breakdown gộp sẵn trong effectiveBonus.
+            long driverTotalBonus = 0L;
+            if (driverDetail != null) {
+                if (driverDetail.getDriverOrderBonusDetail() != null
+                        && driverDetail.getDriverOrderBonusDetail().getTotalAmount() != null
+                        && driverDetail.getDriverOrderBonusDetail().getTotalAmount() > 0) {
+                    driverTotalBonus = driverDetail.getDriverOrderBonusDetail().getTotalAmount();
+                } else if (driverDetail.getEffectiveBonus() != null) {
+                    driverTotalBonus = driverDetail.getEffectiveBonus();
+                }
+            }
+            b.kpiBonus(driverTotalBonus);
+            b.kpiStatus(driverBonusPublished ? "READY" : "PENDING");
+
+            // (10/2026) PHIẾU LƯƠNG chỉ gồm: Lương CB + Phụ cấp + Thưởng IMPORT.
+            // Thưởng tiền xăng + đơn hàng tài xế đã hiển thị ở CARD RIÊNG
+            // "Thưởng giao hàng tháng N" → phải TRỪ driverKpi100 khỏi netSalary
+            // + effectiveBonus để không bị đếm 2 lần.
+            if (driverDetail != null && driverBonusPublished && driverTotalBonus > 0) {
+                Long eff = driverDetail.getEffectiveBonus();
+                if (eff != null && eff >= driverTotalBonus) {
+                    driverDetail.setEffectiveBonus(eff - driverTotalBonus);
+                    if (driverDetail.getEffectiveBonusKpiOnly() != null) {
+                        driverDetail.setEffectiveBonusKpiOnly(
+                                Math.max(0L, driverDetail.getEffectiveBonusKpiOnly() - driverTotalBonus));
+                    }
+                }
+                Long bonusInput = driverDetail.getBonus();
+                if (bonusInput != null && bonusInput >= driverTotalBonus) {
+                    driverDetail.setBonus(bonusInput - driverTotalBonus);
+                }
+                if (driverDetail.getNetSalary() != null) {
+                    driverDetail.setNetSalary(Math.max(0L, driverDetail.getNetSalary() - driverTotalBonus));
+                }
+                if (driverDetail.getNetSalaryExact() != null) {
+                    driverDetail.setNetSalaryExact(Math.max(0L, driverDetail.getNetSalaryExact() - driverTotalBonus));
+                }
+            }
 
             return b.driver(dm)
                     .status(driverDetail != null ? "READY" : "NO_SALARY")
@@ -444,6 +640,13 @@ public class FactoryPayrollService {
 
         // ── CHI TIẾT LƯƠNG — đúng bộ số liệu OWNER nhìn thấy ─────────────────
         SalaryBreakdownDto detail = hrService.getSalaryBreakdownForUser(user.getId(), month, year);
+        // (10/2026) Attach "Thưởng hỗ trợ giao hàng" cho NV FACTORY/WAREHOUSE
+        // nào có km/trips trong tháng (sau khi Thưởng Tài xế đã Public).
+        //   + gắn luôn DriverMonthDto vào b.driver(...) để FE hiện card
+        //   "Chi tiết số km theo ngày" cho NV hỗ trợ giao hàng.
+        DriverMonthDto supportDm = attachDriverSupportBonusIfAny(user, month, year, detail);
+        if (supportDm != null) b.driver(supportDm);
+        attachSalesSupportBonusIfAny(user, month, year, dept, b);
         b.salaryDetail(detail);
 
         // ── Tóm tắt lương theo hồ sơ (giữ tương thích màn hình cũ) ───────────
@@ -545,11 +748,66 @@ public class FactoryPayrollService {
             }
         }
 
+        // (10/2026) Load ngày lễ của tháng + map tên ngày lễ
+        Set<LocalDate> holidayDates;
+        Map<LocalDate, String> holidayNames = new HashMap<>();
+        try {
+            holidayDates = holidayService.datesOfMonth(month, year);
+            for (com.nhatnam.server.entity.Holiday h : holidayService.entitiesOfMonth(month, year)) {
+                if (h.getDate() != null) holidayNames.put(h.getDate(), h.getName());
+            }
+        } catch (Exception ex) {
+            log.warn("[Attendance] Không load được ngày lễ cho {}/{}: {}", month, year, ex.getMessage());
+            holidayDates = java.util.Set.of();
+        }
+
+        // (10/2026) Load các phiếu nghỉ phép ĐÃ DUYỆT của NV trong tháng.
+        //   • Có FULL_DAY_OFF duyệt → ngày đó = LEAVE (hồng).
+        //   • Nếu ngày thường không chấm công + KHÔNG có phiếu duyệt → UNPAID (xám).
+        Set<Integer> approvedFullDayOff = new HashSet<>();
+        Set<Integer> approvedHalfDay    = new HashSet<>();
+        if (entry != null && entry.getUser() != null) {
+            try {
+                for (com.nhatnam.server.entity.AttendanceLeaveRequest lr :
+                        leaveRepo.findByUser_IdAndYearAndMonth(entry.getUser().getId(), year, month)) {
+                    if (lr == null || !lr.isEffective() || lr.getDay() == null) continue;
+                    com.nhatnam.server.enumtype.AttendanceExceptionType t = lr.getType();
+                    if (t == null) continue;
+                    if (t.isFullDayCredit()) approvedFullDayOff.add(lr.getDay());
+                    else if (t == com.nhatnam.server.enumtype.AttendanceExceptionType.HALF_DAY_MORNING_OFF
+                            || t == com.nhatnam.server.enumtype.AttendanceExceptionType.HALF_DAY_AFTERNOON_OFF)
+                        approvedHalfDay.add(lr.getDay());
+                }
+            } catch (Exception ex) {
+                log.warn("[Attendance] Không load được phiếu nghỉ: {}", ex.getMessage());
+            }
+
+            // (10/2026) BỔ SUNG: ngoài AttendanceLeaveRequest (parse từ file
+            // chấm công), còn phải cộng cả EmployeeRequest (phiếu HR tự tạo)
+            // ĐÃ DUYỆT. Trước đây 2 luồng tách rời khiến "Phiếu nghỉ phép"
+            // trên page HR duyệt rồi mà UI công của NV vẫn hiện "Nghỉ không
+            // lương" + lương ngày đó = 0.
+            try {
+                var dayEffects = employeeRequestService.effectsForUser(
+                        entry.getUser().getId(), month, year);
+                for (var e : dayEffects.entrySet()) {
+                    int day = e.getKey();
+                    var eff = e.getValue();
+                    if (eff == null || eff.zeroDay()) continue;
+                    if (eff.fullDayCredit())    approvedFullDayOff.add(day);
+                    else if (eff.minCredit() > 0) approvedHalfDay.add(day);
+                }
+            } catch (Exception ex) {
+                log.warn("[Attendance] Không load được EmployeeRequest DayEffect: {}", ex.getMessage());
+            }
+        }
+
         List<AttendanceDayDto> days = new ArrayList<>(len);
         for (int d = 1; d <= len; d++) {
             LocalDate date = LocalDate.of(year, month, d);
             int weekday = date.getDayOfWeek() == DayOfWeek.SUNDAY ? 8
                     : date.getDayOfWeek().getValue() + 1;   // T2=2 … T7=7, CN=8
+            boolean isHoliday = holidayDates.contains(date);
 
             Map<String, Object> r = daily.get(d);
 
@@ -562,12 +820,94 @@ public class FactoryPayrollService {
             if (r != null) {
                 double value = r.get("v") instanceof Number n ? n.doubleValue() : 0.0;
                 String type = str(r.get("t"));
+                String inStr  = str(r.get("in"));
+                String outStr = str(r.get("out"));
+
+                // (10/2026) Phase 7 writer (CompanyAttendanceService.serializeDaily)
+                // KHÔNG ghi "v" / "t" vào dailyJson, nên các nhân viên KT/KD/XSX
+                // dù có chấm công vào/ra vẫn hiển thị công=0 và không có màu.
+                // Fallback: tính "value" + "type" từ in/out ngay tại đây.
+                //
+                //   Rule (theo yêu cầu người dùng):
+                //     • Đi đúng giờ, về đúng giờ (chênh ≤ 5 phút)  → WORK, value=1
+                //       (parttime → value=0.5, type=WORK → vẫn tô xanh lá)
+                //     • Trễ hoặc về sớm > 5 phút                   → HALF, value=0.5 → vàng
+                //     • Không có in và out                         → giữ OFF
+                //
+                //   LEAVE / UNPAID / BUSINESS / EXCEPTION sẽ KHÔNG bị override vì
+                //   dailyJson ở các case đó có sẵn "t" (parser đọc ký hiệu P/K/CT).
+                // Suy ra type từ ký hiệu "sym" trước (nghỉ phép / không phép ko có in/out)
+                if ((type == null || type.isBlank())) {
+                    String sym = str(r.get("sym"));
+                    if (sym != null && !sym.isBlank()) {
+                        String up = sym.trim().toUpperCase();
+                        if (up.equals("P") || up.equals("CP") || up.contains("PHÉP") || up.contains("PHEP")) {
+                            type = "LEAVE";
+                            if (value <= 0) value = 1.0;
+                        } else if (up.equals("K") || up.equals("KP") || up.contains("KHÔNG PHÉP") || up.contains("KHONG PHEP")) {
+                            type = "UNPAID";
+                        } else if (up.equals("CT") || up.contains("CÔNG TÁC") || up.contains("CONG TAC")) {
+                            type = "BUSINESS";
+                            if (value <= 0) value = 1.0;
+                        }
+                    }
+                }
+
+                if ((type == null || type.isBlank()) && value <= 0
+                        && (inStr != null || outStr != null)) {
+                    boolean isPartTime = entry != null
+                            && Boolean.TRUE.equals(entry.getPartTime());
+                    LocalTime expectedStart = SHIFT_START;
+                    LocalTime expectedEnd   = isPartTime ? PART_TIME_END : SHIFT_END;
+
+                    LocalTime inTime  = parseHHmmSafe(inStr);
+                    LocalTime outTime = parseHHmmSafe(outStr);
+
+                    int lateMin  = (inTime  != null && inTime.isAfter(expectedStart))
+                            ? (int) java.time.Duration.between(expectedStart, inTime).toMinutes()
+                            : 0;
+                    int earlyMin = (outTime != null && outTime.isBefore(expectedEnd))
+                            ? (int) java.time.Duration.between(outTime, expectedEnd).toMinutes()
+                            : 0;
+
+                    // Có mặt (ít nhất 1 đầu chấm công) → tính công
+                    //   value = 1 - (lateMin + earlyMin) / shiftMinutes
+                    //   TRUNCATE 2 chữ số thập phân (KHÔNG làm tròn lên).
+                    //   VD: trễ 43' → 1 - 43/480 = 0.9104... → 0.91
+                    //       về sớm 8' → 1 - 8/480 = 0.9833... → 0.98
+                    //   Full công tối đa 1.0 (parttime 0.5).
+                    final int GRACE = 5;
+                    double shiftMin = isPartTime
+                            ? java.time.Duration.between(SHIFT_START, PART_TIME_END).toMinutes()
+                            : (java.time.Duration.between(SHIFT_START, SHIFT_END).toMinutes()
+                            - java.time.Duration.between(LUNCH_START, LUNCH_END).toMinutes());
+                    double maxVal = isPartTime ? 0.5 : 1.0;
+
+                    if (inTime != null && outTime != null
+                            && lateMin <= GRACE && earlyMin <= GRACE) {
+                        type  = "WORK";
+                        value = maxVal;
+                    } else if (inTime != null && outTime != null) {
+                        // Trừ công theo tỷ lệ phút trễ + về sớm (truncate 2dp)
+                        double missing = (lateMin + earlyMin) / shiftMin;
+                        double raw = maxVal * Math.max(0.0, 1.0 - missing);
+                        // Truncate (floor) tới 2 chữ số
+                        value = Math.floor(raw * 100.0) / 100.0;
+                        type  = value >= maxVal ? "WORK" : "HALF";
+                    } else {
+                        // Chỉ có 1 đầu chấm công → nửa công
+                        type  = "HALF";
+                        value = Math.min(maxVal, 0.5);
+                    }
+                }
+
+                // Fallback cuối: nếu vẫn chưa có type, suy ra từ value
                 if (type == null || type.isBlank())
                     type = value >= 1 ? "WORK" : value > 0 ? "HALF" : "OFF";
 
                 db.value(value).type(type)
-                        .checkIn(str(r.get("in")))
-                        .checkOut(str(r.get("out")))
+                        .checkIn(inStr)
+                        .checkOut(outStr)
                         .lateMinutes(r.get("late")  instanceof Number n2 ? n2.intValue() : null)
                         .earlyMinutes(r.get("early") instanceof Number n3 ? n3.intValue() : null)
                         .workedMinutes(r.get("wk")   instanceof Number n4 ? n4.intValue() : null)
@@ -576,6 +916,64 @@ public class FactoryPayrollService {
                         .windowStart(str(r.get("ws")))
                         .windowEnd(str(r.get("we")))
                         .sessions(readSessions(r.get("ss")));
+            }
+
+            // (10/2026) Phân loại ngày KHÔNG chấm công theo phiếu nghỉ phép.
+            //   - Có phiếu FULL_DAY_OFF đã duyệt → LEAVE (hồng), value=1 (ko trừ lương).
+            //   - Có phiếu HALF_DAY đã duyệt → LEAVE (hồng), value=0.5.
+            //   - Không có phiếu, và là NGÀY THƯỜNG (không CN, không lễ) →
+            //     UNPAID (xám) → "nghỉ không phép, có trừ lương".
+            //   - CN / Lễ sẽ được override bởi logic phía dưới (SUNDAY / HOLIDAY).
+            {
+                // Lấy value / type HIỆN TẠI từ builder (vì có thể vừa được set phía trên)
+                AttendanceDayDto preview = db.build();
+                boolean noPunch = (preview.getCheckIn() == null || preview.getCheckIn().isBlank())
+                        && (preview.getCheckOut() == null || preview.getCheckOut().isBlank());
+                boolean currentlyOff = "OFF".equals(preview.getType())
+                        || (preview.getValue() == null || preview.getValue() <= 0);
+
+                // (10/2026) Parttime: 1 công hệ thống = 0.5 — cap value để
+                // UI không hiện "1 công" cho ngày paid-leave của parttime.
+                boolean isPartTime = entry != null && Boolean.TRUE.equals(entry.getPartTime());
+                double maxCreditPerDay = isPartTime ? 0.5 : 1.0;
+
+                if (noPunch && currentlyOff) {
+                    boolean isSunday = date.getDayOfWeek() == DayOfWeek.SUNDAY;
+                    if (approvedFullDayOff.contains(d)) {
+                        db.type("LEAVE").value(maxCreditPerDay);
+                    } else if (approvedHalfDay.contains(d)) {
+                        db.type("LEAVE").value(Math.min(0.5, maxCreditPerDay));
+                    } else if (!isSunday && !isHoliday) {
+                        // Ngày thường không chấm công + không có phiếu nghỉ → nghỉ ko phép
+                        db.type("UNPAID").value(0.0);
+                    }
+                } else if (!noPunch && approvedFullDayOff.contains(d)) {
+                    // (10/2026 — Issue 2) Có chấm công + có phiếu nghỉ phép
+                    // CẢ NGÀY/NỬA NGÀY đã duyệt bù vào phần thiếu → ngày này
+                    // đủ công của ngày đó (fulltime 1.0, parttime 0.5), UI tô
+                    // xanh WORK thay vì vàng (nửa công).
+                    double curVal = preview.getValue() != null ? preview.getValue() : 0.0;
+                    if (curVal < maxCreditPerDay) db.value(maxCreditPerDay);
+                    db.type("WORK");
+                }
+            }
+
+            // (10/2026) Override khi là NGÀY LỄ (áp dụng cho mọi NV):
+            //   - type = HOLIDAY → FE tô xanh dương
+            //   - value = 1.0 (full công — luật lao động), KHÔNG trừ lương
+            //   - exception = tên ngày lễ (nếu có) hoặc "Nghỉ lễ theo luật lao động"
+            //   - Giữ nguyên checkIn/checkOut nếu NV vẫn đi làm (tăng ca lễ)
+            if (isHoliday) {
+                db.type("HOLIDAY");
+                // Chỉ bump value lên 1.0 nếu NV ko đi làm; nếu đi làm (value>0),
+                // giữ value hiện tại (có thể >1 do nhân hệ số lễ).
+                Double curVal = null;
+                if (r != null && r.get("v") instanceof Number n) curVal = n.doubleValue();
+                if (curVal == null || curVal <= 0) db.value(1.0);
+                String name = holidayNames.get(date);
+                db.exception(name != null && !name.isBlank()
+                        ? "Nghỉ lễ: " + name
+                        : "Nghỉ lễ theo luật lao động");
             }
 
             days.add(db.build());
@@ -610,6 +1008,20 @@ public class FactoryPayrollService {
     }
 
     @SuppressWarnings("unchecked")
+    /**
+     * Parse "HH:mm" hoặc "HH:mm:ss" → LocalTime; null-safe, không throw.
+     * Dùng trong buildAttendanceSummary để tính công từ chuỗi in/out.
+     */
+    private static LocalTime parseHHmmSafe(String s) {
+        if (s == null || s.isBlank()) return null;
+        try {
+            // LocalTime.parse hỗ trợ cả "HH:mm" và "HH:mm:ss"
+            return LocalTime.parse(s.trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private List<PunchSessionDto> readSessions(Object raw) {
         if (!(raw instanceof List<?> list)) return List.of();
         List<PunchSessionDto> out = new ArrayList<>();
@@ -732,6 +1144,12 @@ public class FactoryPayrollService {
                 .bonusFinalized(s.isBonusFinalized())
                 .bonusFinalizedAt(s.getBonusFinalizedAt())
                 .bonusFinalizedByName(s.getBonusFinalizedByName())
+                // (10/2026) State 3 bước: NONE / CALCULATED / PUBLISHED
+                .bonusCalcStatus(s.getBonusCalcStatus() != null ? s.getBonusCalcStatus().name() : "NONE")
+                .bonusCalculatedAt(s.getBonusCalculatedAt())
+                .bonusCalculatedByName(s.getBonusCalculatedByName())
+                .bonusPublishedAt(s.getBonusPublishedAt())
+                .bonusPublishedByName(s.getBonusPublishedByName())
                 .hasSalesBonus(d == PayrollDepartment.SALES || d == PayrollDepartment.ACCOUNTING)
                 .build();
     }
@@ -2078,6 +2496,37 @@ public class FactoryPayrollService {
                 .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.DRIVER)
                 .orElse(null);
 
+        // (10/2026) CACHE HIT: nếu sheet có driverBonusCachedJson (được tạo
+        // ngay sau khi OWNER bấm "Tính thưởng"), parse & return ngay — không
+        // tính lại. Giảm từ ~2.5s xuống <50ms vì bỏ qua query driver_km +
+        // orders + attendance_entry.
+        if (sheet != null && sheet.getDriverBonusCachedJson() != null
+                && !sheet.getDriverBonusCachedJson().isBlank()) {
+            try {
+                return MAPPER.readValue(sheet.getDriverBonusCachedJson(),
+                        DriverPayrollConfigDto.class);
+            } catch (Exception e) {
+                log.warn("[Payroll] Cache driver bonus bị corrupt {}/{}: {} — fallback tính live",
+                        month, year, e.getMessage());
+                // Rơi xuống nhánh tính live bên dưới.
+            }
+        }
+
+        return computeDriverPayrollConfigLive(month, year);
+    }
+
+    /**
+     * (10/2026) Tính driver payroll config LIVE — tách khỏi
+     * {@link #driverPayrollConfig(int, int)} để {@link #calculateDriverBonus}
+     * có thể gọi trực tiếp để lấy snapshot cache mà không chạy cache-check
+     * (vì mục tiêu là tạo cache mới, cache cũ không còn ý nghĩa).
+     */
+    @Transactional(readOnly = true)
+    public DriverPayrollConfigDto computeDriverPayrollConfigLive(int month, int year) {
+        AttendanceSheet sheet = sheetRepo
+                .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.DRIVER)
+                .orElse(null);
+
         Long gasPrice = sheet != null ? sheet.getDriverGasPrice() : null;
         Long bonusMoto = sheet != null ? sheet.getDriverBonusUnitPrice() : null;
         Long bonusTruck = sheet != null ? sheet.getDriverTruckBonusUnitPrice() : null;
@@ -2086,7 +2535,29 @@ public class FactoryPayrollService {
         // Bao gồm CẢ tài xế đang bị khoá tài khoản: lương tài xế = số km × giá
         // xăng + số lượt × đơn giá, dựa trên công việc THỰC TẾ đã làm. Tài khoản
         // bị khoá không phải lý do để trừ lương cho phần đã chạy.
-        List<User> drivers = deptResolver.employeesWithLockedOf(PayrollDepartment.DRIVER);
+        List<User> allDrivers = deptResolver.employeesWithLockedOf(PayrollDepartment.DRIVER);
+
+        // (10/2026) Tách thành 2 nhóm theo chức vụ:
+        //   • Tài xế xe máy (position != "Tài xế xe tải"): tính theo km × giá xăng
+        //     + lượt × đơn giá. VẪN được tính lượt xe tải nếu kiêm (dm.vehicleType=BOTH).
+        //   • Tài xế xe tải (position == "Tài xế xe tải"): thưởng CỐ ĐỊNH, không
+        //     tính theo lượt. Fetch số đã lưu ở TruckDriverFixedBonus.
+        //
+        // Legacy data (position = "Tài xế giao nhận" hoặc rỗng) được coi là tài
+        // xế xe máy để không phá vỡ dữ liệu cũ.
+        java.util.Map<Long, Long> fixedBonusByUser = new java.util.HashMap<>();
+        truckDriverFixedBonusRepo.findByMonthAndYear(month, year).forEach(fb -> {
+            if (fb.getUser() != null)
+                fixedBonusByUser.put(fb.getUser().getId(), fb.getAmount() != null ? fb.getAmount() : 0L);
+        });
+
+        List<User> drivers        = new ArrayList<>();
+        List<User> truckDrivers   = new ArrayList<>();
+        for (User u : allDrivers) {
+            if (isTruckDriverPosition(u.getPosition())) truckDrivers.add(u);
+            else                                        drivers.add(u);
+        }
+
         List<DriverSalaryRowDto> rows = new ArrayList<>();
         long grand = 0;
 
@@ -2130,8 +2601,10 @@ public class FactoryPayrollService {
 
             Long grandForDriver = null;
             if ((moto == null || moto.getTotalSalary() != null)
-                    && (truck == null || truck.getTotalSalary() != null))
-                grandForDriver = motoTotal + truckTotal;
+                    && (truck == null || truck.getTotalSalary() != null)) {
+                // (10/2026) Làm tròn LÊN bước 5.000
+                grandForDriver = roundUpTo(motoTotal + truckTotal, 5_000L);
+            }
             if (grandForDriver != null) grand += grandForDriver;
 
             rows.add(DriverSalaryRowDto.builder()
@@ -2145,8 +2618,31 @@ public class FactoryPayrollService {
         }
 
         // ── Nhân viên NGOÀI bộ phận Tài xế có hoạt động giao hàng ──────────
+        //
+        // (10/2026) FIX: PHẢI loại trừ CẢ allDrivers (gồm xe máy + xe tải) khỏi
+        // nhóm "hỗ trợ giao hàng". Trước đây chỉ loại `drivers` (xe máy) → tài
+        // xế xe tải vẫn lọt vào bảng HỖ TRỢ GIAO HÀNG nếu có hoạt động ODO/đơn
+        // trong tháng. Tài xế xe tải đã có section riêng với thưởng cố định,
+        // không được hiện thêm ở nhóm hỗ trợ.
         List<DriverSalaryRowDto> nonDriverRows = buildNonDriverRows(
-                month, year, gasPrice, bonusMoto, bonusTruck, drivers);
+                month, year, gasPrice, bonusMoto, bonusTruck, allDrivers);
+
+        // ── (10/2026) Tài xế xe tải — thưởng cố định ───────────────────────
+        List<DriverSalaryRowDto> truckDriverRows = new ArrayList<>();
+        for (User u : truckDrivers) {
+            long fixed = fixedBonusByUser.getOrDefault(u.getId(), 0L);
+            truckDriverRows.add(DriverSalaryRowDto.builder()
+                    .userId(u.getId())
+                    .driverName(u.getFullName())
+                    .vehicleType("TRUCK_FIXED")
+                    .truckDriver(true)
+                    .fixedTruckBonus(fixed)
+                    .grandTotalSalary(fixed)         // = fixed, không round
+                    .position(u.getPosition())
+                    .motorbike(null).truck(null)      // emdash tất cả cột tính theo lượt
+                    .build());
+            grand += fixed;
+        }
 
         return DriverPayrollConfigDto.builder()
                 .month(month).year(year)
@@ -2158,8 +2654,52 @@ public class FactoryPayrollService {
                 .finalizedByName(sheet != null ? sheet.getFinalizedByName() : null)
                 .grandTotalSalary(grand)
                 .rows(rows)
+                .truckDriverRows(truckDriverRows)
                 .nonDriverRows(nonDriverRows)
                 .build();
+    }
+
+    /**
+     * (10/2026) Chức vụ "Tài xế xe tải" → nhận thưởng cố định, không tính lượt.
+     * Legacy "Tài xế giao nhận" / null được coi là xe máy để không phá dữ liệu cũ.
+     * Compare không phân biệt hoa thường + trim.
+     */
+    private static boolean isTruckDriverPosition(String position) {
+        if (position == null) return false;
+        return position.trim().equalsIgnoreCase("Tài xế xe tải");
+    }
+
+    /** (10/2026) Upsert thưởng cố định tài xế xe tải cho 1 user/tháng. */
+    @Transactional
+    public void upsertTruckDriverFixedBonus(Long userId, int month, int year, long amount) {
+        if (userId == null) throw new IllegalArgumentException("userId null");
+        if (amount < 0) throw new IllegalArgumentException("Thưởng cố định không âm");
+        User u = userRepo.findById(userId)
+                .orElseThrow(() -> new IllegalArgumentException("Không tìm thấy user " + userId));
+        if (!isTruckDriverPosition(u.getPosition()))
+            throw new IllegalArgumentException(
+                    "User " + u.getFullName() + " không có chức vụ 'Tài xế xe tải' — không nhập được thưởng cố định.");
+
+        com.nhatnam.server.entity.TruckDriverFixedBonus row =
+                truckDriverFixedBonusRepo.findByUser_IdAndMonthAndYear(userId, month, year)
+                        .orElseGet(() -> com.nhatnam.server.entity.TruckDriverFixedBonus.builder()
+                                .user(u).month(month).year(year).amount(0L).build());
+        row.setAmount(amount);
+        truckDriverFixedBonusRepo.save(row);
+    }
+
+    /**
+     * (10/2026) Upsert BATCH — gọi khi OWNER bấm "Tính thưởng" trong modal
+     * với toàn bộ list thưởng cố định cho từng tài xế xe tải cùng lúc.
+     * Entry với amount null bị bỏ qua.
+     */
+    @Transactional
+    public void upsertTruckDriverFixedBonuses(int month, int year,
+                                              java.util.Map<Long, Long> amountByUserId) {
+        if (amountByUserId == null || amountByUserId.isEmpty()) return;
+        amountByUserId.forEach((uid, amt) -> {
+            if (uid != null && amt != null) upsertTruckDriverFixedBonus(uid, month, year, amt);
+        });
     }
 
     /**
@@ -2213,7 +2753,7 @@ public class FactoryPayrollService {
             Long grandTotal = null;
             if ((moto == null || moto.getTotalSalary() != null)
                     && (truck == null || truck.getTotalSalary() != null))
-                grandTotal = motoTotal + truckTotal;
+                grandTotal = roundUpTo(motoTotal + truckTotal, 5_000L);
 
             result.add(DriverSalaryRowDto.builder()
                     .userId(u.getId())
@@ -2258,6 +2798,53 @@ public class FactoryPayrollService {
 
         // Không tính lại phụ cấp xăng ngay — sẽ tính khi OWNER bấm "Hoàn tất KPI"
         return driverPayrollConfig(month, year);
+    }
+
+    /**
+     * (10/2026) TÍNH THƯỞNG TÀI XẾ — flow mới 3-state giống KT/KD.
+     *
+     * <p>Lưu 3 config (gas + 2 unit prices) vào sheet DRIVER + đánh dấu
+     * {@code bonusCalcStatus = CALCULATED}. Nhân viên tài xế CHƯA thấy thưởng
+     * cho đến khi OWNER bấm "Hoàn tất" (= Public → publishBonus).
+     *
+     * <p>KHÁC với {@link #saveDriverPayrollConfig}: không reset KPI finalized —
+     * flow mới dùng bonusCalcStatus thay cho kpiFinalized để quyết định visibility.
+     */
+    @Transactional
+    public AttendanceSheetDto calculateDriverBonus(int month, int year,
+                                                   Long gasPrice, Long bonusUnitPrice, Long truckBonusUnitPrice, User actor) {
+        validatePastOrCurrentPeriod(month, year);
+        if (gasPrice == null || gasPrice < 0) throw new IllegalArgumentException("Giá xăng không hợp lệ.");
+        if (bonusUnitPrice == null || bonusUnitPrice < 0)
+            throw new IllegalArgumentException("Đơn giá thưởng xe máy không hợp lệ.");
+        if (truckBonusUnitPrice == null || truckBonusUnitPrice < 0)
+            throw new IllegalArgumentException("Đơn giá thưởng xe tải không hợp lệ.");
+
+        AttendanceSheet sheet = sheetOf(month, year, PayrollDepartment.DRIVER);
+        sheet.setDriverGasPrice(gasPrice);
+        sheet.setDriverBonusUnitPrice(bonusUnitPrice);
+        sheet.setDriverTruckBonusUnitPrice(truckBonusUnitPrice);
+        // Đánh dấu CALCULATED — chưa Public cho tài xế thấy.
+        sheet.markBonusCalculated(actor != null ? actor.getFullName() : "system");
+        // (10/2026) Clear cache cũ trước khi tính mới — driverPayrollConfig sẽ
+        // tính lại live và tự cache lại qua đường dẫn miss cache ở dưới.
+        sheet.setDriverBonusCachedJson(null);
+        sheetRepo.save(sheet);
+
+        // Compute rows LIVE 1 lần + cache vào JSON để các lần load sau đọc cache.
+        try {
+            DriverPayrollConfigDto freshRows = computeDriverPayrollConfigLive(month, year);
+            String cached = MAPPER.writeValueAsString(freshRows);
+            sheet.setDriverBonusCachedJson(cached);
+            sheetRepo.save(sheet);
+        } catch (Exception ex) {
+            log.warn("[Payroll] Không cache được driver rows cho {}/{}: {}", month, year, ex.getMessage());
+        }
+
+        log.info("[Payroll] TÍNH THƯỞNG TÀI XẾ {}/{} bởi {} (gas={}, moto={}, truck={})",
+                month, year, actor != null ? actor.getFullName() : "system",
+                gasPrice, bonusUnitPrice, truckBonusUnitPrice);
+        return toSheetDto(sheet);
     }
 
     /** Nhãn phụ cấp xăng xe tự động cho nhân viên ngoài bộ phận Tài xế. */
@@ -2425,7 +3012,10 @@ public class FactoryPayrollService {
         //   duy nhất "Thưởng KPI — đạt 100%" trên phiếu lương, thay vì tách gas
         //   ra allowances và orderBonus lên riêng. Card chi tiết bên dưới (do FE
         //   render từ driverOrderBonusDetail) vẫn giữ đủ 3 hạng mục.
-        long driverKpi100 = gasAllowance + orderBonus; // = gas + moto + truck
+        long driverKpi100Raw = gasAllowance + orderBonus; // = gas + moto + truck
+        // (10/2026 — user request) Làm tròn LÊN theo bước 5.000 cho tổng thưởng
+        // giao hàng cuối cùng. VD 204.584 → 205.000.
+        long driverKpi100 = roundUpTo(driverKpi100Raw, 5_000L);
 
         com.nhatnam.server.dto.hr.HrDtos.DriverOrderBonusDto orderBonusDetail = null;
         if (driverKpi100 > 0) {
@@ -2512,6 +3102,98 @@ public class FactoryPayrollService {
             return String.format(java.util.Locale.GERMANY, "%,d", n.longValue());
         }
         return String.format(java.util.Locale.GERMANY, "%,.1f", d);
+    }
+
+    /**
+     * (10/2026) Nếu NV này có hỗ trợ giao hàng (km/trips > 0 trong tháng) VÀ
+     * Thưởng Tài xế đã Public → compute "phụ cấp xăng + bonus đơn hàng" như
+     * driverSalaryDetail làm cho tài xế chính, rồi attach vào
+     * {@code salaryDetail.driverOrderBonusDetail} để FE hiển thị card
+     * "Thưởng hỗ trợ giao hàng" trên phiếu lương của họ.
+     *
+     * <p>No-op nếu đã có detail sẵn (NV tài xế chính), DRIVER sheet chưa Public,
+     * hoặc tháng này không có km/trips.
+     */
+    /**
+     * Trả về {@link DriverMonthDto} (daily km/trips breakdown) để caller gắn
+     * vào {@code b.driver(dm)} — FE hiển thị card "Chi tiết số km theo ngày"
+     * cho NV hỗ trợ giao hàng. Trả null nếu NV không có km/trips hoặc tháng
+     * tài xế chưa publish bonus.
+     */
+    /**
+     * (10/2026) Attach "Thưởng HỖ TRỢ BÁN HÀNG" cho NV ko thuộc SALES nhưng
+     * có đơn trong tháng. Flow:
+     *   • Skip nếu NV đã thuộc SALES (bonus chính của họ, không phải "hỗ trợ").
+     *   • Skip nếu sheet SALES chưa Public.
+     *   • Query office_bonus_item (dept=SALES, user_id, month, year) → nếu có
+     *     bonus_amount > 0 → set salesSupportBonus + salesSupportRevenue.
+     */
+    private void attachSalesSupportBonusIfAny(User user, int month, int year,
+                                              PayrollDepartment dept, MyPayslipDto.MyPayslipDtoBuilder b) {
+        if (dept == PayrollDepartment.SALES) return;  // đã là bonus chính
+        AttendanceSheet salesSheet = sheetRepo
+                .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.SALES)
+                .orElse(null);
+        if (salesSheet == null) return;
+        boolean salesPub = salesSheet.isBonusFinalized()
+                || salesSheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+        if (!salesPub) return;
+
+        Long bonus = officeBonusResultRepo.sumBonusForUser(month, year,
+                PayrollDepartment.SALES, user.getId());
+        if (bonus == null || bonus <= 0) return;
+        b.salesSupportBonus(bonus);
+
+        // Snapshot doanh thu chia hoa hồng (ex-VAT) cá nhân để hiển thị trên card
+        java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+        long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+        long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+        java.math.BigDecimal rev = nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, user.getId()));
+        b.salesSupportRevenue(rev.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact());
+    }
+
+    private DriverMonthDto attachDriverSupportBonusIfAny(User user, int month, int year, SalaryBreakdownDto detail) {
+        if (detail == null) return null;
+        if (detail.getDriverOrderBonusDetail() != null
+                && detail.getDriverOrderBonusDetail().getTotalAmount() != null
+                && detail.getDriverOrderBonusDetail().getTotalAmount() > 0) return null;
+
+        AttendanceSheet driverSheet = sheetRepo
+                .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.DRIVER)
+                .orElse(null);
+        if (driverSheet == null) return null;
+        boolean driverBonusPub = driverSheet.isBonusFinalized()
+                || driverSheet.isKpiFinalized()
+                || driverSheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+        if (!driverBonusPub) return null;
+
+        Long gasPrice   = driverSheet.getDriverGasPrice();
+        Long bonusMoto  = driverSheet.getDriverBonusUnitPrice();
+        Long bonusTruck = driverSheet.getDriverTruckBonusUnitPrice();
+
+        DriverMonthDto dm;
+        try { dm = driverKmService.monthOf(user, month, year); }
+        catch (Exception e) { return null; }
+        if (dm == null) return null;
+
+        double km = dm.getTotalKm() != null ? dm.getTotalKm() : 0;
+        int tripsMoto = dm.getTotalTripsMotorbike() != null ? dm.getTotalTripsMotorbike() : 0;
+        int tripsTruck = dm.getTotalTripsTruck() != null ? dm.getTotalTripsTruck() : 0;
+        long gasAllowance = gasPrice != null ? Math.round(km * gasPrice) : 0L;
+        long orderBonusMoto = bonusMoto != null ? (long) tripsMoto * bonusMoto : 0L;
+        long orderBonusTruck = bonusTruck != null ? (long) tripsTruck * bonusTruck : 0L;
+        long totalRaw = gasAllowance + orderBonusMoto + orderBonusTruck;
+        if (totalRaw <= 0) return null;
+        // (10/2026) Làm tròn LÊN theo bước 5.000 cho đồng bộ với tài xế
+        long total = roundUpTo(totalRaw, 5_000L);
+
+        detail.setDriverOrderBonusDetail(com.nhatnam.server.dto.hr.HrDtos.DriverOrderBonusDto.builder()
+                .motorbikeTrips(tripsMoto).motorbikeAmount(orderBonusMoto)
+                .truckTrips(tripsTruck).truckAmount(orderBonusTruck)
+                .gasKm(km).gasPrice(gasPrice).gasAmount(gasAllowance)
+                .totalAmount(total)
+                .build());
+        return dm;
     }
 
     /** Mở lại tháng đã hoàn tất (nhân viên quay về trạng thái "Đang xử lý lương"). */
@@ -2609,7 +3291,11 @@ public class FactoryPayrollService {
                     .division(u.getDivision())
                     .kpiBonus(kpiAmount)
                     .attendanceExempt(exempt)
-                    .hasAttendance(e != null);
+                    .hasAttendance(e != null)
+                    // (10/2026) Owner yêu cầu: ai thai sản thì bảng lương
+                    // hiển thị "Đang nghỉ thai sản theo chế độ" merged, FE
+                    // dựa vào cờ này để ẩn số liệu công/phụ cấp/thưởng.
+                    .maternityLeave(com.nhatnam.server.service.FactoryKpiService.isMaternityLeave(u));
 
             if (s != null) {
                 rb.salaryStatus(s.getStatus())
@@ -2956,6 +3642,493 @@ public class FactoryPayrollService {
     }
 
     private static String str(Object o) { return o != null ? String.valueOf(o) : null; }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // BONUS TREND — biến động thưởng 12 tháng (10/2026)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Trend 12 tháng gần nhất cho 1 phòng.
+     * KHÔNG tính lại — chỉ đọc data đã lưu (office_bonus_result, sales_bonus_override,
+     * factory_kpi_bonus, attendance_sheet.driver_bonus_cached_json).
+     */
+    @Transactional(readOnly = true)
+    public BonusTrendDto getBonusTrend(PayrollDepartment dept) {
+        // (10/2026) Hiển thị 12 tháng, cột phải nhất = THÁNG HIỆN TẠI − 1
+        // (thưởng tháng hiện tại chưa tính xong).
+        java.time.YearMonth newest = java.time.YearMonth.now(VN).minusMonths(1);
+        java.time.YearMonth start  = newest.minusMonths(11);
+
+        List<BonusTrendMonthDto> months = new ArrayList<>(12);
+        Map<Long, BonusTrendUserDto> userIndex = new LinkedHashMap<>();
+
+        for (int i = 0; i < 12; i++) {
+            java.time.YearMonth ym = start.plusMonths(i);
+            int m = ym.getMonthValue(); int y = ym.getYear();
+            Map<String, Object> stats = new LinkedHashMap<>();
+            boolean hasData = false;
+
+            switch (dept) {
+                case SALES -> hasData = buildSalesTrendMonth(m, y, stats, userIndex);
+                case ACCOUNTING -> hasData = buildOfficeTrendMonth(m, y, PayrollDepartment.ACCOUNTING, stats, userIndex);
+                case DRIVER -> hasData = buildDriverTrendMonth(m, y, stats, userIndex);
+                case FACTORY -> hasData = buildFactoryTrendMonth(m, y, stats, userIndex);
+                case WAREHOUSE -> hasData = buildWarehouseTrendMonth(m, y, stats, userIndex);
+            }
+
+            months.add(BonusTrendMonthDto.builder()
+                    .month(m).year(y)
+                    .stats(stats)
+                    .published(hasData)
+                    .build());
+        }
+
+        // Enrich: xác định isSupport + roleRank cho mỗi user theo dept đang xem
+        List<BonusTrendUserDto> users = new ArrayList<>(userIndex.values());
+        for (BonusTrendUserDto bu : users) {
+            User u = userRepo.findById(bu.getUserId()).orElse(null);
+            if (u == null) continue;
+            PayrollDepartment userDept = deptResolver.departmentOf(u);
+            boolean isSupport = userDept != null && userDept != dept;
+            bu.setSupport(isSupport);
+            if (isSupport) {
+                bu.setSupportLabel(switch (dept) {
+                    case SALES -> "hỗ trợ bán hàng";
+                    case DRIVER -> "hỗ trợ giao hàng";
+                    case FACTORY -> "hỗ trợ sản xuất";
+                    case ACCOUNTING -> "hỗ trợ kế toán";
+                    case WAREHOUSE -> "hỗ trợ kho";
+                });
+                bu.setRoleRank(9999);  // support staff đẩy xuống cuối
+            } else {
+                bu.setRoleRank(roleSortOrderIn(dept, u));
+            }
+        }
+
+        // Sort: non-support theo roleRank ASC, tie-break latest-month DESC
+        //       → sau đó support cuối cùng, sort theo latest-month DESC
+        String lastKey = ymKey(newest.getMonthValue(), newest.getYear());
+        users.sort((a, b) -> {
+            boolean sA = Boolean.TRUE.equals(a.getSupport());
+            boolean sB = Boolean.TRUE.equals(b.getSupport());
+            if (sA != sB) return sA ? 1 : -1;
+            if (!sA) {
+                // Non-support: role rank asc
+                int cmp = Integer.compare(
+                        a.getRoleRank() != null ? a.getRoleRank() : 9999,
+                        b.getRoleRank() != null ? b.getRoleRank() : 9999);
+                if (cmp != 0) return cmp;
+            }
+            // Tie-break (hoặc support): latest-month desc
+            long aLast = a.getAmountsByMonth() != null && a.getAmountsByMonth().get(lastKey) != null
+                    ? a.getAmountsByMonth().get(lastKey) : 0L;
+            long bLast = b.getAmountsByMonth() != null && b.getAmountsByMonth().get(lastKey) != null
+                    ? b.getAmountsByMonth().get(lastKey) : 0L;
+            if (aLast != bLast) return Long.compare(bLast, aLast);
+            return (a.getFullName() != null ? a.getFullName() : "")
+                    .compareTo(b.getFullName() != null ? b.getFullName() : "");
+        });
+
+        return BonusTrendDto.builder()
+                .department(dept.name())
+                .departmentLabel(dept.getLabel())
+                .months(months)
+                .users(users)
+                .build();
+    }
+
+    private String ymKey(int month, int year) {
+        return String.format("%d-%02d", year, month);
+    }
+
+    /**
+     * BONUS SUMMARY — tổng hợp thưởng 12 tháng, group theo phòng → sort chức vụ.
+     * Mỗi NV = SUM thưởng từ TẤT CẢ nguồn (nếu NV kiêm hỗ trợ liên phòng).
+     */
+    @Transactional(readOnly = true)
+    public BonusSummaryDto getBonusSummary() {
+        // Thứ tự phòng theo yêu cầu: KD → SX → KT → Kho → TX
+        PayrollDepartment[] DEPT_ORDER = {
+                PayrollDepartment.SALES,
+                PayrollDepartment.FACTORY,
+                PayrollDepartment.ACCOUNTING,
+                PayrollDepartment.WAREHOUSE,
+                PayrollDepartment.DRIVER,
+        };
+
+        // 1) Lấy trend từng phòng → gộp amount per user
+        Map<Long, Map<String, Long>> userTotals = new LinkedHashMap<>();  // userId → monthKey → sum
+        List<BonusTrendMonthDto> monthsRef = null;
+
+        for (PayrollDepartment d : DEPT_ORDER) {
+            BonusTrendDto t = getBonusTrend(d);
+            if (monthsRef == null) monthsRef = t.getMonths();
+            for (BonusTrendUserDto u : t.getUsers()) {
+                if (u.getUserId() == null || u.getAmountsByMonth() == null) continue;
+                Map<String, Long> totals = userTotals.computeIfAbsent(u.getUserId(),
+                        k -> new LinkedHashMap<>());
+                u.getAmountsByMonth().forEach((k, v) -> {
+                    if (v != null && v > 0) totals.merge(k, v, Long::sum);
+                });
+            }
+        }
+
+        // 2) Group users theo PHÒNG CHÍNH + sort theo role rank
+        Map<PayrollDepartment, List<BonusTrendUserDto>> byDept = new LinkedHashMap<>();
+        for (PayrollDepartment d : DEPT_ORDER) byDept.put(d, new ArrayList<>());
+        List<BonusTrendUserDto> orphans = new ArrayList<>();
+
+        for (Map.Entry<Long, Map<String, Long>> en : userTotals.entrySet()) {
+            Long uid = en.getKey();
+            User u = userRepo.findById(uid).orElse(null);
+            if (u == null) continue;
+            PayrollDepartment mainDept = deptResolver.departmentOf(u);
+            BonusTrendUserDto row = BonusTrendUserDto.builder()
+                    .userId(uid)
+                    .fullName(u.getFullName())
+                    .roleLabel(deptResolver.roleLabelOf(u))
+                    .deleted(u.isDeleted())
+                    .locked(u.isLockAccount())
+                    .amountsByMonth(en.getValue())
+                    .roleRank(mainDept != null ? roleSortOrderIn(mainDept, u) : 9999)
+                    .build();
+            if (mainDept != null && byDept.containsKey(mainDept)) byDept.get(mainDept).add(row);
+            else orphans.add(row);
+        }
+
+        // Sort trong từng phòng theo roleRank asc, tie-break theo tên
+        for (List<BonusTrendUserDto> list : byDept.values()) {
+            list.sort((a, b) -> {
+                int cmp = Integer.compare(a.getRoleRank() != null ? a.getRoleRank() : 9999,
+                        b.getRoleRank() != null ? b.getRoleRank() : 9999);
+                if (cmp != 0) return cmp;
+                return (a.getFullName() != null ? a.getFullName() : "")
+                        .compareTo(b.getFullName() != null ? b.getFullName() : "");
+            });
+        }
+
+        // 3) Build groups + totals
+        List<BonusSummaryGroupDto> groups = new ArrayList<>();
+        Map<String, Long> grandTotals = new LinkedHashMap<>();
+        for (PayrollDepartment d : DEPT_ORDER) {
+            List<BonusTrendUserDto> rows = byDept.get(d);
+            Map<String, Long> deptTotals = new LinkedHashMap<>();
+            for (BonusTrendUserDto r : rows) {
+                r.getAmountsByMonth().forEach((k, v) -> {
+                    deptTotals.merge(k, v, Long::sum);
+                    grandTotals.merge(k, v, Long::sum);
+                });
+            }
+            groups.add(BonusSummaryGroupDto.builder()
+                    .department(d.name())
+                    .departmentLabel(d.getLabel())
+                    .users(rows)
+                    .totalsByMonth(deptTotals)
+                    .build());
+        }
+
+        return BonusSummaryDto.builder()
+                .months(monthsRef != null ? monthsRef : new ArrayList<>())
+                .groups(groups)
+                .grandTotalsByMonth(grandTotals)
+                .build();
+    }
+
+    private BonusTrendUserDto ensureUser(Map<Long, BonusTrendUserDto> idx, User u) {
+        if (u == null) return null;
+        return idx.computeIfAbsent(u.getId(), id -> BonusTrendUserDto.builder()
+                .userId(u.getId())
+                .fullName(u.getFullName())
+                .roleLabel(deptResolver.roleLabelOf(u))
+                .deleted(u.isDeleted())
+                .locked(u.isLockAccount())
+                .amountsByMonth(new LinkedHashMap<>())
+                .build());
+    }
+
+    private boolean buildSalesTrendMonth(int month, int year,
+                                         Map<String, Object> stats,
+                                         Map<Long, BonusTrendUserDto> userIndex) {
+        AttendanceSheet sheet = sheetRepo
+                .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.SALES)
+                .orElse(null);
+        if (sheet != null) {
+            if (sheet.getSalesBonusDeptRevenue() != null) stats.put("deptRevenue", sheet.getSalesBonusDeptRevenue());
+            if (sheet.getSalesBonusTarget() != null) stats.put("target", sheet.getSalesBonusTarget());
+            if (sheet.getSalesBonusStepUnitPrice() != null) stats.put("stepUnitPrice", sheet.getSalesBonusStepUnitPrice());
+            if (sheet.getSalesBonusStepAmount() != null) stats.put("stepAmount", sheet.getSalesBonusStepAmount());
+        }
+        List<SalesBonusOverride> overrides = salesBonusOverrideRepo.findByMonthAndYear(month, year);
+        if (overrides.isEmpty()) return false;
+        long pool = 0L;
+        for (SalesBonusOverride ov : overrides) {
+            if (ov.getUser() == null || ov.getTotalBonus() == null || ov.getTotalBonus() <= 0) continue;
+            BonusTrendUserDto u = ensureUser(userIndex, ov.getUser());
+            if (u != null) u.getAmountsByMonth().put(ymKey(month, year), ov.getTotalBonus());
+            pool += ov.getTotalBonus();
+        }
+        stats.put("totalPool", pool);
+        return true;
+    }
+
+    private boolean buildOfficeTrendMonth(int month, int year, PayrollDepartment dept,
+                                          Map<String, Object> stats,
+                                          Map<Long, BonusTrendUserDto> userIndex) {
+        OfficeBonusResult result = officeBonusResultRepo
+                .findByMonthAndYearAndDepartment(month, year, dept)
+                .orElse(null);
+        if (result == null) return false;
+
+        if (result.getTotalRevenue() != null)
+            stats.put("deptRevenue", result.getTotalRevenue().setScale(0, RoundingMode.HALF_UP).longValueExact());
+        if (result.getTotalBonusPool() != null)
+            stats.put("totalPool", result.getTotalBonusPool());
+        // (10/2026) ACCOUNTING: thêm commissionPercent dept-wide
+        if (dept == PayrollDepartment.ACCOUNTING && result.getAccountingPercent() != null)
+            stats.put("commissionPercent", result.getAccountingPercent().doubleValue());
+
+        String key = ymKey(month, year);
+        for (OfficeBonusItem item : result.getItems()) {
+            if (item.getUser() == null || item.getBonusAmount() == null || item.getBonusAmount() <= 0) continue;
+            BonusTrendUserDto u = ensureUser(userIndex, item.getUser());
+            if (u != null) {
+                u.getAmountsByMonth().put(key, item.getBonusAmount());
+                // Per-user ratioPercent chỉ hiện cho ACCOUNTING
+                if (dept == PayrollDepartment.ACCOUNTING && item.getRatioPercent() != null) {
+                    if (u.getRatioByMonth() == null) u.setRatioByMonth(new LinkedHashMap<>());
+                    u.getRatioByMonth().put(key, item.getRatioPercent().doubleValue());
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean buildDriverTrendMonth(int month, int year,
+                                          Map<String, Object> stats,
+                                          Map<Long, BonusTrendUserDto> userIndex) {
+        AttendanceSheet sheet = sheetRepo
+                .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.DRIVER)
+                .orElse(null);
+        boolean published = sheet != null && (sheet.isBonusFinalized()
+                || sheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED);
+        if (sheet != null) {
+            if (sheet.getDriverGasPrice() != null) stats.put("gasPrice", sheet.getDriverGasPrice());
+            if (sheet.getDriverBonusUnitPrice() != null) stats.put("bikeUnitPrice", sheet.getDriverBonusUnitPrice());
+            if (sheet.getDriverTruckBonusUnitPrice() != null) stats.put("truckUnitPrice", sheet.getDriverTruckBonusUnitPrice());
+        }
+        if (sheet == null || sheet.getDriverBonusCachedJson() == null
+                || sheet.getDriverBonusCachedJson().isBlank()) return false;
+
+        try {
+            DriverPayrollConfigDto cfg = MAPPER.readValue(sheet.getDriverBonusCachedJson(),
+                    DriverPayrollConfigDto.class);
+            long pool = 0L;
+            java.util.List<DriverSalaryRowDto> all = new java.util.ArrayList<>();
+            if (cfg.getRows() != null) all.addAll(cfg.getRows());
+            if (cfg.getNonDriverRows() != null) all.addAll(cfg.getNonDriverRows());
+            for (DriverSalaryRowDto row : all) {
+                if (row.getUserId() == null) continue;
+                long raw = row.getGrandTotalSalary() != null ? row.getGrandTotalSalary() : 0L;
+                // (10/2026) Làm tròn LÊN bước 5.000
+                long amount = roundUpTo(raw, 5_000L);
+                if (amount <= 0) continue;
+                User u = userRepo.findById(row.getUserId()).orElse(null);
+                if (u == null) continue;
+                BonusTrendUserDto d = ensureUser(userIndex, u);
+                if (d != null) d.getAmountsByMonth().put(ymKey(month, year), amount);
+                pool += amount;
+            }
+            stats.put("totalPool", pool);
+        } catch (Exception e) {
+            log.warn("[Trend] Parse driver cache {}/{} lỗi: {}", month, year, e.getMessage());
+            return false;
+        }
+        return published;
+    }
+
+    /**
+     * (10/2026) Warehouse Trend — luôn hiển thị TẤT CẢ NV phòng Kho (ko tính thưởng),
+     * amount lấy từ warehouse_bonus (OWNER nhập tay).
+     */
+    private boolean buildWarehouseTrendMonth(int month, int year,
+                                             Map<String, Object> stats,
+                                             Map<Long, BonusTrendUserDto> userIndex) {
+        // Luôn thêm toàn bộ NV phòng Kho vào index (kể cả tháng ko có thưởng)
+        List<User> whMembers = deptResolver.employeesOf(PayrollDepartment.WAREHOUSE);
+        for (User u : whMembers) ensureUser(userIndex, u);
+
+        // (10/2026) Hiển thị amount cả draft (CALCULATED) + PUBLISHED
+        //   (NV chỉ thấy phiếu khi PUBLISHED — xem getMyPayslip, nhưng admin
+        //   biến động muốn thấy cả nháp để kiểm tra).
+        long pool = 0L;
+        for (WarehouseBonus wb : warehouseBonusRepo.findByMonthAndYear(month, year)) {
+            if (wb.getUser() == null || wb.getAmount() == null || wb.getAmount() <= 0) continue;
+            BonusTrendUserDto u = ensureUser(userIndex, wb.getUser());
+            if (u != null) u.getAmountsByMonth().put(ymKey(month, year), wb.getAmount());
+            pool += wb.getAmount();
+        }
+        stats.put("totalPool", pool);
+        return pool > 0;
+    }
+
+    /**
+     * UPSERT thưởng kho cho 1 NV trong 1 tháng.
+     * Chỉ cho NV đang thuộc phòng Kho.
+     * Mark sheet WAREHOUSE = CALCULATED (chưa Public).
+     */
+    @Transactional
+    public void upsertWarehouseBonus(Long userId, int month, int year, long amount, User actor) {
+        User u = userRepo.findById(userId).orElseThrow(() ->
+                new IllegalArgumentException("Không tìm thấy NV id=" + userId));
+        PayrollDepartment d = deptResolver.departmentOf(u);
+        if (d != PayrollDepartment.WAREHOUSE)
+            throw new IllegalArgumentException("NV không thuộc phòng Kho");
+
+        WarehouseBonus wb = warehouseBonusRepo
+                .findByUser_IdAndMonthAndYear(userId, month, year)
+                .orElse(WarehouseBonus.builder().user(u).month(month).year(year).build());
+        wb.setAmount(Math.max(0, amount));
+        wb.setUpdatedByName(actor != null ? actor.getFullName() : "SYSTEM");
+        warehouseBonusRepo.save(wb);
+
+        // Mark sheet WAREHOUSE = CALCULATED (chưa Public — chưa hiện cho NV)
+        AttendanceSheet sheet = sheetOf(month, year, PayrollDepartment.WAREHOUSE);
+        if (sheet.getBonusCalcStatus() != com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED) {
+            sheet.markBonusCalculated(actor != null ? actor.getFullName() : "SYSTEM");
+            sheetRepo.save(sheet);
+        }
+    }
+
+    /**
+     * PUBLIC thưởng kho tháng — bấm "Hoàn tất".
+     * NV phòng Kho sẽ thấy phiếu thưởng tháng này.
+     */
+    @Transactional
+    public void publishWarehouseBonus(int month, int year, User actor) {
+        AttendanceSheet sheet = sheetOf(month, year, PayrollDepartment.WAREHOUSE);
+        sheet.markBonusPublished(actor != null ? actor.getFullName() : "SYSTEM");
+        sheetRepo.save(sheet);
+        log.info("[Payroll] Public thưởng KHO {}/{} bởi {}", month, year,
+                actor != null ? actor.getFullName() : "SYSTEM");
+    }
+
+    /** UNPUBLIC thưởng kho — chuyển về CALCULATED, NV không còn thấy. */
+    @Transactional
+    public void unpublishWarehouseBonus(int month, int year, User actor) {
+        AttendanceSheet sheet = sheetOf(month, year, PayrollDepartment.WAREHOUSE);
+        sheet.markBonusUnpublished();
+        sheetRepo.save(sheet);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ATTENDANCE BONUS (10/2026) — thưởng chuyên cần per-user per-month
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * List NV theo phòng + sort theo chức vụ (dành cho modal "Thưởng chuyên cần").
+     * Bao gồm cả NV đã nghỉ/khoá để OWNER vẫn thấy data cũ.
+     * Trả về cả amount tháng hiện tại + amount tháng gần nhất trước đó (placeholder).
+     */
+    @Transactional(readOnly = true)
+    public List<AttendanceBonusRowDto> listAttendanceBonusForMonth(int month, int year) {
+        PayrollDepartment[] DEPT_ORDER = {
+                PayrollDepartment.SALES,
+                PayrollDepartment.FACTORY,
+                PayrollDepartment.ACCOUNTING,
+                PayrollDepartment.WAREHOUSE,
+                PayrollDepartment.DRIVER,
+        };
+        // Snapshot tháng hiện tại
+        Map<Long, Long> currentAmounts = new HashMap<>();
+        for (AttendanceBonus ab : attendanceBonusRepo.findByMonthAndYear(month, year)) {
+            if (ab.getUser() != null) currentAmounts.put(ab.getUser().getId(), ab.getAmount());
+        }
+
+        List<AttendanceBonusRowDto> result = new ArrayList<>();
+        for (PayrollDepartment d : DEPT_ORDER) {
+            List<User> members = deptResolver.employeesWithLockedOf(d).stream()
+                    .sorted(Comparator.comparingInt((User u) -> roleSortOrderIn(d, u))
+                            .thenComparing(User::getFullName))
+                    .toList();
+            for (User u : members) {
+                Long cur = currentAmounts.get(u.getId());
+                Long prev = findPreviousAttendanceBonusAmount(u.getId(), month, year);
+                result.add(AttendanceBonusRowDto.builder()
+                        .userId(u.getId())
+                        .fullName(u.getFullName())
+                        .roleLabel(deptResolver.roleLabelOf(u))
+                        .department(d.name())
+                        .departmentLabel(d.getLabel())
+                        .deleted(u.isDeleted())
+                        .locked(u.isLockAccount())
+                        .amount(cur != null ? cur : 0L)
+                        .previousAmount(prev != null ? prev : 0L)
+                        .build());
+            }
+        }
+        return result;
+    }
+
+    private Long findPreviousAttendanceBonusAmount(Long userId, int month, int year) {
+        List<AttendanceBonus> list = attendanceBonusRepo.findLatestBefore(userId, month, year);
+        if (list.isEmpty()) return null;
+        AttendanceBonus latest = list.get(0);
+        return latest.getAmount();
+    }
+
+    @Transactional
+    public void upsertAttendanceBonus(Long userId, int month, int year, long amount, User actor) {
+        User u = userRepo.findById(userId).orElseThrow(() ->
+                new IllegalArgumentException("Không tìm thấy NV id=" + userId));
+        AttendanceBonus ab = attendanceBonusRepo
+                .findByUser_IdAndMonthAndYear(userId, month, year)
+                .orElse(AttendanceBonus.builder().user(u).month(month).year(year).build());
+        ab.setAmount(Math.max(0, amount));
+        ab.setUpdatedByName(actor != null ? actor.getFullName() : "SYSTEM");
+        attendanceBonusRepo.save(ab);
+    }
+
+    /** Helper cho PDF: lookup amount per user cho 1 tháng. */
+    @Transactional(readOnly = true)
+    public long getAttendanceBonusAmount(Long userId, int month, int year) {
+        return attendanceBonusRepo
+                .findByUser_IdAndMonthAndYear(userId, month, year)
+                .map(AttendanceBonus::getAmount)
+                .orElse(0L);
+    }
+
+    private boolean buildFactoryTrendMonth(int month, int year,
+                                           Map<String, Object> stats,
+                                           Map<Long, BonusTrendUserDto> userIndex) {
+        FactoryKpiBonus kpi = factoryKpiBonusRepo.findByMonthAndYear(month, year).orElse(null);
+        if (kpi == null) return false;
+
+        if (kpi.getTotalOutputKg() != null)
+            stats.put("totalOutputKg", kpi.getTotalOutputKg().setScale(0, RoundingMode.HALF_UP).longValueExact());
+        if (kpi.getRatePerTon() != null) stats.put("ratePerTon", kpi.getRatePerTon());
+        if (kpi.getBonusPool() != null) stats.put("bonusPool", kpi.getBonusPool());
+
+        for (FactoryKpiBonusItem item : factoryKpiBonusItemRepo.findByKpiBonus_Id(kpi.getId())) {
+            if (item.getUser() == null || item.getAmount() == null || item.getAmount() <= 0) continue;
+            BonusTrendUserDto u = ensureUser(userIndex, item.getUser());
+            if (u != null) {
+                u.getAmountsByMonth().put(ymKey(month, year), item.getAmount());
+                // (10/2026) Set fixedAmount flag nếu bất kỳ tháng nào NV ở role fixed
+                if (Boolean.TRUE.equals(item.getFixedAmountRole())) u.setFixedAmount(true);
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Làm tròn LÊN tới bội số của {@code step} (step phải > 0).
+     * VD roundUpTo(204_584, 5_000) = 205_000; roundUpTo(0, 5_000) = 0.
+     */
+    private static long roundUpTo(long v, long step) {
+        if (step <= 0 || v <= 0) return Math.max(0, v);
+        long rem = v % step;
+        return rem == 0 ? v : v + (step - rem);
+    }
     private static long nz(Long v) { return v != null ? v : 0L; }
     private static double nz(Double v) { return v != null ? v : 0.0; }
     private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
@@ -3011,21 +4184,51 @@ public class FactoryPayrollService {
     @Transactional
     public OfficeBonusSummaryDto finalizeBonus(int month, int year,
                                                PayrollDepartment department, User actor) {
-        return finalizeBonus(month, year, department, actor, null);
+        return finalizeBonus(month, year, department, actor, (FinalizeBonusRequest) null);
     }
 
     /**
-     * Overload 11/2026: nhận đơn giá hoa hồng do OWNER nhập mỗi tháng.
-     * Xem {@link OfficeBonusCommissionUtil} cho công thức:
-     *   - SALES: per-seller, làm tròn LÊN 5.000.
-     *   - ACCOUNTING: pool chung chia theo trọng số (KTT=2, CV=1), unitShare
-     *     làm tròn XUỐNG 5.000, phần dư bỏ.
-     * Khi {@code unitPrice == null} → fallback công thức tier-based cũ (legacy).
+     * Legacy signature (giữ tương thích): nhận 1 unitPrice / 100tr.
+     * Chuyển về {@link #finalizeBonus(int, int, PayrollDepartment, User, FinalizeBonusRequest)}
+     * bằng cách gói unitPrice vào request body.
      */
     @Transactional
     public OfficeBonusSummaryDto finalizeBonus(int month, int year,
                                                PayrollDepartment department,
                                                User actor, Long unitPrice) {
+        FinalizeBonusRequest req = unitPrice == null
+                ? null
+                : FinalizeBonusRequest.builder().unitPrice(unitPrice).build();
+        return finalizeBonus(month, year, department, actor, req);
+    }
+
+    /**
+     * FLOW MỚI 2026 — tính hoa hồng từ cấu hình OWNER nhập trong modal.
+     *
+     * <h3>SALES</h3> dùng {@code req.salesTiers}: tính per-seller, mốc cao
+     * nhất trước. Phần dư không đủ mốc thấp nhất → bỏ. Số cuối cùng làm tròn
+     * LÊN 5.000.
+     *
+     * <h3>ACCOUNTING</h3> dùng {@code req.accountingPercent} + {@code req.accountingRatios}:
+     * <pre>
+     *   pool_raw = collectedRevenue × accountingPercent / 100
+     *   share_i  = pool_raw × ratio_i / 100  (ceil 5.000)
+     *   dư       = pool_raw × (100 − Σ ratio) / 100   (lưu, không chia)
+     * </pre>
+     *
+     * <h3>LOG (yêu cầu nghiệp vụ 2026)</h3> Mỗi lần tính, in log doanh thu
+     * được chia hoa hồng + doanh thu đang hold + waived + pool + dư.
+     *
+     * <h3>Chống đếm trùng</h3> Doanh thu lấy từ {@code PaymentTransaction}
+     * (ghi nhận từng lần thu). Mỗi lần thu được tính 1 lần duy nhất vào tháng
+     * có {@code createdAt} rơi vào — KHÔNG dùng {@code paid_amount} cộng dồn.
+     * Phần {@code waived} (đơn COMPLETED còn chênh) được cộng vào doanh thu
+     * chia hoa hồng của tháng mà đơn được tạo (bỏ số lẻ 1 lần duy nhất).
+     */
+    @Transactional
+    public OfficeBonusSummaryDto finalizeBonus(int month, int year,
+                                               PayrollDepartment department,
+                                               User actor, FinalizeBonusRequest req) {
         validatePastOrCurrentPeriod(month, year);
 
         if (department != PayrollDepartment.SALES && department != PayrollDepartment.ACCOUNTING)
@@ -3034,24 +4237,24 @@ public class FactoryPayrollService {
 
         AttendanceSheet sheet = sheetOf(month, year, department);
 
-        // FIX (11/2026): KHÔNG còn bắt buộc hoàn tất Lương trước khi tính hoa
-        // hồng — theo yêu cầu, hoa hồng và lương là 2 phần tách biệt.
-        //
-        // Flow mới (unitPrice != null) cũng KHÔNG đòi finalizeKpi; chỉ chế độ
-        // legacy tier-based (unitPrice == null) mới cần — bỏ cả check này cho
-        // nhất quán.
-
-        if (unitPrice != null && unitPrice <= 0)
-            throw new IllegalArgumentException("Đơn giá hoa hồng phải > 0.");
-
-        // Biên tháng theo giờ VN — bao gồm 00:00 đầu tháng, exclusive đến đầu
-        // tháng kế. Nhờ đó đơn thu 06:00 ngày 1/9 VN được tính vào tháng 9.
+        // Biên tháng theo giờ VN
         java.time.YearMonth ym = java.time.YearMonth.of(year, month);
         long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
         long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
 
         long now = System.currentTimeMillis();
         String actorName = actor != null ? actor.getFullName() : "system";
+
+        // ── Chuẩn hoá request: tách rõ 3 flow ───────────────────────────
+        //   (1) flow MỚI SALES   : req.salesTiers != empty
+        //   (2) flow MỚI ACCOUNT : req.accountingPercent + accountingRatios
+        //   (3) flow LEGACY      : req.unitPrice != null, các field mới null
+        boolean hasTiers      = req != null && req.getSalesTiers() != null && !req.getSalesTiers().isEmpty();
+        boolean hasAcctConfig = req != null && req.getAccountingPercent() != null
+                && req.getAccountingRatios() != null && !req.getAccountingRatios().isEmpty();
+        Long legacyUnitPrice  = req != null ? req.getUnitPrice() : null;
+        if (legacyUnitPrice != null && legacyUnitPrice <= 0)
+            throw new IllegalArgumentException("Đơn giá hoa hồng phải > 0.");
 
         // Xoá kết quả cũ trước khi tính lại
         officeBonusResultRepo.deleteByMonthAndYearAndDepartment(month, year, department);
@@ -3060,104 +4263,183 @@ public class FactoryPayrollService {
         OfficeBonusResult result;
         List<OfficeBonusItem> items = new ArrayList<>();
 
+        // Doanh thu tổng (cho log, giống preview)
+        java.math.BigDecimal deptCollected = nzBd(paymentTransactionRepo.sumRevenueAllOrders(startMs, endMs));
+        java.math.BigDecimal deptHold      = nzBd(orderRepository.sumHoldAmountCreatedInRange(startMs, endMs));
+        java.math.BigDecimal deptWaived    = nzBd(orderRepository.sumWaivedAmountCreatedInRange(startMs, endMs));
+        java.math.BigDecimal deptMonthOrd  = nzBd(orderRepository.sumFinalAmountCreatedInRange(startMs, endMs));
+
         if (department == PayrollDepartment.ACCOUNTING) {
-            // Tất cả đơn trong tháng, không phân biệt người tạo
-            java.math.BigDecimal totalRev = paymentTransactionRepo.sumRevenueAllOrders(startMs, endMs);
-            if (totalRev == null) totalRev = java.math.BigDecimal.ZERO;
+            // ── Doanh thu để tính hoa hồng = ĐÃ THU + WAIVED (bỏ số lẻ) ──
+            //   Phần waived là chênh của đơn COMPLETED đã được kế toán xác nhận
+            //   "bỏ số lẻ". Theo nghiệp vụ: tính như đã thu để chia hoa hồng.
+            java.math.BigDecimal totalRev = deptCollected.add(deptWaived);
             long txCount = paymentTransactionRepo.countTransactionsAllOrders(startMs, endMs);
 
-            // Lấy danh sách nhân viên kế toán có receiveBonus = true, SORT theo
-            // thứ tự chức vụ trong PayrollDepartment (KTT trước chuyên viên)
+            // Nhân viên kế toán có receiveBonus
             List<User> bonusEligible = deptResolver.employeesOf(PayrollDepartment.ACCOUNTING)
                     .stream()
                     .filter(u -> !Boolean.FALSE.equals(u.getReceiveBonus()))
                     .sorted(Comparator.comparingInt(u -> roleSortOrderIn(PayrollDepartment.ACCOUNTING, u)))
                     .toList();
+            Map<Long, User> userById = bonusEligible.stream()
+                    .collect(java.util.stream.Collectors.toMap(User::getId, u -> u, (a,b) -> a));
 
             long pool;
-            List<AccountingShare> shares;
-            if (unitPrice != null) {
-                // ── Flow MỚI (11/2026): chia theo trọng số, unitShare floor 5k ──
+            long undistributed = 0L;
+            String ratiosJson = null;
+            java.math.BigDecimal acctPct = null;
+            List<AccountingShareV2> shares;
+
+            if (hasAcctConfig) {
+                // ── FLOW MỚI: % phòng + tỉ lệ từng người ──
+                acctPct = req.getAccountingPercent();
+                if (acctPct.signum() <= 0)
+                    throw new IllegalArgumentException("% hoa hồng phòng phải > 0.");
+                if (acctPct.compareTo(new BigDecimal("100")) > 0)
+                    throw new IllegalArgumentException("% hoa hồng phòng không được > 100.");
+
+                List<UserRatio> userRatios = req.getAccountingRatios().stream()
+                        .filter(ur -> ur.getUserId() != null && userById.containsKey(ur.getUserId()))
+                        .map(ur -> new UserRatio(ur.getUserId(),
+                                ur.getRatio() == null ? BigDecimal.ZERO : ur.getRatio()))
+                        .toList();
+
+                AccountingPoolResult poolRes =
+                        OfficeBonusCommissionUtil.splitAccountingByRatios(totalRev, acctPct, userRatios);
+                shares = poolRes.shares();
+                pool = poolRes.distributedTotal();
+                undistributed = poolRes.undistributed();
+
+                try {
+                    ratiosJson = MAPPER.writeValueAsString(req.getAccountingRatios());
+                } catch (Exception ignored) {}
+
+            } else if (legacyUnitPrice != null) {
+                // ── LEGACY unitPrice/100tr: chia theo weight KTT=2, CV=1 ──
                 java.math.BigDecimal rawPool =
-                        OfficeBonusCommissionUtil.rawCommission(totalRev, unitPrice);
+                        OfficeBonusCommissionUtil.rawCommission(totalRev, legacyUnitPrice);
                 List<UserWeight> weights = bonusEligible.stream()
-                        .map(u -> new UserWeight(
-                                u.getId(),
+                        .map(u -> new UserWeight(u.getId(),
                                 OfficeBonusCommissionUtil.accountingWeightOf(deptResolver.payrollRoleOf(u))))
                         .toList();
-                shares = OfficeBonusCommissionUtil.splitAccountingPool(rawPool, weights);
-                pool = shares.stream().mapToLong(AccountingShare::bonusAmount).sum();
+                List<AccountingShare> legacyShares =
+                        OfficeBonusCommissionUtil.splitAccountingPool(rawPool, weights);
+                shares = legacyShares.stream()
+                        .map(s -> new AccountingShareV2(s.userId(), s.bonusAmount(),
+                                s.bonusAmount(), null))
+                        .toList();
+                pool = shares.stream().mapToLong(AccountingShareV2::bonusAmount).sum();
+
             } else {
-                // ── LEGACY tier-based: chia đều cho tất cả, trọng số = 1 ──
+                // ── LEGACY tier-based bonus: chia đều ──
                 long tierPool = calcBonusFromRevenue(totalRev);
                 long perPerson = bonusEligible.isEmpty() ? 0L
                         : (tierPool / bonusEligible.size() / 100_000) * 100_000;
                 pool = perPerson * (long) bonusEligible.size();
                 final long pp = perPerson;
                 shares = bonusEligible.stream()
-                        .map(u -> new AccountingShare(u.getId(), pp, 1))
+                        .map(u -> new AccountingShareV2(u.getId(), pp, pp, null))
                         .toList();
             }
 
             final java.math.BigDecimal finalTotalRev = totalRev;
             final long finalTxCount = txCount;
+            final long finalUndist = undistributed;
+            final String finalRatiosJson = ratiosJson;
+            final java.math.BigDecimal finalAcctPct = acctPct;
+
             result = OfficeBonusResult.builder()
                     .month(month).year(year).department(department)
                     .totalRevenue(finalTotalRev)
                     .totalBonusPool(pool)
-                    .commissionUnitPrice(unitPrice)
+                    .commissionUnitPrice(legacyUnitPrice)        // null khi flow mới
+                    .accountingPercent(finalAcctPct)
+                    .accountingRatiosJson(finalRatiosJson)
+                    .undistributedAmount(finalUndist)
                     .transactionCount((int) finalTxCount)
                     .computedAt(now).computedByName(actorName)
                     .build();
             result = officeBonusResultRepo.save(result);
 
-            Map<Long, AccountingShare> byUser = new HashMap<>();
-            for (AccountingShare s : shares) byUser.put(s.userId(), s);
+            Map<Long, AccountingShareV2> byUser = new HashMap<>();
+            for (AccountingShareV2 s : shares) byUser.put(s.userId(), s);
 
             for (User u : bonusEligible) {
-                AccountingShare s = byUser.get(u.getId());
+                AccountingShareV2 s = byUser.get(u.getId());
                 OfficeBonusItem item = OfficeBonusItem.builder()
                         .bonusResult(result)
                         .user(u)
                         .userFullName(u.getFullName())
                         .roleLabel(deptResolver.roleLabelOf(u))
-                        .revenue(finalTotalRev)         // kế toán thấy doanh thu chung
+                        .revenue(finalTotalRev)
                         .bonusAmount(s != null ? s.bonusAmount() : 0L)
-                        .kpiPercent(100.0)              // KPI = 100% (snapshot)
+                        .rawBonusAmount(s != null ? s.rawShare() : 0L)
+                        .ratioPercent(s != null ? s.ratio() : null)
+                        .kpiPercent(100.0)
                         .transactionCount((int) finalTxCount)
                         .build();
                 items.add(item);
             }
 
         } else {
-            // SALES — mỗi seller tính riêng từ đơn của mình.
-            // Danh sách bao gồm NV phòng KD + extras ngoài phòng có tạo đơn
-            // trong tháng (vd nhân viên Kho được phép tạo đơn).
+            // ───────────────────── SALES ─────────────────────
             List<User> sellers = buildSalesBonusEligible(startMs, endMs);
+
+            // Config
+            List<SalesTier> tiers = null;
+            String tiersJson = null;
+            if (hasTiers) {
+                tiers = req.getSalesTiers().stream()
+                        .filter(t -> t.getThreshold() != null && t.getUnitPrice() != null
+                                && t.getThreshold().signum() > 0 && t.getUnitPrice() > 0)
+                        .map(t -> new SalesTier(t.getThreshold(), t.getUnitPrice()))
+                        .toList();
+                if (tiers.isEmpty())
+                    throw new IllegalArgumentException("Cần ít nhất 1 mốc thưởng hợp lệ (threshold > 0, unitPrice > 0).");
+                try {
+                    tiersJson = MAPPER.writeValueAsString(req.getSalesTiers());
+                } catch (Exception ignored) {}
+            }
+
             java.math.BigDecimal deptTotalRev = java.math.BigDecimal.ZERO;
             long deptPool = 0L;
             int  deptTxCount = 0;
+            long deptUndistributed = 0L;      // Σ unmatchedRevenue chuyển sang long để log
 
             result = OfficeBonusResult.builder()
                     .month(month).year(year).department(department)
-                    .commissionUnitPrice(unitPrice)
+                    .commissionUnitPrice(legacyUnitPrice)
+                    .salesTiersJson(tiersJson)
                     .computedAt(now).computedByName(actorName)
                     .build();
             result = officeBonusResultRepo.save(result);
 
             for (User u : sellers) {
-                java.math.BigDecimal sellerRev = paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId());
-                if (sellerRev == null) sellerRev = java.math.BigDecimal.ZERO;
+                // Doanh thu chia hoa hồng cho seller = ĐÃ THU + WAIVED (bỏ số lẻ)
+                java.math.BigDecimal sellerCollected =
+                        nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId()));
+                java.math.BigDecimal sellerWaived =
+                        nzBd(orderRepository.sumWaivedAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                java.math.BigDecimal sellerRev = sellerCollected.add(sellerWaived);
                 long sellerTx = paymentTransactionRepo.countTransactionsByUser(startMs, endMs, u.getId());
 
                 long sellerBonus;
-                if (unitPrice != null) {
-                    // Flow MỚI: raw × unitPrice / 100tr, ceil 5k
-                    sellerBonus = OfficeBonusCommissionUtil.salesCommission(sellerRev, unitPrice);
+                long sellerRaw;
+                if (hasTiers) {
+                    SalesBonusResult br = OfficeBonusCommissionUtil.salesCommissionTiered(sellerRev, tiers);
+                    sellerBonus = br.bonusAmount();
+                    sellerRaw   = br.rawBonus();
+                    // Cộng doanh thu không đủ mốc vào tổng dư của phòng
+                    if (br.unmatchedRevenue() != null)
+                        deptUndistributed += br.unmatchedRevenue().setScale(0, RoundingMode.HALF_UP).longValueExact();
+                } else if (legacyUnitPrice != null) {
+                    sellerBonus = OfficeBonusCommissionUtil.salesCommission(sellerRev, legacyUnitPrice);
+                    sellerRaw   = sellerBonus;
                 } else {
-                    // LEGACY: tier-based, floor 100k
                     long raw = calcBonusFromRevenue(sellerRev);
                     sellerBonus = (raw / 100_000) * 100_000;
+                    sellerRaw   = raw;
                 }
 
                 deptTotalRev = deptTotalRev.add(sellerRev);
@@ -3171,16 +4453,17 @@ public class FactoryPayrollService {
                         .roleLabel(deptResolver.roleLabelOf(u))
                         .revenue(sellerRev)
                         .bonusAmount(sellerBonus)
+                        .rawBonusAmount(sellerRaw)
                         .kpiPercent(100.0)
                         .transactionCount((int) sellerTx)
                         .build();
                 items.add(item);
             }
 
-            // Cập nhật tổng vào result
             result.setTotalRevenue(deptTotalRev);
             result.setTotalBonusPool(deptPool);
             result.setTransactionCount(deptTxCount);
+            result.setUndistributedAmount(deptUndistributed);
             result = officeBonusResultRepo.save(result);
         }
 
@@ -3190,16 +4473,43 @@ public class FactoryPayrollService {
         savedResult.getItems().addAll(items);
         officeBonusResultRepo.save(savedResult);
 
-        // Chốt cờ bonus
-        sheet.setBonusFinalized(true);
-        sheet.setBonusFinalizedAt(now);
-        sheet.setBonusFinalizedByName(actorName);
+        // (10/2026) Chỉ đánh dấu CALCULATED — chưa Public cho nhân viên thấy.
+        // OWNER sẽ bấm "Public thưởng" ở bước riêng để nhân viên xem phiếu.
+        // bonusFinalized vẫn giữ = false ở bước này; chỉ bật = true khi Public.
+        sheet.markBonusCalculated(actorName);
         sheetRepo.save(sheet);
 
-        log.info("[Payroll] HOÀN TẤT THƯỞNG {} tháng {}/{}: unitPrice={} pool={}đ bởi {}",
-                department, month, year, unitPrice, savedResult.getTotalBonusPool(), actorName);
+        // ─────────────────────────── LOG (yêu cầu nghiệp vụ) ───────────────────────────
+        log.info("[Bonus] ╔══════════════════════════════════════════════════════════════════");
+        log.info("[Bonus] ║ TÍNH HOA HỒNG {} tháng {}/{} — actor: {}",
+                department, month, year, actorName);
+        log.info("[Bonus] ║ Doanh thu đã thu EX-VAT (chia HH)  = {}đ",
+                fmtVn(savedResult.getTotalRevenue()));
+        log.info("[Bonus] ║ Doanh thu đang hold EX-VAT         = {}đ",
+                fmtVn(deptHold));
+        log.info("[Bonus] ║ Doanh thu waived EX-VAT            = {}đ (đã gộp vào \"đã thu\")",
+                fmtVn(deptWaived));
+        log.info("[Bonus] ║ Doanh thu đơn tạo trong tháng EX-VAT = {}đ",
+                fmtVn(deptMonthOrd));
+        log.info("[Bonus] ║ Pool chia                          = {}đ",
+                String.format("%,d", savedResult.getTotalBonusPool()));
+        log.info("[Bonus] ║ Số dư (không chia cho ai)          = {}đ",
+                String.format("%,d", savedResult.getUndistributedAmount() == null
+                        ? 0L : savedResult.getUndistributedAmount()));
+        if (savedResult.getSalesTiersJson() != null)
+            log.info("[Bonus] ║ Config SALES tiers              = {}", savedResult.getSalesTiersJson());
+        if (savedResult.getAccountingPercent() != null)
+            log.info("[Bonus] ║ Config ACCOUNTING percent       = {}%", savedResult.getAccountingPercent());
+        if (savedResult.getAccountingRatiosJson() != null)
+            log.info("[Bonus] ║ Config ACCOUNTING ratios        = {}", savedResult.getAccountingRatiosJson());
+        log.info("[Bonus] ╚══════════════════════════════════════════════════════════════════");
 
         return toOfficeBonusSummaryDto(savedResult);
+    }
+
+    private static String fmtVn(java.math.BigDecimal v) {
+        if (v == null) return "0";
+        return String.format("%,.0f", v);
     }
 
     /**
@@ -3257,6 +4567,447 @@ public class FactoryPayrollService {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // SALES BONUS v2 — target + 1 mốc + override per-seller (10/2026)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * TÍNH THƯỞNG SALES V2 — tạo preview để OWNER review trước khi Public.
+     *
+     * <p>Flow:
+     * <ol>
+     *   <li>OWNER bấm "Tính thưởng" → modal nhập 3 input: target, stepAmount, stepUnitPrice.</li>
+     *   <li>BE chạy hàm này: tính doanh thu phòng, so với target → multiplier (1.0 hoặc 0.5).</li>
+     *   <li>Mỗi seller: steps = floor(revenue/stepAmount); remainder = revenue - steps×stepAmount.</li>
+     *   <li>Default row: stepUnitPrice × multiplier, remainderBonus = 0.</li>
+     *   <li>Upsert vào {@code sales_bonus_override} (giữ owner-edited rows nếu đã có).</li>
+     *   <li>Mark sheet CALCULATED (chưa Public).</li>
+     *   <li>Trả về preview để FE mở ReviewModal.</li>
+     * </ol>
+     *
+     * <p>Lưu config (target/stepAmount/stepUnitPrice/multiplier) vào sheet để
+     * mở lại tháng cũ vẫn thấy state cũ.
+     */
+    @Transactional
+    public SalesBonusPreviewDto previewSalesBonusV2(int month, int year,
+                                                    long target, long stepAmount,
+                                                    long stepUnitPrice,
+                                                    List<SalesBonusTierDto> tiers,
+                                                    User actor) {
+        if (stepAmount <= 0) throw new IllegalArgumentException("Bước doanh thu phải > 0.");
+        if (stepUnitPrice <= 0) throw new IllegalArgumentException("Đơn giá/bước phải > 0.");
+        if (target < 0) throw new IllegalArgumentException("Target không âm.");
+
+        PayrollDepartment dept = PayrollDepartment.SALES;
+        AttendanceSheet sheet = sheetOf(month, year, dept);
+
+        java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+        long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+        long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+
+        List<User> sellers = buildSalesBonusEligible(startMs, endMs);
+
+        // 1) Doanh thu phòng — 2 số khác nhau:
+        //    • commissionRev (= collected + waived): dùng tính TIỀN THƯỞNG per bước
+        //    • orderRev     (= Σ final - vat đơn tạo trong tháng): dùng tính KPI % đạt target
+        //    Lý do: target cá nhân so với tổng DT tháng (order-based), không phải DT chia HH.
+        long deptRevenue = 0L;                    // commissionRev (dùng tính bước thưởng)
+        long deptOrderRevenue = 0L;               // orderRev (dùng tính % đạt target DEPT)
+        Map<Long, Long> sellerRevenues = new LinkedHashMap<>();
+        Map<Long, Long> sellerOrderRevenues = new LinkedHashMap<>();
+        for (User u : sellers) {
+            java.math.BigDecimal collected =
+                    nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId()));
+            java.math.BigDecimal waived =
+                    nzBd(orderRepository.sumWaivedAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+            long rev = collected.add(waived).setScale(0, RoundingMode.HALF_UP).longValueExact();
+            sellerRevenues.put(u.getId(), rev);
+            deptRevenue += rev;
+
+            java.math.BigDecimal orderRev =
+                    nzBd(orderRepository.sumFinalAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+            long oRev = orderRev.setScale(0, RoundingMode.HALF_UP).longValueExact();
+            sellerOrderRevenues.put(u.getId(), oRev);
+            deptOrderRevenue += oRev;
+        }
+
+        // 2) Dept-wide multiplier — ladder theo % đạt DEPT target.
+        //    Dùng ORDER revenue (giống UI) để % đồng bộ với con số user thấy trên card.
+        boolean deptAchieved = deptOrderRevenue >= target;
+        double deptAchievedPct = target > 0 ? (double) deptOrderRevenue / target * 100.0 : 0.0;
+
+        // 3) Chuẩn hóa tiers (sort DESC theo thresholdPercent). Nếu null/empty →
+        //    dùng legacy 90/50% dept-wide.
+        List<SalesBonusTierDto> sortedTiers = tiers == null ? new ArrayList<>()
+                : tiers.stream()
+                .filter(t -> t != null && t.getThresholdPercent() != null && t.getPricePercent() != null)
+                .sorted((a,b) -> Integer.compare(b.getThresholdPercent(), a.getThresholdPercent()))
+                .toList();
+        String tiersJson = null;
+        try { if (!sortedTiers.isEmpty()) tiersJson = MAPPER.writeValueAsString(sortedTiers); } catch (Exception ignored) {}
+
+        // 3b) Multiplier chung cho cả phòng = tier matching với deptAchievedPct
+        double deptMultiplier = resolveMultiplierFromTiers(deptAchievedPct, sortedTiers,
+                deptAchieved ? 1.0 : 0.5);
+
+        // 4) Snapshot config lên sheet
+        //    (10/2026) Lưu ORDER revenue (= tổng DT tháng, order-based) để % đạt
+        //    target khớp với card "Tổng doanh thu tháng" hiển thị trên UI.
+        sheet.setSalesBonusTarget(target);
+        sheet.setSalesBonusStepAmount(stepAmount);
+        sheet.setSalesBonusStepUnitPrice(stepUnitPrice);
+        sheet.setSalesBonusMultiplier(deptMultiplier);
+        sheet.setSalesBonusDeptRevenue(deptOrderRevenue);
+        sheet.setSalesBonusTiersJson(tiersJson);
+        sheet.markBonusCalculated(actor != null ? actor.getFullName() : "SYSTEM");
+        sheetRepo.save(sheet);
+
+        // 5) Upsert sales_bonus_override cho từng seller
+        List<SalesBonusRowDto> rows = new ArrayList<>(sellers.size());
+        for (User u : sellers) {
+            long rev = sellerRevenues.getOrDefault(u.getId(), 0L);
+            int  steps     = (int) (rev / stepAmount);
+            long remainder = rev - (long) steps * stepAmount;
+
+            boolean isSalesSeller = u.getPayrollRole() == com.nhatnam.server.enumtype.Role.SELLER
+                    || u.getPayrollRole() == com.nhatnam.server.enumtype.Role.SUPER_SELLER;
+            Long personalTarget = u.getSalesPersonalTarget();
+
+            // Multiplier LUÔN theo dept-wide (ladder match với deptAchievedPct).
+            // Personal target: tính % đạt dùng ORDER revenue (= tổng DT tháng hiển thị UI),
+            // không phải commission revenue (payment-based).
+            double multiplier = deptMultiplier;
+            Double achievedPct = null;
+            if (personalTarget != null && personalTarget > 0) {
+                long orderRev = sellerOrderRevenues.getOrDefault(u.getId(), 0L);
+                achievedPct = (double) orderRev / personalTarget * 100.0;
+            }
+            long defaultUnitAfter = Math.round(stepUnitPrice * multiplier);
+
+            // (10/2026) RESET về default mỗi lần preview — không giữ override cũ.
+            //   User override lại trong modal, bấm "Xác nhận" (save) để lưu lại.
+            SalesBonusOverride ov = salesBonusOverrideRepo
+                    .findByUser_IdAndMonthAndYear(u.getId(), month, year)
+                    .orElse(null);
+            if (ov == null) {
+                ov = SalesBonusOverride.builder()
+                        .user(u).month(month).year(year)
+                        .build();
+            }
+            // (10/2026) FIX "phần dư" không còn bị bỏ (= 0đ), mà tính theo % đạt
+            // bước. Công thức theo user:
+            //   remPercent = floor(remainder / stepAmount * 100)   // chỉ phần nguyên
+            //   remBonus   = ceilTo5000(remPercent × defaultUnitAfter / 100)
+            // VD stepAmount=100tr, defaultUnitAfter=200.000 (full 400k × multiplier 50%),
+            //    remainder=78.084.417 → remPercent=78 → raw = 78×200.000/100 = 156.000
+            //    → ceilTo5000(156.000) = 160.000.
+            int remainderPercent = stepAmount > 0
+                    ? (int) (remainder * 100L / stepAmount)
+                    : 0;
+            long remainderBonusRaw = (long) remainderPercent * defaultUnitAfter / 100L;
+            long remainderBonusDefault = roundUpTo(remainderBonusRaw, 5_000L);
+
+            ov.setRevenue(rev);
+            ov.setSteps(steps);
+            ov.setRemainder(remainder);
+            ov.setPersonalTarget(personalTarget);
+            ov.setAchievedPercent(achievedPct);
+            ov.setAppliedMultiplier(multiplier);
+            ov.setStepUnitPrice(defaultUnitAfter);     // reset về default
+            ov.setRemainderBonus(remainderBonusDefault); // default theo % phần dư, đã round 5.000
+            ov.setOwnerEdited(false);                   // reset flag
+            ov.setTotalBonus((long) ov.getSteps() * ov.getStepUnitPrice() + ov.getRemainderBonus());
+            SalesBonusOverride saved = salesBonusOverrideRepo.save(ov);
+
+            rows.add(SalesBonusRowDto.builder()
+                    .userId(u.getId())
+                    .fullName(u.getFullName())
+                    .roleLabel(deptResolver.roleLabelOf(u))
+                    .revenue(rev)
+                    .steps(steps)
+                    .remainder(remainder)
+                    .stepUnitPrice(saved.getStepUnitPrice())
+                    .remainderBonus(saved.getRemainderBonus())
+                    .totalBonus(saved.getTotalBonus())
+                    .ownerEdited(Boolean.TRUE.equals(saved.getOwnerEdited()))
+                    .isSalesSeller(isSalesSeller)
+                    .personalTarget(personalTarget)
+                    .achievedPercent(achievedPct)
+                    .appliedMultiplier(multiplier)
+                    .build());
+        }
+
+        return SalesBonusPreviewDto.builder()
+                .month(month).year(year)
+                .target(target).stepAmount(stepAmount).stepUnitPrice(stepUnitPrice)
+                .multiplier(deptMultiplier)
+                .deptRevenue(deptRevenue)
+                .targetAchieved(deptAchieved)
+                .tiers(sortedTiers)
+                .rows(rows)
+                .build();
+    }
+
+    /**
+     * Tìm multiplier từ ladder tiers (đã sort DESC theo thresholdPercent).
+     * Trả về tier.pricePercent/100 của tier đầu tiên match; nếu không khớp tier nào → fallback.
+     */
+    private static double resolveMultiplierFromTiers(double achievedPct,
+                                                     List<SalesBonusTierDto> sortedTiers,
+                                                     double fallback) {
+        if (sortedTiers == null || sortedTiers.isEmpty()) return fallback;
+        for (SalesBonusTierDto t : sortedTiers) {
+            if (achievedPct >= t.getThresholdPercent()) {
+                return t.getPricePercent() / 100.0;
+            }
+        }
+        return 0.0;
+    }
+
+    /**
+     * LOAD lại preview đang có — dùng khi OWNER mở lại tab đã tính.
+     * Nếu sheet chưa có config (chưa bấm Tính) → trả null.
+     */
+    @Transactional(readOnly = true)
+    public SalesBonusPreviewDto getCurrentSalesBonusV2(int month, int year) {
+        AttendanceSheet sheet = sheetRepo
+                .findByMonthAndYearAndDepartment(month, year, PayrollDepartment.SALES)
+                .orElse(null);
+        if (sheet == null || sheet.getSalesBonusStepUnitPrice() == null) return null;
+
+        List<SalesBonusOverride> all = salesBonusOverrideRepo.findByMonthAndYear(month, year);
+        List<SalesBonusRowDto> rows = all.stream()
+                .sorted(Comparator.comparing(o -> o.getUser() != null && o.getUser().getFullName() != null
+                        ? o.getUser().getFullName() : ""))
+                .map(o -> {
+                    User u = o.getUser();
+                    boolean isSeller = u != null && (
+                            u.getPayrollRole() == com.nhatnam.server.enumtype.Role.SELLER
+                                    || u.getPayrollRole() == com.nhatnam.server.enumtype.Role.SUPER_SELLER);
+                    return SalesBonusRowDto.builder()
+                            .userId(u != null ? u.getId() : null)
+                            .fullName(u != null ? u.getFullName() : null)
+                            .roleLabel(u != null ? deptResolver.roleLabelOf(u) : null)
+                            .revenue(o.getRevenue())
+                            .steps(o.getSteps())
+                            .remainder(o.getRemainder())
+                            .stepUnitPrice(o.getStepUnitPrice())
+                            .remainderBonus(o.getRemainderBonus())
+                            .totalBonus(o.getTotalBonus())
+                            .ownerEdited(Boolean.TRUE.equals(o.getOwnerEdited()))
+                            .isSalesSeller(isSeller)
+                            .personalTarget(o.getPersonalTarget())
+                            .achievedPercent(o.getAchievedPercent())
+                            .appliedMultiplier(o.getAppliedMultiplier())
+                            .build();
+                })
+                .toList();
+
+        boolean achieved = sheet.getSalesBonusDeptRevenue() != null && sheet.getSalesBonusTarget() != null
+                && sheet.getSalesBonusDeptRevenue() >= sheet.getSalesBonusTarget();
+
+        List<SalesBonusTierDto> tiers = new ArrayList<>();
+        if (sheet.getSalesBonusTiersJson() != null && !sheet.getSalesBonusTiersJson().isBlank()) {
+            try {
+                tiers = MAPPER.readValue(sheet.getSalesBonusTiersJson(),
+                        new com.fasterxml.jackson.core.type.TypeReference<List<SalesBonusTierDto>>() {});
+            } catch (Exception ignored) {}
+        }
+
+        return SalesBonusPreviewDto.builder()
+                .month(month).year(year)
+                .target(sheet.getSalesBonusTarget())
+                .stepAmount(sheet.getSalesBonusStepAmount())
+                .stepUnitPrice(sheet.getSalesBonusStepUnitPrice())
+                .multiplier(sheet.getSalesBonusMultiplier())
+                .deptRevenue(sheet.getSalesBonusDeptRevenue())
+                .targetAchieved(achieved)
+                .tiers(tiers)
+                .rows(rows)
+                .build();
+    }
+
+    /**
+     * PUBLISH SALES BONUS V2 với override per-seller.
+     *
+     * <p>Flow:
+     * <ol>
+     *   <li>Nhận list overrides từ FE (chỉ các seller OWNER đã sửa, hoặc tất cả).</li>
+     *   <li>Upsert sales_bonus_override — đánh dấu ownerEdited=true nếu khác default.</li>
+     *   <li>Xoá OfficeBonusResult cũ (nếu có) → tạo mới với items theo total_bonus.</li>
+     *   <li>Mark sheet PUBLISHED → nhân viên thấy phiếu.</li>
+     * </ol>
+     */
+    /**
+     * (10/2026) SAVE OVERRIDES ONLY — không publish.
+     * OWNER bấm "Xác nhận" trong ReviewModal → gọi method này.
+     * Sheet vẫn CALCULATED, nhân viên chưa thấy. Phải bấm "Hoàn tất" riêng để publish.
+     */
+    @Transactional
+    public SalesBonusPreviewDto saveSalesBonusOverrides(int month, int year,
+                                                        List<SalesBonusOverrideDto> overrides,
+                                                        User actor) {
+        applySalesOverrides(month, year, overrides, actor);
+        // FIX (10/2026): Trước đây OfficeBonusResult chỉ được tạo ở bước Publish —
+        // nên sau khi OWNER bấm "Xác nhận" trong ReviewModal, cột "Thưởng doanh
+        // thu" ở bảng preview vẫn trống (getOfficeBonusPreview đọc bonusAmount
+        // từ OfficeBonusResult). Phải chờ "Hoàn tất" mới có data — sai logic.
+        // Nay sync luôn OfficeBonusResult theo state hiện tại của SalesBonusOverride
+        // nhưng KHÔNG đổi state sheet (vẫn CALCULATED, nhân viên chưa thấy).
+        syncOfficeBonusResultFromOverrides(month, year, actor);
+        return getCurrentSalesBonusV2(month, year);
+    }
+
+    /**
+     * Dựng lại OfficeBonusResult cho SALES từ SalesBonusOverride hiện tại.
+     * Dùng chung cho cả bước SAVE (giữ state CALCULATED) và PUBLISH (sẽ bật
+     * state PUBLISHED ở ngoài).
+     */
+    private void syncOfficeBonusResultFromOverrides(int month, int year, User actor) {
+        PayrollDepartment dept = PayrollDepartment.SALES;
+        AttendanceSheet sheet = sheetOf(month, year, dept);
+        if (sheet.getSalesBonusStepUnitPrice() == null) return;
+        long stepUnitPrice = sheet.getSalesBonusStepUnitPrice();
+
+        List<SalesBonusOverride> allRows = salesBonusOverrideRepo.findByMonthAndYear(month, year);
+        long deptPool = 0L;
+        java.math.BigDecimal deptRev = java.math.BigDecimal.ZERO;
+        List<OfficeBonusItem> items = new ArrayList<>();
+        for (SalesBonusOverride row : allRows) {
+            User u = row.getUser();
+            if (u == null) continue;
+            long total = row.getTotalBonus() != null ? row.getTotalBonus() : 0L;
+            deptPool += total;
+            java.math.BigDecimal rev = java.math.BigDecimal.valueOf(
+                    row.getRevenue() != null ? row.getRevenue() : 0L);
+            deptRev = deptRev.add(rev);
+            items.add(OfficeBonusItem.builder()
+                    .user(u)
+                    .userFullName(u.getFullName())
+                    .roleLabel(deptResolver.roleLabelOf(u))
+                    .revenue(rev)
+                    .bonusAmount(total)
+                    .rawBonusAmount(total)
+                    .kpiPercent(100.0)
+                    .transactionCount(0)
+                    .build());
+        }
+
+        officeBonusResultRepo.deleteByMonthAndYearAndDepartment(month, year, dept);
+        officeBonusResultRepo.flush();
+
+        OfficeBonusResult result = OfficeBonusResult.builder()
+                .month(month).year(year).department(dept)
+                .commissionUnitPrice(stepUnitPrice)
+                .totalRevenue(deptRev)
+                .totalBonusPool(deptPool)
+                .transactionCount(0)
+                .computedAt(System.currentTimeMillis())
+                .computedByName(actor != null ? actor.getFullName() : "SYSTEM")
+                .build();
+        result = officeBonusResultRepo.save(result);
+        final OfficeBonusResult saved = result;
+        items.forEach(it -> it.setBonusResult(saved));
+        saved.getItems().addAll(items);
+        officeBonusResultRepo.save(saved);
+    }
+
+    /**
+     * PUBLISH — promote current state (từ sales_bonus_override) → office_bonus_result,
+     * mark sheet PUBLISHED → nhân viên thấy. KHÔNG nhận overrides nữa (OWNER đã lưu
+     * bằng saveSalesBonusOverrides trước đó).
+     */
+    @Transactional
+    public SalesBonusPreviewDto publishSalesBonusV2(int month, int year, User actor) {
+        return publishSalesBonusV2Internal(month, year, actor);
+    }
+
+    private void applySalesOverrides(int month, int year, List<SalesBonusOverrideDto> overrides, User actor) {
+        PayrollDepartment dept = PayrollDepartment.SALES;
+        AttendanceSheet sheet = sheetOf(month, year, dept);
+        if (sheet.getSalesBonusStepUnitPrice() == null)
+            throw new IllegalStateException("Chưa bấm 'Tính thưởng' — không có config để lưu.");
+
+        long stepUnitPrice = sheet.getSalesBonusStepUnitPrice();
+        double multiplier  = sheet.getSalesBonusMultiplier() != null ? sheet.getSalesBonusMultiplier() : 1.0;
+        long defaultUnitAfter = Math.round(stepUnitPrice * multiplier);
+        // (10/2026) Cần stepAmount để tính default remainderBonus theo công thức
+        // "% phần dư" — dùng để so sánh ownerEdited đúng, không dính default.
+        long stepAmount = sheet.getSalesBonusStepAmount() != null
+                ? sheet.getSalesBonusStepAmount() : 0L;
+
+        Map<Long, SalesBonusOverrideDto> ovByUser = new HashMap<>();
+        if (overrides != null) {
+            for (SalesBonusOverrideDto o : overrides) {
+                if (o != null && o.getUserId() != null) ovByUser.put(o.getUserId(), o);
+            }
+        }
+        List<SalesBonusOverride> allRows = salesBonusOverrideRepo.findByMonthAndYear(month, year);
+        for (SalesBonusOverride row : allRows) {
+            User u = row.getUser();
+            if (u == null) continue;
+            // Default remainderBonus theo công thức mới (10/2026): để check
+            // ownerEdited đúng — khi OWNER không đổi, giá trị gửi lên == default.
+            long rowRemainder = row.getRemainder() != null ? row.getRemainder() : 0L;
+            int defaultRemPercent = stepAmount > 0
+                    ? (int) (rowRemainder * 100L / stepAmount) : 0;
+            long defaultRemBonus = roundUpTo(
+                    (long) defaultRemPercent * defaultUnitAfter / 100L, 5_000L);
+
+            SalesBonusOverrideDto ov = ovByUser.get(u.getId());
+            if (ov != null) {
+                boolean edited = false;
+                if (ov.getStepUnitPrice() != null && ov.getStepUnitPrice() >= 0) {
+                    row.setStepUnitPrice(ov.getStepUnitPrice());
+                    if (ov.getStepUnitPrice() != defaultUnitAfter) edited = true;
+                }
+                if (ov.getRemainderBonus() != null && ov.getRemainderBonus() >= 0) {
+                    row.setRemainderBonus(ov.getRemainderBonus());
+                    if (ov.getRemainderBonus() != defaultRemBonus) edited = true;
+                }
+                // (10/2026) MỌI NV đều có thể set personalTarget nếu có doanh thu
+                if (ov.getPersonalTarget() != null && ov.getPersonalTarget() >= 0) {
+                    u.setSalesPersonalTarget(ov.getPersonalTarget());
+                    userRepo.save(u);
+                    row.setPersonalTarget(ov.getPersonalTarget());
+                    if (ov.getPersonalTarget() > 0) {
+                        // Dùng ORDER revenue (tổng DT tháng) để tính % đạt KPI
+                        java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+                        long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+                        long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+                        java.math.BigDecimal oRev = nzBd(
+                                orderRepository.sumFinalAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                        row.setAchievedPercent(oRev.doubleValue() / ov.getPersonalTarget() * 100.0);
+                    }
+                }
+                row.setOwnerEdited(edited || Boolean.TRUE.equals(row.getOwnerEdited()));
+            }
+            long total = (long) row.getSteps() * row.getStepUnitPrice() + row.getRemainderBonus();
+            row.setTotalBonus(total);
+            salesBonusOverrideRepo.save(row);
+        }
+    }
+
+    private SalesBonusPreviewDto publishSalesBonusV2Internal(int month, int year, User actor) {
+        PayrollDepartment dept = PayrollDepartment.SALES;
+        AttendanceSheet sheet = sheetOf(month, year, dept);
+        if (sheet.getSalesBonusStepUnitPrice() == null)
+            throw new IllegalStateException("Chưa bấm 'Tính thưởng' — không có config để Public.");
+
+        // (10/2026) Dùng chung helper — logic dựng OfficeBonusResult đã tách ra
+        // để SAVE cũng gọi được. Ở đây chỉ cần sync lại cho chắc rồi mark Published.
+        syncOfficeBonusResultFromOverrides(month, year, actor);
+
+        // Mark sheet PUBLISHED (markBonusPublished tự set bonusFinalized=true)
+        sheet.markBonusPublished(actor != null ? actor.getFullName() : "SYSTEM");
+        sheetRepo.save(sheet);
+
+        log.info("[Payroll] Public SALES bonus v2 {}/{} target={}",
+                month, year, sheet.getSalesBonusTarget());
+
+        return getCurrentSalesBonusV2(month, year);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // PREVIEW HOA HỒNG — hoạt động cả khi CHƯA tính (11/2026)
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -3283,13 +5034,20 @@ public class FactoryPayrollService {
         long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
         long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
 
-        // Kết quả đã tính (nếu có) — để lấy bonusAmount per user
+        // Kết quả đã tính (nếu có) — để lấy bonusAmount + ratio per user
         OfficeBonusResult existing = officeBonusResultRepo
                 .findByMonthAndYearAndDepartment(month, year, department).orElse(null);
         Map<Long, Long> bonusByUser = new HashMap<>();
+        Map<Long, Long> rawBonusByUser = new HashMap<>();
+        Map<Long, java.math.BigDecimal> ratioByUser = new HashMap<>();
         if (existing != null) {
-            for (OfficeBonusItem it : existing.getItems())
+            for (OfficeBonusItem it : existing.getItems()) {
                 bonusByUser.put(it.getUser().getId(), it.getBonusAmount());
+                if (it.getRawBonusAmount() != null)
+                    rawBonusByUser.put(it.getUser().getId(), it.getRawBonusAmount());
+                if (it.getRatioPercent() != null)
+                    ratioByUser.put(it.getUser().getId(), it.getRatioPercent());
+            }
         }
 
         // Danh sách nhân viên hiện trong bảng.
@@ -3319,6 +5077,15 @@ public class FactoryPayrollService {
         int deptTxCount =
                 (int) paymentTransactionRepo.countTransactionsAllOrders(startMs, endMs);
 
+        // (10/2026 fix) "Doanh thu được chia hoa hồng" dùng để tính pool PHẢI
+        // nhất quán với số được dùng ở finalizeBonus (collected + waived).
+        //   collected = Σ pt.amount × netRatio  (từng lần thu, EX-VAT)
+        //   waived    = Σ (final − paid) × netRatio của đơn COMPLETED còn chênh
+        //               — khoản kế toán xác nhận "bỏ số lẻ" vẫn tính HH như đã thu.
+        // Trước fix này, UI chỉ hiển thị collected → chênh với pool đúng bằng
+        // số waived (vd 957đ trong log test).
+        java.math.BigDecimal deptCollectedForBonus = deptCollectedRev.add(deptWaivedRev);
+
         List<OfficeBonusPreviewRowDto> rows = new ArrayList<>();
         for (User u : employees) {
             java.math.BigDecimal rowMonth, rowCollected, rowHold, rowWaived;
@@ -3326,14 +5093,16 @@ public class FactoryPayrollService {
             if (department == PayrollDepartment.SALES) {
                 // Mỗi seller chỉ tính đơn do chính họ tạo (o.user.id = seller.id)
                 rowMonth     = nzBd(orderRepository.sumFinalAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
-                rowCollected = nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId()));
-                rowHold      = nzBd(orderRepository.sumHoldAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                java.math.BigDecimal rowCollectedOnly =
+                        nzBd(paymentTransactionRepo.sumRevenueByUser(startMs, endMs, u.getId()));
                 rowWaived    = nzBd(orderRepository.sumWaivedAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
+                rowCollected = rowCollectedOnly.add(rowWaived);     // dùng chia HH
+                rowHold      = nzBd(orderRepository.sumHoldAmountCreatedInRangeByUser(startMs, endMs, u.getId()));
                 rowTx        = (int) paymentTransactionRepo.countTransactionsByUser(startMs, endMs, u.getId());
             } else {
                 // ACCOUNTING — mỗi row thấy số của phòng
                 rowMonth     = deptMonthOrderRev;
-                rowCollected = deptCollectedRev;
+                rowCollected = deptCollectedForBonus;                // = collected + waived
                 rowHold      = deptHoldRev;
                 rowWaived    = deptWaivedRev;
                 rowTx        = deptTxCount;
@@ -3353,6 +5122,8 @@ public class FactoryPayrollService {
                     .totalWaivedRevenue(rowWaived)
                     .transactionCount(rowTx)
                     .bonusAmount(bonusByUser.get(u.getId()))
+                    .rawBonusAmount(rawBonusByUser.get(u.getId()))
+                    .ratioPercent(ratioByUser.get(u.getId()))
                     .build());
         }
 
@@ -3361,7 +5132,7 @@ public class FactoryPayrollService {
                 .department(department.name())
                 .departmentLabel(department.getLabel())
                 .totalMonthOrderRevenue(deptMonthOrderRev)
-                .totalCollectedRevenue(deptCollectedRev)
+                .totalCollectedRevenue(deptCollectedForBonus)         // = collected + waived
                 .totalHoldRevenue(deptHoldRev)
                 .totalWaivedRevenue(deptWaivedRev)
                 .transactionCount(deptTxCount)
@@ -3369,6 +5140,10 @@ public class FactoryPayrollService {
                 .commissionUnitPrice(existing != null ? existing.getCommissionUnitPrice() : null)
                 .lastCommissionUnitPrice(findLastCommissionUnitPrice(month, year, department))
                 .totalBonusPool(existing != null ? existing.getTotalBonusPool() : null)
+                .undistributedAmount(existing != null ? existing.getUndistributedAmount() : null)
+                .salesTiers(existing != null ? parseSalesTiers(existing.getSalesTiersJson()) : null)
+                .accountingPercent(existing != null ? existing.getAccountingPercent() : null)
+                .accountingRatios(existing != null ? parseAcctRatios(existing.getAccountingRatiosJson()) : null)
                 .computedAt(existing != null ? existing.getComputedAt() : null)
                 .computedByName(existing != null ? existing.getComputedByName() : null)
                 .items(rows)
@@ -3398,17 +5173,88 @@ public class FactoryPayrollService {
     }
 
     /**
-     * Mở lại Thưởng doanh thu — nhân viên quay về "Đang tính thưởng".
-     * OfficeBonusResult không bị xoá cho đến khi OWNER bấm "Hoàn tất Thưởng" lần tiếp.
+     * (10/2026) PUBLIC thưởng — nhân viên bắt đầu thấy phiếu thưởng.
+     * Chỉ cho phép khi đã ở state CALCULATED (đã Tính thưởng ở bước trước).
+     * Chuyển state CALCULATED → PUBLISHED và bật bonusFinalized = true.
+     */
+    @Transactional
+    public AttendanceSheetDto publishBonus(int month, int year, PayrollDepartment department, User actor) {
+        if (department != PayrollDepartment.SALES
+                && department != PayrollDepartment.ACCOUNTING
+                && department != PayrollDepartment.DRIVER)
+            throw new IllegalArgumentException("Chỉ SALES / ACCOUNTING / DRIVER mới có bước Public Thưởng.");
+        AttendanceSheet sheet = sheetOf(month, year, department);
+        if (sheet.getBonusCalcStatus() != com.nhatnam.server.enumtype.PayrollCalcStatus.CALCULATED)
+            throw new IllegalArgumentException(
+                    "Phải Tính thưởng trước. Trạng thái hiện tại: "
+                            + (sheet.getBonusCalcStatus() == null ? "NONE" : sheet.getBonusCalcStatus().name()));
+
+        // (10/2026) Ràng buộc nghiệp vụ: trước khi Public Thưởng, LƯƠNG cả công
+        // ty phải đã Public. Nếu lương vẫn chưa chốt mà Public thưởng, NV sẽ
+        // thấy phiếu "Đang xử lý lương" + có thưởng → không nhất quán.
+        AttendanceSheet company = sheetRepo.findCompanySheet(month, year).orElse(null);
+        boolean companyPub = company != null
+                && company.getCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED;
+        if (!companyPub) {
+            throw new IllegalArgumentException(
+                    "Phải Public LƯƠNG toàn công ty tháng " + month + "/" + year
+                            + " trước khi Public Thưởng (tránh phiếu thưởng xuất hiện khi lương chưa chốt).");
+        }
+
+        sheet.markBonusPublished(actor != null ? actor.getFullName() : "system");
+        sheetRepo.save(sheet);
+        log.info("[Payroll] PUBLIC THƯỞNG {} tháng {}/{} bởi {}", department, month, year,
+                actor != null ? actor.getFullName() : "system");
+        return toSheetDto(sheet);
+    }
+
+    /**
+     * (10/2026) UNPUBLIC thưởng — ẩn phiếu thưởng khỏi nhân viên, giữ nguyên
+     * kết quả đã tính. State PUBLISHED → CALCULATED. OfficeBonusResult KHÔNG xoá.
+     * Dùng khi phát hiện sai, muốn sửa cấu hình rồi tính lại trước khi Public lại.
+     */
+    @Transactional
+    public AttendanceSheetDto unpublishBonus(int month, int year, PayrollDepartment department, User actor) {
+        if (department != PayrollDepartment.SALES
+                && department != PayrollDepartment.ACCOUNTING
+                && department != PayrollDepartment.DRIVER)
+            throw new IllegalArgumentException("Chỉ SALES / ACCOUNTING / DRIVER mới có bước Unpublic Thưởng.");
+        AttendanceSheet sheet = sheetOf(month, year, department);
+        if (sheet.getBonusCalcStatus() != com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED)
+            throw new IllegalArgumentException("Thưởng chưa Public thì không Unpublic được.");
+        sheet.markBonusUnpublished();
+        sheetRepo.save(sheet);
+        log.info("[Payroll] UNPUBLIC THƯỞNG {} tháng {}/{} bởi {}", department, month, year,
+                actor != null ? actor.getFullName() : "system");
+        return toSheetDto(sheet);
+    }
+
+    /**
+     * Mở lại Thưởng doanh thu — reset về state NONE (chưa tính), đồng thời XOÁ
+     * kết quả OfficeBonusResult đã lưu. OWNER sẽ phải nhập lại config và bấm
+     * "Tính thưởng" từ đầu.
+     *
+     * <p>Yêu cầu state hiện tại là CALCULATED (chưa Public). Nếu đang PUBLISHED
+     * thì phải Unpublic trước — tránh trường hợp nhân viên đang xem phiếu rồi
+     * bị xoá đột ngột không rõ lý do.
      */
     @Transactional
     public AttendanceSheetDto reopenBonus(int month, int year, PayrollDepartment department) {
         if (department != PayrollDepartment.SALES && department != PayrollDepartment.ACCOUNTING)
             throw new IllegalArgumentException("Chỉ SALES / ACCOUNTING mới có bước Hoàn tất Thưởng.");
         AttendanceSheet sheet = sheetOf(month, year, department);
-        sheet.unfinalizeBonus();
+        if (sheet.getBonusCalcStatus() == com.nhatnam.server.enumtype.PayrollCalcStatus.PUBLISHED)
+            throw new IllegalArgumentException(
+                    "Thưởng đang Public — hãy Unpublic trước khi Mở lại.");
+        // (10/2026) Mở lại = cho phép TÍNH LẠI từ đầu → cần xoá kết quả đã lưu
+        // để OWNER thấy UI "Chưa tính" và nhập lại config. Nếu không xoá, UI
+        // vẫn hiển thị bảng cũ gây hiểu nhầm là đã có thưởng.
+        officeBonusResultRepo.deleteByMonthAndYearAndDepartment(month, year, department);
+        officeBonusResultRepo.flush();
+        sheet.markBonusReopened();
         sheetRepo.save(sheet);
-        log.info("[Payroll] MỞ LẠI THƯỞNG {} tháng {}/{}", department, month, year);
+        log.info("[Payroll] MỞ LẠI THƯỞNG {} tháng {}/{} (đã xoá OfficeBonusResult)",
+                department, month, year);
         return toSheetDto(sheet);
     }
 
@@ -3467,6 +5313,8 @@ public class FactoryPayrollService {
                         .roleLabel(i.getRoleLabel())
                         .revenue(i.getRevenue())
                         .bonusAmount(i.getBonusAmount())
+                        .rawBonusAmount(i.getRawBonusAmount())
+                        .ratioPercent(i.getRatioPercent())
                         .kpiPercent(i.getKpiPercent())
                         .transactionCount(i.getTransactionCount())
                         .build())
@@ -3479,10 +5327,36 @@ public class FactoryPayrollService {
                 .totalRevenue(r.getTotalRevenue())
                 .totalBonusPool(r.getTotalBonusPool())
                 .transactionCount(r.getTransactionCount())
+                .undistributedAmount(r.getUndistributedAmount())
+                .salesTiers(parseSalesTiers(r.getSalesTiersJson()))
+                .accountingPercent(r.getAccountingPercent())
+                .accountingRatios(parseAcctRatios(r.getAccountingRatiosJson()))
                 .computedAt(r.getComputedAt())
                 .computedByName(r.getComputedByName())
                 .items(items)
                 .build();
+    }
+
+    /** Parse sales tiers JSON lưu trong DB → list DTO. Null hoặc parse lỗi → null. */
+    private List<SalesTierDto> parseSalesTiers(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            return MAPPER.readValue(json, new TypeReference<List<SalesTierDto>>() {});
+        } catch (Exception e) {
+            log.warn("[Bonus] Không parse được sales_tiers_json: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** Parse accounting ratios JSON → list DTO. */
+    private List<UserRatioDto> parseAcctRatios(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            return MAPPER.readValue(json, new TypeReference<List<UserRatioDto>>() {});
+        } catch (Exception e) {
+            log.warn("[Bonus] Không parse được accounting_ratios_json: {}", e.getMessage());
+            return null;
+        }
     }
 
 

@@ -437,11 +437,22 @@ public class FactoryPayrollController {
             @AuthenticationPrincipal User user,
             @RequestParam int month, @RequestParam int year,
             @RequestParam(defaultValue = "SALES") String department,
-            @RequestParam(required = false) Long unitPrice) {
+            @RequestParam(required = false) Long unitPrice,
+            @RequestBody(required = false) FactoryPayrollDtos.FinalizeBonusRequest body) {
         try {
             PayrollDepartment d = requireDept(department);
+
+            // Ưu tiên body (flow mới). Nếu body null nhưng có unitPrice query (FE cũ),
+            // gói thành FinalizeBonusRequest để service xử lý thống nhất.
+            FactoryPayrollDtos.FinalizeBonusRequest req = body;
+            if (req == null && unitPrice != null) {
+                req = FactoryPayrollDtos.FinalizeBonusRequest.builder()
+                        .unitPrice(unitPrice).build();
+            }
+            // Nếu body có mà query param cũng có unitPrice (hiếm), body thắng.
+
             FactoryPayrollDtos.OfficeBonusSummaryDto result =
-                    payrollService.finalizeBonus(month, year, d, user, unitPrice);
+                    payrollService.finalizeBonus(month, year, d, user, req);
             return ResponseEntity.ok(ApiResponse.success(result,
                     "Đã tính hoa hồng %s tháng %d/%d: pool %,dđ"
                             .formatted(d.getLabel(), month, year, result.getTotalBonusPool())));
@@ -471,6 +482,340 @@ public class FactoryPayrollController {
         } catch (IllegalArgumentException e) {
             return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
         } catch (Exception e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * (10/2026) PUBLIC Thưởng — nhân viên bắt đầu thấy phiếu thưởng.
+     * Chỉ chạy khi state đang CALCULATED (đã tính xong).
+     */
+    @PostMapping("/publish-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<AttendanceSheetDto>> publishBonus(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.publishBonus(month, year, d, user),
+                    "Đã Public Thưởng %s tháng %d/%d".formatted(d.getLabel(), month, year)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi Public Thưởng {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * (10/2026) TÍNH THƯỞNG TÀI XẾ — flow mới, lưu 3 config (gas + 2 unit prices)
+     * vào sheet DRIVER + mark CALCULATED. Nhân viên tài xế CHƯA thấy thưởng
+     * cho tới khi OWNER bấm Hoàn tất (= publish-bonus với dept=DRIVER).
+     * Body: { gasPrice: Long, bonusUnitPrice: Long, truckBonusUnitPrice: Long }
+     */
+    // ══════════════════════════════════════════════════════════════════════
+    // SALES BONUS v2 — target + 1 mốc + override per-seller (10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * POST /api/factory-payroll/sales-bonus/preview?month=&year=
+     * Body: { target, stepAmount, stepUnitPrice }
+     * Trả về preview để FE mở ReviewModal cho OWNER chỉnh per-seller.
+     */
+    @PostMapping("/sales-bonus/preview")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.SalesBonusPreviewDto>>
+    previewSalesBonusV2(@AuthenticationPrincipal User user,
+                        @RequestParam int month, @RequestParam int year,
+                        @RequestBody java.util.Map<String, Object> body) {
+        try {
+            long target        = toLong(body.get("target"), 0L);
+            long stepAmount    = toLong(body.get("stepAmount"), 100_000_000L);
+            long stepUnitPrice = toLong(body.get("stepUnitPrice"), 400_000L);
+            // Parse tiers (list of {thresholdPercent, pricePercent})
+            java.util.List<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.SalesBonusTierDto> tiers = new java.util.ArrayList<>();
+            Object rawTiers = body.get("tiers");
+            if (rawTiers instanceof java.util.List<?> list) {
+                for (Object o : list) {
+                    if (o instanceof java.util.Map<?,?> m) {
+                        tiers.add(com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.SalesBonusTierDto.builder()
+                                .thresholdPercent(toInt(((java.util.Map<?,?>) m).get("thresholdPercent"), 0))
+                                .pricePercent(toInt(((java.util.Map<?,?>) m).get("pricePercent"), 0))
+                                .build());
+                    }
+                }
+            }
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.previewSalesBonusV2(month, year, target, stepAmount, stepUnitPrice, tiers, user),
+                    "Đã tính thưởng Sales tháng %d/%d".formatted(month, year)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi preview sales bonus v2 {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * GET /api/factory-payroll/sales-bonus/current?month=&year=
+     * Dùng khi OWNER mở lại tab tháng đã tính — load preview cũ.
+     */
+    @GetMapping("/sales-bonus/current")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.SalesBonusPreviewDto>>
+    getCurrentSalesBonusV2(@RequestParam int month, @RequestParam int year) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.getCurrentSalesBonusV2(month, year), null));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi load sales bonus v2 {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * POST /api/factory-payroll/sales-bonus/publish?month=&year=
+     * Body: { overrides: [{userId, stepUnitPrice, remainderBonus}] }
+     * Lưu override, tạo lại OfficeBonusResult, mark sheet PUBLISHED.
+     */
+    /**
+     * SAVE OVERRIDES (chưa publish) — OWNER bấm "Xác nhận" trong ReviewModal.
+     * Sheet vẫn ở trạng thái CALCULATED, nhân viên chưa thấy.
+     */
+    @PostMapping("/sales-bonus/save")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.SalesBonusPreviewDto>>
+    saveSalesBonusV2(@AuthenticationPrincipal User user,
+                     @RequestParam int month, @RequestParam int year,
+                     @RequestBody com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.PublishSalesBonusRequest req) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.saveSalesBonusOverrides(month, year,
+                            req != null ? req.getOverrides() : null, user),
+                    "Đã lưu thưởng Sales (chưa Public) tháng %d/%d".formatted(month, year)));
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi save sales bonus v2 {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * PUBLISH — OWNER bấm "Hoàn tất". Không nhận body, promote state hiện tại.
+     */
+    @PostMapping("/sales-bonus/publish")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.SalesBonusPreviewDto>>
+    publishSalesBonusV2(@AuthenticationPrincipal User user,
+                        @RequestParam int month, @RequestParam int year) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.publishSalesBonusV2(month, year, user),
+                    "Đã Public thưởng Sales tháng %d/%d".formatted(month, year)));
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi publish sales bonus v2 {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /** Public thưởng kho — bấm "Hoàn tất" trong tab Kho của Bảng chấm công. */
+    @PostMapping("/warehouse-bonus/publish")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<Void>> publishWarehouseBonus(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year) {
+        try {
+            payrollService.publishWarehouseBonus(month, year, user);
+            return ResponseEntity.ok(ApiResponse.success(null, "Đã Public thưởng kho"));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi publish warehouse bonus {}/{}", month, year, e);
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
+    }
+
+    @PostMapping("/warehouse-bonus/unpublish")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<Void>> unpublishWarehouseBonus(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year) {
+        try {
+            payrollService.unpublishWarehouseBonus(month, year, user);
+            return ResponseEntity.ok(ApiResponse.success(null, "Đã mở lại thưởng kho"));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi unpublish warehouse bonus {}/{}", month, year, e);
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
+    }
+
+    /**
+     * BONUS TREND — biến động thưởng 12 tháng cho 1 phòng.
+     * GET /api/factory-payroll/bonus-trend?department=SALES
+     */
+    /**
+     * UPSERT thưởng cứng cho NV phòng Kho (10/2026).
+     * POST /api/factory-payroll/warehouse-bonus { userId, month, year, amount }
+     */
+    @PostMapping("/warehouse-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<Void>> upsertWarehouseBonus(
+            @AuthenticationPrincipal User user,
+            @RequestBody java.util.Map<String, Object> body) {
+        try {
+            Long userId = toLong(body.get("userId"), 0L);
+            int month = toInt(body.get("month"), 0);
+            int year = toInt(body.get("year"), 0);
+            long amount = toLong(body.get("amount"), 0L);
+            if (userId <= 0 || month <= 0 || year <= 0)
+                return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, "Thiếu tham số"));
+            payrollService.upsertWarehouseBonus(userId, month, year, amount, user);
+            return ResponseEntity.ok(ApiResponse.success(null, "Đã lưu thưởng kho"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi upsert warehouse bonus", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ATTENDANCE BONUS — thưởng chuyên cần (10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+
+    @GetMapping("/attendance-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<java.util.List<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.AttendanceBonusRowDto>>>
+    listAttendanceBonus(@RequestParam int month, @RequestParam int year) {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.listAttendanceBonusForMonth(month, year), "OK"));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi load attendance bonus {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    @PostMapping("/attendance-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<Void>> upsertAttendanceBonus(
+            @AuthenticationPrincipal User user,
+            @RequestBody java.util.Map<String, Object> body) {
+        try {
+            Long userId = toLong(body.get("userId"), 0L);
+            int month = toInt(body.get("month"), 0);
+            int year = toInt(body.get("year"), 0);
+            long amount = toLong(body.get("amount"), 0L);
+            if (userId <= 0 || month <= 0 || year <= 0)
+                return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, "Thiếu tham số"));
+            payrollService.upsertAttendanceBonus(userId, month, year, amount, user);
+            return ResponseEntity.ok(ApiResponse.success(null, "Đã lưu thưởng chuyên cần"));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi upsert attendance bonus", e);
+            return ResponseEntity.badRequest().body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        }
+    }
+
+    /**
+     * BONUS SUMMARY — tổng hợp 12 tháng, group theo phòng → chức vụ.
+     * GET /api/factory-payroll/bonus-summary
+     */
+    @GetMapping("/bonus-summary")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.BonusSummaryDto>>
+    getBonusSummary() {
+        try {
+            return ResponseEntity.ok(ApiResponse.success(payrollService.getBonusSummary(), "OK"));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi load bonus summary", e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    @GetMapping("/bonus-trend")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<com.nhatnam.server.dto.factorypayroll.FactoryPayrollDtos.BonusTrendDto>>
+    getBonusTrend(@RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(payrollService.getBonusTrend(d), "OK"));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi load bonus trend dept={}", department, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    @PostMapping("/calculate-driver-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<AttendanceSheetDto>> calculateDriverBonus(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year,
+            @RequestBody java.util.Map<String, Object> body) {
+        try {
+            Long gas        = toLong(body.get("gasPrice"), null);
+            Long bonusMoto  = toLong(body.get("bonusUnitPrice"), null);
+            Long bonusTruck = toLong(body.get("truckBonusUnitPrice"), null);
+
+            // (10/2026) Thưởng cố định cho tài xế xe tải — mỗi người 1 số.
+            // Chấp nhận 2 format FE gửi lên:
+            //   • Map {userId: amount}        — {"12": 3000000, "15": 2500000}
+            //   • List [{userId, amount}, …]  — [{"userId":12,"amount":3000000},…]
+            // Save BEFORE tính (upsert bảng truck_driver_fixed_bonus) để
+            // computeDriverPayrollConfigLive bên dưới đọc đúng số mới.
+            Object raw = body.get("truckDriverFixedBonuses");
+            java.util.Map<Long, Long> fixedMap = new java.util.HashMap<>();
+            if (raw instanceof java.util.Map<?, ?> m) {
+                m.forEach((k, v) -> {
+                    Long uid = toLong(k, null);
+                    Long amt = toLong(v, null);
+                    if (uid != null && amt != null) fixedMap.put(uid, amt);
+                });
+            } else if (raw instanceof java.util.List<?> list) {
+                for (Object o : list) {
+                    if (o instanceof java.util.Map<?, ?> m2) {
+                        Long uid = toLong(m2.get("userId"), null);
+                        Long amt = toLong(m2.get("amount"), null);
+                        if (uid != null && amt != null) fixedMap.put(uid, amt);
+                    }
+                }
+            }
+            if (!fixedMap.isEmpty()) {
+                payrollService.upsertTruckDriverFixedBonuses(month, year, fixedMap);
+            }
+
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.calculateDriverBonus(month, year, gas, bonusMoto, bonusTruck, user),
+                    "Đã tính thưởng tài xế tháng %d/%d".formatted(month, year)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi tính thưởng tài xế {}/{}", month, year, e);
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
+        }
+    }
+
+    /**
+     * (10/2026) UNPUBLIC Thưởng — ẩn khỏi nhân viên, state về CALCULATED.
+     * OfficeBonusResult vẫn giữ nguyên, chỉ ẩn khỏi phiếu lương.
+     */
+    @PostMapping("/unpublish-bonus")
+    @PreAuthorize(ADMIN_ROLES)
+    public ResponseEntity<ApiResponse<AttendanceSheetDto>> unpublishBonus(
+            @AuthenticationPrincipal User user,
+            @RequestParam int month, @RequestParam int year,
+            @RequestParam(defaultValue = "SALES") String department) {
+        try {
+            PayrollDepartment d = requireDept(department);
+            return ResponseEntity.ok(ApiResponse.success(
+                    payrollService.unpublishBonus(month, year, d, user),
+                    "Đã Unpublic Thưởng %s tháng %d/%d".formatted(d.getLabel(), month, year)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+        } catch (Exception e) {
+            log.error("[FactoryPayroll] Lỗi Unpublic Thưởng {}/{}", month, year, e);
             return ResponseEntity.ok(ApiResponse.error(StatusCode.INTERNAL_SERVER_ERROR, e.getMessage()));
         }
     }
@@ -1091,6 +1436,24 @@ public class FactoryPayrollController {
         return d;
     }
 
+    private static long toLong(Object o, long def) {
+        if (o == null) return def;
+        if (o instanceof Number n) return n.longValue();
+        try { return Long.parseLong(String.valueOf(o).trim()); } catch (Exception e) { return def; }
+    }
+    // (10/2026) Overload trả Long nullable — dùng khi "không có giá trị" cần phân
+    // biệt với 0 (ví dụ gasPrice null nghĩa là FE không gửi, khác với 0đ).
+    private static Long toLong(Object o, Long def) {
+        if (o == null) return def;
+        if (o instanceof Number n) return n.longValue();
+        try { return Long.parseLong(String.valueOf(o).trim()); } catch (Exception e) { return def; }
+    }
+    private static int toInt(Object o, int def) {
+        if (o == null) return def;
+        if (o instanceof Number n) return n.intValue();
+        try { return Integer.parseInt(String.valueOf(o).trim()); } catch (Exception e) { return def; }
+    }
+
     // ── EXPORT FILE LƯƠNG TỔNG HỢP ─────────────────────────────────────────────
 
     /**
@@ -1129,17 +1492,39 @@ public class FactoryPayrollController {
                 case "SALARY_ONLY" -> "luong";
                 default -> "luong-thuong";
             };
-            String filename = "bang-" + typeSlug + "-thang-" + month + "-" + year + ".xlsx";
+            // (10/2026) Nếu là xuất THƯỞNG của MỘT phòng cụ thể → chèn slug tên
+            // phòng (không dấu) vào tên file để OWNER phân biệt được khi tải nhiều
+            // phòng: bang-thuong-ketoan-thang-09-2026.pdf,
+            // bang-thuong-kinhdoanh-thang-09-2026.pdf, …
+            String deptSlug = "";
+            if ("BONUS_ONLY".equals(request.getExportType())
+                    && request.getDepartments() != null
+                    && request.getDepartments().size() == 1) {
+                deptSlug = switch (request.getDepartments().get(0)) {
+                    case "ACCOUNTING" -> "-ketoan";
+                    case "SALES"      -> "-kinhdoanh";
+                    case "FACTORY"    -> "-xuongsx";
+                    case "WAREHOUSE"  -> "-kho";
+                    case "DRIVER"     -> "-taixe";
+                    default -> "";
+                };
+            }
+            String filename = "bang-" + typeSlug + deptSlug + "-thang-"
+                    + String.format("%02d", month) + "-" + year + ".pdf";
 
             return ResponseEntity.ok()
                     .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
-                    .contentType(MediaType.parseMediaType(
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                    .contentType(MediaType.APPLICATION_PDF)
                     .body(bytes);
         } catch (Exception e) {
             log.error("[SALARY-EXPORT] error month={} year={}", month, year, e);
-            return ResponseEntity.ok(
-                    ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
+            // Phải trả HTTP 4xx (không được ok()) — FE gọi với responseType:'blob',
+            // nếu trả 200 thì axios không throw và FE sẽ đặt tên file .pdf cho body
+            // JSON lỗi → mở ra báo "Failed to load PDF document". Trả JSON với
+            // status BAD_REQUEST để FE parseExportError đọc được `message` và toast.
+            return ResponseEntity.badRequest()
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(ApiResponse.error(StatusCode.BAD_REQUEST, e.getMessage()));
         }
     }
 

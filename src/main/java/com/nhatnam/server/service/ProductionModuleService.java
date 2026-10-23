@@ -427,13 +427,14 @@ public class ProductionModuleService {
             }
         }
 
-        // Nếu scheduledStart là tương lai → SCHEDULED, ngược lại → PENDING_PLAN
-        // Nếu scheduledMode=true thì luôn dùng SCHEDULED cho đến khi đến ngày
+        // (10/2026) Mặc định "phát hành ngay" — lệnh SX tạo xong vào thẳng
+        // PENDING_PLAN để xưởng lập phương án, không chờ OWNER bấm "Phát hành".
+        // CHỈ khi user tick "Hẹn giờ" (scheduledMode=true) mới giữ SCHEDULED
+        // tới ngày bắt đầu.
         boolean isScheduledMode = Boolean.TRUE.equals(req.getScheduledMode());
-        WorkOrder.WorkOrderStatus initStatus =
-                (isScheduledMode || scheduledStart > System.currentTimeMillis())
-                        ? WorkOrder.WorkOrderStatus.SCHEDULED
-                        : WorkOrder.WorkOrderStatus.PENDING_PLAN;
+        WorkOrder.WorkOrderStatus initStatus = isScheduledMode
+                ? WorkOrder.WorkOrderStatus.SCHEDULED
+                : WorkOrder.WorkOrderStatus.PENDING_PLAN;
 
         // Resolve factory
         ProductionFactory factory = req.getProductionFactoryId() != null

@@ -65,6 +65,10 @@ public class EmployeeRequestService {
     // thực tế → nhân viên gửi thêm đơn được → OWNER duyệt → quỹ về ÂM.
     private final com.nhatnam.server.repository.ManualLeaveUsageRepository manualLeaveUsageRepo;
     private final com.nhatnam.server.repository.AttendanceEntryRepository attendanceEntryRepo;
+    // (10/2026) Kiểm tra lương tháng trước đã Public chưa để quyết định có cho
+    // nhân viên tạo phiếu nghỉ ngược tháng đó không.
+    private final com.nhatnam.server.repository.AttendanceSheetRepository attendanceSheetRepo;
+    private final com.nhatnam.server.repository.EmployeeSalaryRepository salaryRepo;
 
     /**
      * Tháng cuối cùng dùng số OWNER NHẬP TAY (ManualLeaveUsage). Tháng lớn hơn
@@ -95,16 +99,27 @@ public class EmployeeRequestService {
      * KHÔNG giới hạn (hôm nay tháng 9 vẫn xin nghỉ cho tháng 12 được).
      * Các loại khác vẫn theo offset như cũ.
      */
-    public RequestFormConfigDto formConfig() {
+    public RequestFormConfigDto formConfig(User me) {
         LocalDate today = LocalDate.now(VN);
         YearMonth ym = YearMonth.from(today);
+
+        // (10/2026) Cho phép tạo phiếu nghỉ phép LÙI về tháng TRƯỚC, nhưng chỉ
+        // khi lương tháng trước CHƯA được Public (nếu đã chốt lương rồi thì
+        // thêm phép không còn tác dụng — chặn luôn ở FE để tránh gửi vô ích).
+        YearMonth prevYm = ym.minusMonths(1);
+        boolean prevMonthPayrollPublished = attendanceSheetRepo
+                .isPublished(prevYm.getMonthValue(), prevYm.getYear());
 
         List<RequestTypeOptionDto> types = new ArrayList<>();
         for (EmployeeRequestType t : EmployeeRequestType.values()) {
             LocalDate minDate, maxDate;
             if (t.isMonthScoped()) {
-                // Nghỉ phép: lùi tối đa về ngày 1 tháng hiện tại; tiến không giới hạn.
-                minDate = ym.atDay(1);
+                // Nghỉ phép: cửa sổ lùi mở rộng về đầu THÁNG TRƯỚC nếu lương
+                // tháng trước chưa Public; nếu đã Public thì giữ như cũ (đầu
+                // tháng hiện tại). Chiều TIẾN không giới hạn.
+                minDate = prevMonthPayrollPublished
+                        ? ym.atDay(1)
+                        : prevYm.atDay(1);
                 maxDate = null;
             } else {
                 minDate = today.plusDays(t.minOffsetDays());
@@ -122,11 +137,27 @@ public class EmployeeRequestService {
                     .build());
         }
 
+        // (10/2026) Cờ parttime lấy từ hồ sơ lương mới nhất của NV. Không có
+        // hồ sơ hoặc có nhưng partTime=null/false → fulltime (ẩn checkbox
+        // chiều cho parttime vì họ không có ca chiều).
+        boolean isPartTime = false;
+        if (me != null) {
+            try {
+                var list = salaryRepo.findAllByUserIdOrderByCreatedAtDesc(me.getId());
+                isPartTime = !list.isEmpty()
+                        && Boolean.TRUE.equals(list.get(0).getPartTime());
+            } catch (Exception e) {
+                log.warn("[EmployeeRequest] Không lấy được cờ parttime của user {}: {}",
+                        me.getId(), e.getMessage());
+            }
+        }
+
         return RequestFormConfigDto.builder()
                 .today(today)
                 .types(types)
                 .shiftStart("08:00")
                 .shiftEnd("17:00")
+                .partTime(isPartTime)
                 .build();
     }
 
@@ -172,8 +203,19 @@ public class EmployeeRequestService {
             validateWindow(type, to, today);
         }
 
-        if (body.getReason() == null || body.getReason().isBlank())
-            throw new IllegalArgumentException("Bắt buộc nhập lý do.");
+        // (10/2026) Lý do KHÔNG còn bắt buộc với phiếu NGHỈ PHÉP — nếu NV để
+        // trống thì mặc định "Nghỉ phép có lương". Các loại khác (đi trễ, về
+        // sớm, công tác…) vẫn bắt buộc nhập để OWNER có căn cứ duyệt.
+        String reasonText;
+        if (body.getReason() == null || body.getReason().isBlank()) {
+            if (type == EmployeeRequestType.LEAVE) {
+                reasonText = "Nghỉ phép có lương";
+            } else {
+                throw new IllegalArgumentException("Bắt buộc nhập lý do.");
+            }
+        } else {
+            reasonText = body.getReason().trim();
+        }
 
         // Chặn trùng — kiểm tra ở CẤP ĐỘ NGÀY thay vì khoảng ngày.
         //
@@ -231,7 +273,7 @@ public class EmployeeRequestService {
                 .fromDate(from).toDate(to)
                 .days(days)
                 .minutes(minutes)
-                .reason(body.getReason().trim())
+                .reason(reasonText)
                 .status(EmployeeRequestStatus.PENDING)
                 .build());
 
@@ -308,9 +350,26 @@ public class EmployeeRequestService {
     private void validateWindow(EmployeeRequestType type, LocalDate date, LocalDate today) {
         LocalDate min, max;
         if (type.isMonthScoped()) {
-            // Nghỉ phép: chặn lùi quá ngày 1 tháng hiện tại; không chặn tiến.
-            min = YearMonth.from(today).atDay(1);
+            // (10/2026) Nghỉ phép: cho tạo cho THÁNG TRƯỚC nếu lương tháng
+            // trước chưa Public — hợp lý vì chốt lương xong mà cho thêm phép
+            // ngược thì lương không còn khớp bảng công bố.
+            YearMonth prevYm = YearMonth.from(today).minusMonths(1);
+            boolean prevPub = attendanceSheetRepo
+                    .isPublished(prevYm.getMonthValue(), prevYm.getYear());
+            min = prevPub
+                    ? YearMonth.from(today).atDay(1)
+                    : prevYm.atDay(1);
             max = null;
+
+            // Chặn rõ ràng với msg giải thích khi date thuộc tháng trước mà
+            // lương tháng trước đã Public — tránh lỗi mơ hồ "chỉ được chọn từ".
+            YearMonth dateYm = YearMonth.from(date);
+            if (dateYm.equals(prevYm) && prevPub) {
+                throw new IllegalArgumentException(
+                        "Lương tháng %d/%d đã công bố, không tạo được phiếu %s lùi tháng này nữa."
+                                .formatted(prevYm.getMonthValue(), prevYm.getYear(),
+                                        type.getLabel().toLowerCase()));
+            }
         } else {
             min = today.plusDays(type.minOffsetDays());
             max = type.maxOffsetDays() == null ? null : today.plusDays(type.maxOffsetDays());
@@ -534,22 +593,38 @@ public class EmployeeRequestService {
                         .orElse(0);
             } else {
                 double paidDays = calcPaidLeaveDaysInMonth(yearLeaves, m, y);
-                int deductMinutes = attendanceEntryRepo
+
+                // (10/2026) Phần đi trễ/về sớm trừ vào quỹ phép CHỈ ĐƯỢC TÍNH
+                // khi lương tháng đó đã PUBLIC (sheet.finalized=true). Khi
+                // OWNER bấm "Mở lại" tháng đó → sheet.unfinalize() → phần đã
+                // trừ phải được REFUND vào quỹ phép ngay, không chờ re-import
+                // file. Trước đây leaveMinutesUsed vẫn còn trên entry nên quỹ
+                // phép vẫn hiển thị bị trừ → user phản ánh "mở lại mà vẫn trừ".
+                boolean monthLocked = attendanceSheetRepo.isLockedForLeaveDeduction(m, y);
+                int deductMinutes = monthLocked
+                        ? attendanceEntryRepo
                         .findByUserAndPeriod(userId, m, y)
                         .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)
-                        .orElse(0);
+                        .orElse(0)
+                        : 0;
                 usedMinutes += Math.round(paidDays * LEAVE_MINUTES_PER_DAY) + deductMinutes;
             }
         }
         double used = usedMinutes / (double) LEAVE_MINUTES_PER_DAY;
 
+        // (10/2026) Clamp remaining ≥ 0: khi tổng đã dùng (phiếu + attendance
+        // deduct) VƯỢT quỹ phép (có thể xảy ra nếu owner duyệt phiếu nghỉ sau
+        // khi lương tháng cũ đã bake-in attendance deduct), display âm làm NV
+        // hoảng. Hiển thị 0 — luồng mới per-day attribution ở
+        // CompanyAttendanceService sẽ ngăn phần vượt khi tính lại lương.
+        double remaining = Math.max(0.0, entitled - used);
         return LeaveBalanceDto.builder()
                 .userId(u.getId()).fullName(u.getFullName()).year(y)
                 .workStartDate(u.getWorkStartDate())
                 .seniorityYears(seniority)
                 .entitledDays(round2(entitled))
                 .usedDays(round2(used))
-                .remainingDays(round2(entitled - used))
+                .remainingDays(round2(remaining))
                 .missingWorkStartDate(u.getWorkStartDate() == null)
                 .build();
     }
@@ -1082,10 +1157,13 @@ public class EmployeeRequestService {
                 .totalDays(daysBetween(r))
                 .reason(r.getReason())
                 .status(r.getStatus().name())
-                .statusLabel(r.getStatus().getLabel())
+                // (10/2026) Dùng label động: khi auto-split paid+unpaid cùng > 0
+                // → trả "Đã duyệt - X có lương, Y không lương" thay vì chỉ 1 nhánh.
+                .statusLabel(computeStatusLabel(r))
                 .deductedDays(r.getDeductedDays())
                 .paidLeaveDays(r.getPaidLeaveDays())
                 .unpaidLeaveDays(r.getUnpaidLeaveDays())
+                .daysBreakdown(computeDaysBreakdown(r))
                 .decisionNote(r.getDecisionNote())
                 .decidedByName(r.getDecidedByName())
                 .decidedAt(r.getDecidedAt())
@@ -1094,6 +1172,70 @@ public class EmployeeRequestService {
                 .actionable(r.isPending())
                 .build();
     }
+
+    /**
+     * (10/2026) Label trạng thái có chi tiết chia có lương / không lương khi
+     * phiếu nghỉ phép bị auto-split (hết quỹ phép).
+     */
+    private String computeStatusLabel(EmployeeRequest r) {
+        String base = r.getStatus().getLabel();
+        if (r.getType() != EmployeeRequestType.LEAVE) return base;
+        if (!r.getStatus().isEffective()) return base;
+        double paid = r.getPaidLeaveDays() != null ? r.getPaidLeaveDays() : 0.0;
+        double unpaid = r.getUnpaidLeaveDays() != null ? r.getUnpaidLeaveDays() : 0.0;
+        if (paid > 0 && unpaid > 0) {
+            return "Đã duyệt - %s có lương, %s không lương"
+                    .formatted(fmt(paid), fmt(unpaid));
+        }
+        return base;
+    }
+
+    /**
+     * (10/2026) Phân rã phiếu nghỉ ra từng ngày với cờ paid/unpaid.
+     * Thuật toán: lấy list ngày trong phiếu theo thứ tự (dùng LeaveDay nếu có,
+     * ngược lại trải từ fromDate → toDate), rồi lấp đủ `paidLeaveDays` vào các
+     * ngày đầu tiên; phần còn lại = unpaid. Nửa ngày (half-day) chiếm 0.5 trong
+     * quota.
+     */
+    private List<com.nhatnam.server.dto.hr.EmployeeRequestDtos.LeaveDayBreakdownDto>
+    computeDaysBreakdown(EmployeeRequest r) {
+        if (r.getType() != EmployeeRequestType.LEAVE) return null;
+        if (!r.getStatus().isEffective()) return null;
+
+        double paidRemaining = r.getPaidLeaveDays() != null ? r.getPaidLeaveDays() : 0.0;
+
+        List<DayValue> items = new ArrayList<>();
+        if (r.hasDays()) {
+            for (EmployeeRequest.LeaveDay d : r.getDays()) {
+                if (d.isEmpty()) continue;
+                double v = (d.isMorning() ? 0.5 : 0.0) + (d.isAfternoon() ? 0.5 : 0.0);
+                items.add(new DayValue(d.getDate(), v));
+            }
+        } else {
+            LocalDate cur = r.getFromDate();
+            while (!cur.isAfter(r.getToDate())) {
+                items.add(new DayValue(cur, 1.0));
+                cur = cur.plusDays(1);
+            }
+        }
+        items.sort(Comparator.comparing(a -> a.date));
+
+        List<com.nhatnam.server.dto.hr.EmployeeRequestDtos.LeaveDayBreakdownDto> out = new ArrayList<>();
+        for (DayValue it : items) {
+            boolean paid = paidRemaining >= it.value - 1e-6;
+            String label = paid ? "có phép" : "hết phép, không lương";
+            out.add(com.nhatnam.server.dto.hr.EmployeeRequestDtos.LeaveDayBreakdownDto.builder()
+                    .date(it.date)
+                    .dayValue(it.value)
+                    .paid(paid)
+                    .label(label)
+                    .build());
+            if (paid) paidRemaining -= it.value;
+        }
+        return out;
+    }
+
+    private record DayValue(LocalDate date, double value) {}
 
     /**
      * Câu mô tả thời gian xin phép, tuỳ loại đơn:

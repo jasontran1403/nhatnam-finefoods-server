@@ -130,6 +130,13 @@ public class SellerController {
             @RequestParam(required = false) Long to,
             Authentication authentication) {
         try {
+            // (10/2026) SELLER thuần không trong whitelist chỉ thấy đơn của
+            // chính họ. Role khác giữ nguyên — xem all. Thay vì chặn 403, chỉ
+            // filter data để báo cáo luôn ra số đúng với scope của user.
+            Long scopeSellerId = authentication == null ? null
+                    : com.nhatnam.server.common.ReportAccessGuard.sellerScopeId(
+                    (User) authentication.getPrincipal());
+
             // Lấy tất cả đơn hàng (không phân biệt ai tạo), filter theo thời gian
             List<Order> orders = orderRepository.findAllByOrderByCreatedAtDesc();
 
@@ -146,10 +153,30 @@ public class SellerController {
                         .toList();
             }
 
-            // Loại bỏ đơn hủy
+            // (10/2026) Báo cáo NGUYÊN LIỆU chỉ lấy đơn ĐANG LƯU HÀNH thực sự:
+            //   PREPARING / DELIVERING / PENDING_PAYMENT (gồm cả thanh toán 1
+            //   phần qua paymentStatus=PARTIAL) / COMPLETED.
+            // Loại bỏ các đơn chưa chốt (PENDING, CONFIRMED, READY), đơn huỷ
+            // (CANCELLED) và đơn thất bại (FAILED) — không tiêu hao nguyên liệu
+            // thực tế.
+            java.util.EnumSet<com.nhatnam.server.enumtype.OrderStatus> INGREDIENT_REPORTED_STATUSES =
+                    java.util.EnumSet.of(
+                            com.nhatnam.server.enumtype.OrderStatus.PREPARING,
+                            com.nhatnam.server.enumtype.OrderStatus.DELIVERING,
+                            com.nhatnam.server.enumtype.OrderStatus.PENDING_PAYMENT,
+                            com.nhatnam.server.enumtype.OrderStatus.COMPLETED);
             orders = orders.stream()
-                    .filter(o -> o.getStatus() != com.nhatnam.server.enumtype.OrderStatus.CANCELLED)
+                    .filter(o -> o.getStatus() != null
+                            && INGREDIENT_REPORTED_STATUSES.contains(o.getStatus()))
                     .toList();
+
+            // (10/2026) Scope: SELLER không whitelist → chỉ đơn mình tạo.
+            if (scopeSellerId != null) {
+                final Long sid = scopeSellerId;
+                orders = orders.stream()
+                        .filter(o -> o.getUser() != null && sid.equals(o.getUser().getId()))
+                        .toList();
+            }
 
             int totalOrders = orders.size();
 
@@ -766,10 +793,14 @@ public class SellerController {
                         "Khoảng thời gian không hợp lệ"));
 
             User user = (User) authentication.getPrincipal();
+            // (10/2026) Scope: SELLER không whitelist → chỉ đơn mình tạo.
+            // Role khác giữ nguyên (all orders).
+            Long scopeSellerId = com.nhatnam.server.common.ReportAccessGuard.sellerScopeId(user);
             String actor = user.getFullName() != null && !user.getFullName().isBlank()
                     ? user.getFullName() : user.getUsername();
 
-            byte[] pdf = orderProductReportPdfService.generatePdf(from, to, categoryIds, actor);
+            byte[] pdf = orderProductReportPdfService.generatePdf(
+                    from, to, categoryIds, actor, scopeSellerId);
 
             String fromStr = Instant.ofEpochMilli(from).atZone(VN)
                     .format(DateTimeFormatter.ofPattern("yyyyMMdd"));

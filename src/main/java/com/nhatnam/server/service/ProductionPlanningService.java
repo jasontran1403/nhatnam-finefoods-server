@@ -277,9 +277,9 @@ public class ProductionPlanningService {
 
         long scheduledStart = req.getPlannedStartDate() != null
                 ? req.getPlannedStartDate() : System.currentTimeMillis();
-        WorkOrder.WorkOrderStatus initStatus = scheduledStart > System.currentTimeMillis()
-                ? WorkOrder.WorkOrderStatus.SCHEDULED
-                : WorkOrder.WorkOrderStatus.PENDING_PLAN;
+        // (10/2026) Mặc định "phát hành ngay" — xem ProductionModuleService.createWorkOrder.
+        // Service này không có scheduledMode flag nên luôn PENDING_PLAN.
+        WorkOrder.WorkOrderStatus initStatus = WorkOrder.WorkOrderStatus.PENDING_PLAN;
 
         WorkOrder wo = WorkOrder.builder()
                 .workOrderCode(generateWorkOrderCode())

@@ -50,6 +50,9 @@ public class SalaryExportService {
     private final FactoryKpiService kpiService;
     private final FactoryKpiBonusItemRepository kpiBonusItemRepo;
     private final OfficeBonusResultRepository officeBonusResultRepo;
+    private final com.nhatnam.server.repository.OrderRepository orderRepository;
+    // (10/2026) Tất cả export lương/thưởng của OWNER đổi sang PDF — service riêng.
+    private final SalaryReportPdfService pdfService;
 
     private static final long LUNCH_ALLOWANCE_PER_DAY = 30_000L;
 
@@ -254,15 +257,16 @@ public class SalaryExportService {
     @Transactional(readOnly = true)
     public byte[] exportSalaryReport(int month, int year, List<String> departments, String exportType) throws Exception {
 
-        // ── [FIX] Tab Tài xế + "Chỉ thưởng" → xuất file riêng với layout mới ──
-        // Bao gồm cả tài xế thật + nhân viên hỗ trợ giao hàng (nonDriverRows)
+        // ── (10/2026) ALL export → PDF ────────────────────────────────────
+        // Owner xuất bảng thưởng từng phòng — delegate sang SalaryReportPdfService.
         if ("BONUS_ONLY".equals(exportType)) {
             String dept = departments.get(0); // FE gửi đúng 1 phòng ban
             return switch (dept) {
-                case "DRIVER"     -> exportDriverBonusReport(month, year);
-                case "FACTORY"    -> exportFactoryBonusReport(month, year);
-                case "ACCOUNTING" -> exportOfficeBonusReport(month, year, PayrollDepartment.ACCOUNTING);
-                case "SALES"      -> exportOfficeBonusReport(month, year, PayrollDepartment.SALES);
+                case "DRIVER"     -> pdfService.driverBonusPdf(month, year);
+                case "FACTORY"    -> pdfService.factoryBonusPdf(month, year);
+                case "ACCOUNTING" -> pdfService.officeBonusPdf(month, year, PayrollDepartment.ACCOUNTING);
+                case "SALES"      -> pdfService.officeBonusPdf(month, year, PayrollDepartment.SALES);
+                case "WAREHOUSE"  -> pdfService.warehouseBonusPdf(month, year);
                 default -> throw new IllegalArgumentException("Phòng ban " + dept + " chưa hỗ trợ xuất thưởng riêng.");
             };
         }
@@ -293,6 +297,50 @@ public class SalaryExportService {
                 deptData.put(deptCode, rows);
             }
         }
+
+        // ── (10/2026) PDF export cho lương tổng hợp ───────────────────────
+        // User yêu cầu "file lương/thưởng export ra sẽ là PDF". Phần "BONUS_ONLY"
+        // đã delegate ở trên — còn lại SALARY_ONLY + lương+thưởng xuất PDF ở đây.
+        // Code Excel bên dưới GIỮ LẠI để fallback nếu cần, nhưng không reach được.
+        final Map<String, List<EmployeeRow>> deptDataFinal = deptData;
+        return pdfService.salaryReportPdf(month, year, orderedDepts,
+                deptCode -> deptDataFinal.getOrDefault(deptCode, List.of()).stream()
+                        .map(er -> {
+                            var v = new SalaryReportPdfService.EmployeeRowView();
+                            v.name = er.user != null ? er.user.getFullName() : "";
+                            v.role = er.roleLabel;
+                            v.workdays = er.actualWorkdays;
+                            v.baseSalary = er.breakdown != null && er.breakdown.getBaseSalary() != null
+                                    ? er.breakdown.getBaseSalary() : 0L;
+                            long allow = 0L;
+                            if (er.breakdown != null && er.breakdown.getAllowances() != null) {
+                                for (AllowanceItemDto a : er.breakdown.getAllowances()) {
+                                    if (a.getAmount() != null) allow += a.getAmount();
+                                }
+                            } else if (er.breakdown != null && er.breakdown.getAllowance() != null) {
+                                allow = er.breakdown.getAllowance();
+                            }
+                            v.allowances = allow;
+                            v.bonus = er.breakdown != null && er.breakdown.getEffectiveBonus() != null
+                                    ? er.breakdown.getEffectiveBonus()
+                                    : (er.breakdown != null && er.breakdown.getBonus() != null
+                                    ? er.breakdown.getBonus() : 0L);
+                            v.net = er.breakdown != null && er.breakdown.getNetSalary() != null
+                                    ? er.breakdown.getNetSalary() : 0L;
+                            return v;
+                        })
+                        .collect(Collectors.toList()),
+                exportType);
+    }
+
+    /** @deprecated Giữ lại code Excel bên dưới để fallback khi cần — không gọi nữa. */
+    @Deprecated
+    @SuppressWarnings("unused")
+    private byte[] exportSalaryReportExcelLegacy(int month, int year, List<String> departments,
+                                                 String exportType, Map<String, List<EmployeeRow>> deptData) throws Exception {
+        // Recompute locals so legacy body compiles after extraction (10/2026 refactor).
+        boolean includeSalary = !"BONUS_ONLY".equals(exportType);
+        boolean includeBonus  = !"SALARY_ONLY".equals(exportType);
 
         // ── Thu thập TẤT CẢ nhãn phụ cấp xuất hiện ở bất kỳ nhân viên nào ──
         //   Bắt đầu bằng 4 nhãn cơ bản (luôn có cột dù = 0), sau đó thêm các
@@ -541,27 +589,23 @@ public class SalaryExportService {
                 CellStyle net = even ? nve : nvn;
 
                 // ── Xác định lý do không có bonus ──
-                //   Với thang mới 2026, parttime CŨNG được chia bonus (hệ số
-                //   0.6), miễn đi làm ≥ 15 buổi. Nên message không còn phân biệt
-                //   parttime nữa — chỉ phân biệt đơn vị đếm (ngày/buổi).
+                //   (10/2026) Chính sách MỚI: ai đi làm dù chỉ 1 ngày hợp lệ
+                //   cũng được chia tỉ lệ, nên lý do "dưới 15 ngày" không còn
+                //   đúng. Chỉ còn 2 trường hợp bonus = 0:
+                //     • Không có dữ liệu chấm công cả tháng.
+                //     • Số ngày đi làm = 0 (nghỉ hết tháng không phép, bị
+                //       đuổi, mới vào chưa chấm, ...).
+                //     • Nghỉ thai sản theo luật (giữ ngoại lệ cũ).
                 String reason = null;
                 if (!isSecurity && bonus == 0) {
-                    // ── NGOẠI LỆ: nghỉ thai sản theo luật ────────────────────
-                    //   Nhân viên này nghỉ hợp pháp, không đủ ngày công nên không
-                    //   được chia KPI. Không hiển thị lý do "dưới 15 ngày công"
-                    //   (gây hiểu nhầm là nghỉ không phép), thay bằng
-                    //   "Nghỉ thai sản theo luật".
                     if (FactoryKpiService.isMaternityLeave(u)) {
                         reason = "Nghỉ thai sản theo luật";
                     } else if (item == null) {
                         reason = "Không đủ điều kiện nhận thưởng Bonus tháng "
                                 + month + " do không có dữ liệu chấm công.";
                     } else {
-                        boolean isPartTime = attEntry != null
-                                && Boolean.TRUE.equals(attEntry.getPartTime());
-                        String unit = isPartTime ? "buổi" : "ngày";
                         reason = "Không đủ điều kiện nhận thưởng Bonus tháng "
-                                + month + " do đi làm dưới 15 " + unit + " công.";
+                                + month + " do không có ngày đi làm hợp lệ.";
                     }
                 }
                 boolean noBonus = (reason != null);
@@ -692,10 +736,15 @@ public class SalaryExportService {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // XUẤT FILE THƯỞNG KẾ TOÁN / KINH DOANH
+    // XUẤT FILE THƯỞNG KẾ TOÁN / KINH DOANH  (refactor 10/2026)
     //
-    // Cột: STT | Họ tên | Chức vụ | Doanh thu (chỉ SALES) | Tỷ lệ KPI | Bonus | Tạm ứng | Tổng
-    // Header: Tổng doanh thu thu được, Đơn giá thưởng, Tổng quỹ thưởng
+    // Cột (cả 2 bộ phận): STT | Họ tên | Chức vụ | Bonus | Tạm ứng | Tổng
+    //   - Bỏ "Tỷ lệ KPI (%)" (user yêu cầu)
+    //   - KD: bỏ cả cột "Doanh thu cá nhân"
+    //
+    // Subtitle:
+    //   - KT: "Doanh thu đang hold tháng: X  ·  Doanh thu chia hoa hồng: Y"
+    //   - KD: không có dòng subtitle (user yêu cầu bỏ cả "Thang: ..." + info line)
     // ══════════════════════════════════════════════════════════════════════════
 
     private byte[] exportOfficeBonusReport(int month, int year, PayrollDepartment dept) throws Exception {
@@ -717,8 +766,8 @@ public class SalaryExportService {
             XSSFCellStyle nvn = wb.createCellStyle(); nvn.cloneStyleFrom(styles.netOdd); nvn.setDataFormat(vnFmt);
             XSSFCellStyle nve = wb.createCellStyle(); nve.cloneStyleFrom(styles.netEven); nve.setDataFormat(vnFmt);
 
-            // SALES: +1 cột Doanh thu
-            int COLS = isSales ? 8 : 7;
+            // CẢ 2 bộ phận giờ dùng 6 cột: STT | Họ tên | Chức vụ | Bonus | Tạm ứng | Tổng
+            final int COLS = 6;
             int r = 0;
 
             // Title
@@ -730,27 +779,38 @@ public class SalaryExportService {
             sheet.addMergedRegion(new CellRangeAddress(r, r, 0, COLS-1));
             putCell(r1, 0, "BẢNG THƯỞNG DOANH THU " + deptLabel.toUpperCase() + " THÁNG " + month + "/" + year, styles.title); r++;
 
-            // Info header
-            String totalRevStr = bonusResult != null ? fmtVNd(bonusResult.getTotalRevenue().longValue()) : "—";
-            String poolStr = bonusResult != null ? fmtVNd(bonusResult.getTotalBonusPool()) : "—";
-            int txCount = bonusResult != null && bonusResult.getTransactionCount() != null ? bonusResult.getTransactionCount() : 0;
+            // Subtitle — chỉ cho KT. KD bỏ hẳn theo yêu cầu 10/2026.
+            if (!isSales) {
+                // Tính hold của tháng (EX-VAT, dept-level): dùng OrderRepository
+                // để nhất quán với số hiển thị trên UI.
+                java.time.YearMonth ym = java.time.YearMonth.of(year, month);
+                java.time.ZoneId VN = java.time.ZoneId.of("Asia/Ho_Chi_Minh");
+                long startMs = ym.atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+                long endMs   = ym.plusMonths(1).atDay(1).atStartOfDay(VN).toInstant().toEpochMilli();
+                java.math.BigDecimal holdBd = orderRepository.sumHoldAmountCreatedInRange(startMs, endMs);
+                long holdLong = holdBd == null ? 0L : holdBd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
 
-            Row r2 = sheet.createRow(r); r2.setHeightInPoints(22);
-            sheet.addMergedRegion(new CellRangeAddress(r, r, 0, COLS-1));
-            putCell(r2, 0, "Tổng doanh thu thu được: " + totalRevStr
-                    + "  ·  Số phiếu thanh toán: " + txCount
-                    + "  ·  Tổng quỹ thưởng: " + poolStr
-                    + "  ·  Thang: 400.000đ mỗi 100tr doanh thu", styles.subTitle); r++;
-            r++;
+                // Doanh thu chia hoa hồng = totalRevenue trong OfficeBonusResult
+                // (= collected + waived EX-VAT, bằng số pool đã tính trên đó).
+                long collectedForBonus = bonusResult != null && bonusResult.getTotalRevenue() != null
+                        ? bonusResult.getTotalRevenue().longValue() : 0L;
 
-            // Table header
+                Row r2 = sheet.createRow(r); r2.setHeightInPoints(22);
+                sheet.addMergedRegion(new CellRangeAddress(r, r, 0, COLS-1));
+                putCell(r2, 0,
+                        "Doanh thu đang hold tháng: " + fmtVNd(holdLong)
+                                + "  ·  Doanh thu chia hoa hồng: " + fmtVNd(collectedForBonus),
+                        styles.subTitle);
+                r++;
+            }
+            r++; // blank
+
+            // Table header — 6 cột, bỏ KPI (và bỏ "Doanh thu cá nhân" cho SALES)
             Row hdr = sheet.createRow(r); hdr.setHeightInPoints(36);
             int c = 0;
             putCell(hdr, c++, "STT", styles.headerCell);
             putCell(hdr, c++, "Họ và tên", styles.headerCell);
             putCell(hdr, c++, "Chức vụ", styles.headerCell);
-            if (isSales) putCell(hdr, c++, "Doanh thu\ncá nhân", styles.headerCell);
-            putCell(hdr, c++, "Tỷ lệ\nKPI (%)", styles.headerCell);
             putCell(hdr, c++, "Bonus\n(thưởng DT)", styles.headerCell);
             putCell(hdr, c++, "Tạm ứng", styles.headerCell);
             putCell(hdr, c++, "Tổng thưởng\n(Bonus - Tạm ứng)", styles.headerNetCell);
@@ -770,7 +830,6 @@ public class SalaryExportService {
                 CellStyle num = even ? styles.numEven : styles.numOdd;
 
                 long bonus = item.getBonusAmount() != null ? item.getBonusAmount() : 0L;
-                double kpiPct = item.getKpiPercent() != null ? item.getKpiPercent() : 100.0;
 
                 var adv = item.getUser() != null
                         ? expenseVoucherRepo.sumSalaryAdvance(item.getUser().getId(), monthStr, ExpenseVoucher.VoucherStatus.APPROVED)
@@ -782,21 +841,13 @@ public class SalaryExportService {
                 putCell(row, c++, String.valueOf(stt), num);
                 putCell(row, c++, item.getUserFullName(), txt);
                 putCell(row, c++, item.getRoleLabel(), txt);
-                if (isSales) {
-                    setMoneyCell(row, c++, item.getRevenue() != null ? item.getRevenue().longValue() : 0L, mny);
-                }
-                putCell(row, c++, String.format("%.0f%%", kpiPct), num);
-                setMoneyCell(row, c++, bonus, mny);
-                setMoneyCell(row, c++, advance, mny);
+                setMoneyCell(row, c++, bonus, mny);     // D
+                setMoneyCell(row, c++, advance, mny);   // E
 
-                // Tổng = Bonus - Tạm ứng (công thức Excel)
+                // Tổng = Bonus - Tạm ứng  (= D - E)
                 int exR = r + 1;
-                int bonusCol = isSales ? 5 : 4;  // E or F
-                int advCol = bonusCol + 1;
-                String bonusRef = colLetter(bonusCol) + exR;
-                String advRef = colLetter(advCol) + exR;
                 Cell tc = row.createCell(c);
-                tc.setCellFormula(bonusRef + "-" + advRef);
+                tc.setCellFormula("D" + exR + "-E" + exR);
                 tc.setCellStyle(net);
 
                 r++; stt++;
@@ -805,7 +856,7 @@ public class SalaryExportService {
             sheet.setColumnWidth(0, 6*256);
             sheet.autoSizeColumn(1);
             sheet.autoSizeColumn(2);
-            for (int i = 3; i < COLS; i++) sheet.setColumnWidth(i, 18*256);
+            for (int i = 3; i < COLS; i++) sheet.setColumnWidth(i, 20*256);
 
             sheet.getPrintSetup().setPaperSize(PrintSetup.A4_PAPERSIZE);
             sheet.getPrintSetup().setLandscape(true);
@@ -1045,10 +1096,14 @@ public class SalaryExportService {
                     setMoneyCell(row1a, 4, br.bonusPayMoto, mny);
                     setMoneyCell(row1a, 5, br.bonusPayTruck, mny);
                     setMoneyCell(row1a, 6, br.advance, mny);
-                    // Tổng = xăng + xe máy + xe tải - tạm ứng  → CÔNG THỨC EXCEL
+                    // FIX (10/2026): Tổng = CEILING(xăng + xe máy + xe tải, 5000) - tạm ứng
+                    // Round UP bước 5.000đ phần GROSS để khớp UI "Thưởng tháng" (UI
+                    // round rowSum trước khi trừ advance). Trước đây dùng công thức
+                    // D+E+F-G trả số thô → PDF/Excel lệch 1-5k so với UI công bố.
                     int excelRow1 = r + 1; // Excel 1-based
                     Cell totalCell = row1a.createCell(7);
-                    totalCell.setCellFormula("D" + excelRow1 + "+E" + excelRow1 + "+F" + excelRow1 + "-G" + excelRow1);
+                    totalCell.setCellFormula(
+                            "CEILING(D" + excelRow1 + "+E" + excelRow1 + "+F" + excelRow1 + ",5000)-G" + excelRow1);
                     totalCell.setCellStyle(net);
                     r++;
 
@@ -1098,9 +1153,11 @@ public class SalaryExportService {
                     setMoneyCell(row1a, 4, br.bonusPayMoto, mny);
                     setMoneyCell(row1a, 5, br.bonusPayTruck, mny);
                     setMoneyCell(row1a, 6, br.advance, mny);
+                    // FIX (10/2026): CEILING round UP 5.000đ (gross) rồi mới trừ tạm ứng — xem comment ở block TÀI XẾ trên.
                     int excelRow1 = r + 1;
                     Cell totalCell = row1a.createCell(7);
-                    totalCell.setCellFormula("D" + excelRow1 + "+E" + excelRow1 + "+F" + excelRow1 + "-G" + excelRow1);
+                    totalCell.setCellFormula(
+                            "CEILING(D" + excelRow1 + "+E" + excelRow1 + "+F" + excelRow1 + ",5000)-G" + excelRow1);
                     totalCell.setCellStyle(net);
                     r++;
 

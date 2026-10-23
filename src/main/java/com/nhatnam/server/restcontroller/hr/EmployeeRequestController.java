@@ -58,8 +58,9 @@ public class EmployeeRequestController {
     // ══════════════════════════════════════════════════════════════════════════
 
     @GetMapping("/form-config")
-    public ResponseEntity<ApiResponse<RequestFormConfigDto>> formConfig() {
-        return ResponseEntity.ok(ApiResponse.success(service.formConfig(), "OK"));
+    public ResponseEntity<ApiResponse<RequestFormConfigDto>> formConfig(
+            @AuthenticationPrincipal User me) {
+        return ResponseEntity.ok(ApiResponse.success(service.formConfig(me), "OK"));
     }
 
     @PostMapping

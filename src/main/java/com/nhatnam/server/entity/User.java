@@ -281,6 +281,18 @@ public class User implements UserDetails {
   private Boolean receiveKpi;
 
   /**
+   * (10/2026) TARGET DOANH THU CÁ NHÂN — chỉ dùng cho SELLER / SUPER_SELLER.
+   *
+   * <p>Giá trị hiện tại (live) — OWNER có thể sửa trong modal "Xác nhận thưởng Sales".
+   * Giá trị snapshot (dùng tính bonus đã publish) nằm ở {@code sales_bonus_override.personal_target}.
+   *
+   * <p>Khi mở lại tháng cũ để tính lại → preview dùng giá trị live này (có thể đã khác
+   * so với lúc publish). Sau khi publish lại → snapshot vào bảng override.
+   */
+  @Column(name = "sales_personal_target")
+  private Long salesPersonalTarget;
+
+  /**
    * NHẬN BONUS hay không — dùng cho phòng Kế toán.
    *
    * <p>Tương tự {@link #receiveKpi} nhưng kiểm soát riêng bonus.

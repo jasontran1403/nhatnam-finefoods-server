@@ -153,12 +153,67 @@ public class AttendanceSheet {
     private Long driverBonusUnitPrice;
 
     /**
+     * (10/2026) CACHE JSON của kết quả tính thưởng tài xế — snapshot của
+     * {@code DriverPayrollConfigDto.rows + nonDriverRows} sau khi OWNER bấm
+     * "Tính thưởng" (state CALCULATED/PUBLISHED). Dùng để load lại không cần
+     * tính lại — vì phần tính rows query nhiều bảng (driver_km, orders,
+     * attendance) + rất chậm (~3s). Khi state=NONE thì field này = null.
+     *
+     * <p>Field này được invalidate khi:
+     *   <ul>
+     *     <li>OWNER bấm "Tính lại" (calculateDriverBonus): overwrite JSON mới</li>
+     *     <li>Chuyển sang state NONE (chưa triển khai; nếu cần thì clear field)</li>
+     *   </ul>
+     */
+    @Column(name = "driver_bonus_cached_json", columnDefinition = "LONGTEXT")
+    private String driverBonusCachedJson;
+
+    /**
      * ĐƠN GIÁ THƯỞNG XE TẢI (đồng / lượt giao).
      * Xe tải có lương cứng riêng (không tính tiền xăng) nhưng vẫn có thưởng theo lượt
      * và OWNER thường trả mức khác với xe máy → tách riêng ô nhập.
      */
     @Column(name = "driver_truck_bonus_unit_price")
     private Long driverTruckBonusUnitPrice;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CẤU HÌNH THƯỞNG DOANH THU SALES (10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Target doanh thu phòng — OWNER nhập mỗi lần tính. */
+    @Column(name = "sales_bonus_target")
+    private Long salesBonusTarget;
+
+    /** Mỗi bước doanh thu (đồng). VD 100.000.000 = mỗi 100tr tính 1 bước. */
+    @Column(name = "sales_bonus_step_amount")
+    private Long salesBonusStepAmount;
+
+    /** Đơn giá thưởng mỗi bước full (VD 400.000đ). */
+    @Column(name = "sales_bonus_step_unit_price")
+    private Long salesBonusStepUnitPrice;
+
+    /**
+     * Hệ số áp dụng khi tính default per-seller:
+     *   • deptRevenue >= target → 1.0 (full)
+     *   • <                    → 0.5 (50%)
+     * Lưu để biết lần trước tính ở hệ số nào, OWNER mở lại thấy ngay.
+     */
+    @Column(name = "sales_bonus_multiplier")
+    private Double salesBonusMultiplier;
+
+    /** Doanh thu phòng (snapshot) tại thời điểm tính — dùng hiển thị modal. */
+    @Column(name = "sales_bonus_dept_revenue")
+    private Long salesBonusDeptRevenue;
+
+    /**
+     * (10/2026) Ladder tiers — JSON array of {thresholdPercent, pricePercent}.
+     * VD [{"thresholdPercent":90,"pricePercent":100},{"thresholdPercent":75,"pricePercent":50}].
+     * Áp dụng per-seller: achievedPercent = sellerRev/personalTarget*100 → tìm tier
+     * đầu tiên có thresholdPercent <= achievedPercent → pricePercent → multiplier = pct/100.
+     * Nếu không khớp bất kỳ tier nào → multiplier = 0.
+     */
+    @Column(name = "sales_bonus_tiers_json", columnDefinition = "TEXT")
+    private String salesBonusTiersJson;
 
     // ══════════════════════════════════════════════════════════════════════
     // HOÀN TẤT XỬ LÝ LƯƠNG

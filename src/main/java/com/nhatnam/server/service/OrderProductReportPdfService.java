@@ -79,13 +79,13 @@ public class OrderProductReportPdfService {
     /** Logo dự phòng khi không đọc được resources/logo.png (giống InvoicePdf). */
     private static final String LOGO_FALLBACK_URL = "https://iili.io/3vdqwMl.md.png";
 
-    /** Chỉ 4 trạng thái này được đưa vào báo cáo sản phẩm. */
-    private static final Set<OrderStatus> REPORTED_STATUSES = EnumSet.of(
-            OrderStatus.PREPARING,
-            OrderStatus.DELIVERING,
-            OrderStatus.PENDING_PAYMENT,
-            OrderStatus.COMPLETED
-    );
+    /**
+     * (10/2026) Báo cáo SẢN PHẨM = tất cả đơn (giống báo cáo Đơn hàng),
+     * kể cả CANCELLED/FAILED/PENDING… vì user cần nhìn tổng quát mọi lượt bán
+     * đã nhập (kể cả đơn đã huỷ). Trước đây chỉ lấy 4 trạng thái → lệch với
+     * báo cáo Đơn hàng.
+     */
+    private static final Set<OrderStatus> REPORTED_STATUSES = EnumSet.allOf(OrderStatus.class);
 
     private final OrderRepository orderRepository;
     private final ProductRepository productRepository;
@@ -100,9 +100,14 @@ public class OrderProductReportPdfService {
      * @param toMs        mốc cuối khoảng thời gian (epoch millis, đã set 23:59:59)
      * @param categoryIds danh mục cần lọc; null/rỗng = tất cả
      * @param exportedBy  tên người xuất báo cáo (in ở khối thông tin đầu file)
+     * @param sellerScopeId (10/2026) nếu khác null: chỉ lấy đơn có
+     *                      {@code order.user.id == sellerScopeId} — dùng cho SELLER
+     *                      ngoài whitelist, để họ chỉ thấy đơn chính mình tạo. null
+     *                      = không scope (role được xem all).
      */
     @Transactional(readOnly = true)
-    public byte[] generatePdf(long fromMs, long toMs, Collection<Long> categoryIds, String exportedBy) throws IOException {
+    public byte[] generatePdf(long fromMs, long toMs, Collection<Long> categoryIds,
+                              String exportedBy, Long sellerScopeId) throws IOException {
 
         // ── 1. Xác định tập sản phẩm được phép theo danh mục ────────────────
         List<Category> activeCategories = categoryRepository.findByIsActiveTrueOrderByNameAsc();
@@ -142,6 +147,11 @@ public class OrderProductReportPdfService {
         // Chỉ báo cáo 4 trạng thái: Đang chuẩn bị / Đang giao / Đã giao (chờ TT) / Hoàn thành.
         List<Order> orders = new ArrayList<>(orderRepository.findByCreatedAtBetween(fromMs, toMs));
         orders.removeIf(o -> o.getStatus() == null || !REPORTED_STATUSES.contains(o.getStatus()));
+        // (10/2026) SELLER ngoài whitelist → chỉ đơn do họ tạo.
+        if (sellerScopeId != null) {
+            final Long sid = sellerScopeId;
+            orders.removeIf(o -> o.getUser() == null || !sid.equals(o.getUser().getId()));
+        }
         orders.sort((a, b) -> {
             long ca = a.getCreatedAt() == null ? Long.MAX_VALUE : a.getCreatedAt();
             long cb = b.getCreatedAt() == null ? Long.MAX_VALUE : b.getCreatedAt();

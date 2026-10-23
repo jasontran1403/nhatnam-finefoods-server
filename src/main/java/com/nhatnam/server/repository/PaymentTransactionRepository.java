@@ -38,13 +38,23 @@ public interface PaymentTransactionRepository extends JpaRepository<PaymentTrans
     // ── Tổng hợp doanh thu theo khoảng thời gian ────────────────────────────
 
     /**
-     * Tổng tiền THỰC THU trong 1 khoảng thời gian (epoch ms).
-     * Dùng cho KẾ TOÁN: tính tất cả đơn, không lọc theo người tạo.
+     * Tổng tiền THỰC THU (EX-VAT) trong 1 khoảng thời gian — dùng chia hoa hồng.
      *
-     * <p>Chỉ tính đơn có status IN (PENDING_PAYMENT, COMPLETED) để loại đơn HỦY.
+     * <p>Mỗi lần thu được trừ VAT theo tỷ trọng:
+     * <pre>net = amount × (finalAmount − vatAmount) / finalAmount</pre>
+     * Vì vậy khi 1 đơn thu nhiều lần (vd 1.4tr tháng 10 + 273k tháng 11), mỗi
+     * tháng chỉ lấy phần net của lần thu rơi vào tháng đó — tổng net của tất cả
+     * các lần thu luôn bằng {@code paidAmount × (final − vat) / final}.
+     *
+     * <p>Chỉ tính đơn status IN (PENDING_PAYMENT, COMPLETED), loại đơn HỦY.
+     * {@code finalAmount = 0} → không chia (lấy nguyên amount), tránh div-by-zero.
      */
     @Query("""
-            SELECT COALESCE(SUM(pt.amount), 0)
+            SELECT COALESCE(SUM(
+                CASE WHEN o.finalAmount > 0
+                     THEN pt.amount * (o.finalAmount - COALESCE(o.vatAmount, 0)) / o.finalAmount
+                     ELSE pt.amount
+                END), 0)
             FROM PaymentTransaction pt
             JOIN pt.order o
             WHERE pt.createdAt >= :startMs
@@ -55,11 +65,15 @@ public interface PaymentTransactionRepository extends JpaRepository<PaymentTrans
                                    @Param("endMs")   long endMs);
 
     /**
-     * Tổng tiền THỰC THU của 1 seller cụ thể trong 1 khoảng thời gian.
-     * Dùng cho KINH DOANH: chỉ tính đơn do user đó tạo.
+     * Tổng tiền THỰC THU (EX-VAT) của 1 seller cụ thể — dùng chia hoa hồng KD.
+     * Áp cùng công thức trừ VAT theo tỷ trọng như {@link #sumRevenueAllOrders}.
      */
     @Query("""
-            SELECT COALESCE(SUM(pt.amount), 0)
+            SELECT COALESCE(SUM(
+                CASE WHEN o.finalAmount > 0
+                     THEN pt.amount * (o.finalAmount - COALESCE(o.vatAmount, 0)) / o.finalAmount
+                     ELSE pt.amount
+                END), 0)
             FROM PaymentTransaction pt
             JOIN pt.order o
             WHERE pt.createdAt >= :startMs

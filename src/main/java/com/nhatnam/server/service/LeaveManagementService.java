@@ -70,6 +70,7 @@ public class LeaveManagementService {
     private final PayrollDepartmentResolver deptResolver;
     private final AttendanceEntryRepository attendanceEntryRepo;
     private final ManualLeaveUsageRepository manualUsageRepo;
+    private final com.nhatnam.server.repository.AttendanceSheetRepository attendanceSheetRepo;
 
     /**
      * Ranh giới ô tháng "nhập tay" vs "tính từ phiếu":
@@ -312,7 +313,10 @@ public class LeaveManagementService {
 
         long entitledMinutes   = Math.round(
                 (prior + currentEntitled + totalPlus) * LEAVE_MINUTES_PER_DAY);
-        long remainingMinutes  = entitledMinutes - totalUsedMinutes;
+        // (10/2026) Clamp ≥ 0: khi tổng đã dùng vượt quỹ (phiếu + attendance
+        // deduct bake-in), display âm làm hoảng. Hiển thị 0 — luồng mới
+        // per-day attribution ngăn phần vượt khi tính lại lương.
+        long remainingMinutes  = Math.max(0L, entitledMinutes - totalUsedMinutes);
 
         return EmployeeRow.builder()
                 .userId(u.getId())
@@ -425,6 +429,12 @@ public class LeaveManagementService {
     }
 
     private int leaveMinutesUsedInMonth(Long userId, int month, int year) {
+        // (10/2026) CHỈ tính phần đi trễ/về sớm đã trừ vào quỹ phép nếu
+        // tháng đó đã PUBLIC (sheet.finalized=true). Khi OWNER bấm "Mở lại"
+        // tháng đó → sheet.unfinalize() → trả phần đã trừ về quỹ phép ngay,
+        // không chờ re-import file. Entry vẫn giữ leaveMinutesUsed để lịch
+        // sử tính lại khi re-publish đúng số cũ nếu file không thay đổi.
+        if (!attendanceSheetRepo.isLockedForLeaveDeduction(month, year)) return 0;
         return attendanceEntryRepo
                 .findByUserAndPeriod(userId, month, year)
                 .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)

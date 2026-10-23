@@ -38,7 +38,8 @@ public class SecurityConfiguration {
             "/ws/**",
             "/configuration/ui",
             "/configuration/security",
-            "/webjars/**"
+            "/webjars/**",
+            "/error"
     };
 
     private final JwtAuthenticationFilter jwtAuthFilter;
@@ -69,13 +70,21 @@ public class SecurityConfiguration {
                                 .requestMatchers("/api/operator/**").hasAnyRole(Role.OPERATOR.name(), ADMIN.name(), OWNER.name())
                                 // Quản lý camera — chỉ OWNER/ADMIN
                                 .requestMatchers("/api/camera/**").hasAnyRole(OWNER.name(), ADMIN.name(), SUPERADMIN.name())
-                                // Danh mục nguyên liệu xưởng (factory_material) — CHỈ Owner/Admin được
-                                // xem/tạo/sửa/bật-tắt (route thật: FactoryMaterialController, GET dùng
-                                // chung cho xưởng xem danh mục để chọn — chỉ chặn ghi).
+                                // Danh mục nguyên liệu xưởng (factory_material) — tạo/sửa/bật-tắt.
+                                // GET dùng chung cho xưởng xem danh mục để chọn (được bao bởi rule
+                                // /api/owner/production/** bên dưới). Ghi (POST/PUT/PATCH): mở thêm
+                                // cho FACTORY_WORKER / SUPER_FACTORY_WORKER để nhân viên xưởng
+                                // được tạo nguyên liệu như OWNER yêu cầu.
                                 // Đặt TRƯỚC rule /api/factory/** rộng hơn để khớp đúng rule này trước.
-                                .requestMatchers(HttpMethod.POST, "/api/owner/factory/materials").hasAnyRole(OWNER.name(), ADMIN.name(), SUPERADMIN.name())
-                                .requestMatchers(HttpMethod.PUT, "/api/owner/factory/materials/**").hasAnyRole(OWNER.name(), ADMIN.name(), SUPERADMIN.name())
-                                .requestMatchers(HttpMethod.PATCH, "/api/owner/factory/materials/**").hasAnyRole(OWNER.name(), ADMIN.name(), SUPERADMIN.name())
+                                .requestMatchers(HttpMethod.POST, "/api/owner/factory/materials").hasAnyRole(
+                                        OWNER.name(), ADMIN.name(), SUPERADMIN.name(),
+                                        FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())
+                                .requestMatchers(HttpMethod.PUT, "/api/owner/factory/materials/**").hasAnyRole(
+                                        OWNER.name(), ADMIN.name(), SUPERADMIN.name(),
+                                        FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())
+                                .requestMatchers(HttpMethod.PATCH, "/api/owner/factory/materials/**").hasAnyRole(
+                                        OWNER.name(), ADMIN.name(), SUPERADMIN.name(),
+                                        FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())
                                 // Export/Import Excel máy móc & thành phẩm sản xuất — chỉ Owner/Admin.
                                 // Đặt TRƯỚC rule /api/factory/** để khớp đúng rule này trước.
                                 .requestMatchers(
@@ -127,7 +136,9 @@ public class SecurityConfiguration {
                                         FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())
                                 .requestMatchers(HttpMethod.POST, "/api/owner/production/plans")
                                 .hasAnyRole(OWNER.name(), ADMIN.name(), SUPERADMIN.name(),
-                                        SELLER.name(), SUPER_SELLER.name())
+                                        SELLER.name(), SUPER_SELLER.name(),
+                                        // Nhân viên / Trưởng xưởng cũng được chủ động tạo kế hoạch SX
+                                        FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())
                                 .requestMatchers("/api/owner/production/**").hasAnyRole(OWNER.name(), FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())
                                 .requestMatchers("/api/upload/production/**").hasAnyRole(OWNER.name(), FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), SUPER_ACCOUNTANT.name(), FACTORY_STAFF.name())
                                 .requestMatchers("/production-files/**").hasAnyRole(OWNER.name(), FACTORY_WORKER.name(), SUPER_FACTORY_WORKER.name(), FACTORY_STAFF.name())

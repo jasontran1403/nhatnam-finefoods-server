@@ -28,6 +28,17 @@ public interface DriverAttendanceRepository extends JpaRepository<DriverAttendan
     @Query("SELECT a FROM DriverAttendance a WHERE a.attendanceDate BETWEEN :from AND :to ORDER BY a.attendanceDate DESC, a.createdAt ASC")
     List<DriverAttendance> findByDateRange(@Param("from") String from, @Param("to") String to);
 
+    /** (10/2026 FIX perf) Filter theo driver_id ngay trong SQL thay vì load all + filter in-memory. */
+    @Query("""
+            SELECT a FROM DriverAttendance a
+            WHERE a.driver.id = :driverId
+              AND a.attendanceDate BETWEEN :from AND :to
+            ORDER BY a.attendanceDate DESC, a.createdAt ASC
+            """)
+    List<DriverAttendance> findByDriverAndDateRange(@Param("driverId") Long driverId,
+                                                    @Param("from") String from,
+                                                    @Param("to") String to);
+
     /**
      * SỐ ODO ĐÃ GHI GẦN NHẤT TRƯỚC MỘT NGÀY, của cùng tài xế + cùng loại xe.
      *
