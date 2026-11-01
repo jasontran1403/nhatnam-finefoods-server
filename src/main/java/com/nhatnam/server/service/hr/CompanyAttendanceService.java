@@ -870,19 +870,25 @@ public class CompanyAttendanceService {
         }
         DayCount dc = computeDayCount(b, isPartTime, effects);
 
-        // ── (10/2026) PER-DAY ATTRIBUTION cho đi trễ/về sớm ─────────────────
-        //
-        // Chính sách MỚI (owner confirm):
-        //   1. Mỗi ngày tính riêng phút TRỄ (VÀO) + VỀ SỚM (RA) — cả fulltime
-        //      lẫn parttime. Du di 5 phút MỖI đầu.
-        //   2. Duyệt NGÀY THEO THỨ TỰ. Mỗi ngày: trừ min(deductMin, phép còn)
-        //      vào quỹ phép. Phần CHƯA bù (uncovered) → giảm công NGÀY ĐÓ:
-        //          cong_day = baseActual × (standardMin − uncovered) / standardMin
-        //        CEIL 2 chữ số (fulltime standardMin=480; parttime standardMin=240,
-        //        baseActual trần 0.5).
-        //   3. Quỹ phép KHÔNG được âm — "nếu còn 0 thì ko trừ phép, trừ vào công".
-        //   4. Phép dư còn lại dùng ĐỂ NÂNG NGÀY NỬA CÔNG → công đầy đủ (Issue 1).
-        int leaveBalanceMinutes = loadLeaveBalanceMinutes(u, sheet.getYear());
+        // (10/2026) CHỈ phòng SẢN XUẤT (FACTORY) mới trừ phút đi trễ/về sớm
+        // vào quỹ phép. Các phòng Kế toán / Kinh doanh / Kho / Tài xế TẠM
+        // THỜI KHÔNG áp — late/early chỉ ghi nhận KPI, không ảnh hưởng công
+        // / phép. Chủ sẽ đổi chính sách sau; khi đổi, chỉ cần đảo cờ
+        // `applyLeaveDeduction` dưới.
+        // OWNER/ADMIN luôn bỏ dù payroll_role trỏ về FACTORY_* (Chủ Tịch bị
+        // kéo nhầm vào xưởng do data cũ) — họ không thuộc dây chuyền sản xuất.
+        java.util.Set<com.nhatnam.server.enumtype.Role> uRoles = u.getAllRoles();
+        boolean isTopManagement = uRoles != null
+                && (uRoles.contains(com.nhatnam.server.enumtype.Role.OWNER)
+                || uRoles.contains(com.nhatnam.server.enumtype.Role.ADMIN));
+        PayrollDepartment userDept = PayrollDepartment.of(
+                PayrollDepartment.resolvePayrollRole(u.getRoles()));
+        boolean applyLeaveDeduction = !isTopManagement
+                && (userDept == PayrollDepartment.FACTORY);
+
+        int leaveBalanceMinutes = applyLeaveDeduction
+                ? loadLeaveBalanceMinutes(u, sheet.getYear())
+                : 0;
         int remainingBalance = leaveBalanceMinutes;
         int consumedFromLeave = 0;
         double actualFromPunch = 0.0, mealFromPunch = 0.0;
@@ -899,7 +905,13 @@ public class CompanyAttendanceService {
             double dayActual = dd.baseActual();
             double dayMeal   = dd.baseMeal();
             int deduct = dd.deductMinutes();
-            if (deduct > 0 && dayActual > 0) {
+
+            // ── (10/2026) BẬT/TẮT trừ phép theo phòng ────────────────────────
+            // FACTORY: duyệt per-day — trừ phép trước, hết phép thì trừ công.
+            // Các phòng khác: TẠM BỎ, không trừ gì cả — nhánh dưới chỉ chạy
+            // khi applyLeaveDeduction=true. Khi cần bật lại cho phòng khác,
+            // chỉ cần đổi điều kiện ở biến này.
+            if (applyLeaveDeduction && deduct > 0 && dayActual > 0) {
                 int take = Math.min(deduct, remainingBalance);
                 remainingBalance -= take;
                 consumedFromLeave += take;
@@ -916,15 +928,27 @@ public class CompanyAttendanceService {
                     if (dayActual <= 0) dayMeal = 0;
                 }
             }
+            // ── NHÁNH CŨ (đoạn trừ nguyên gộp cả tháng rồi chia 480) đã bị
+            //    thay bằng per-day attribution ở trên. GIỮ COMMENT để tham
+            //    chiếu khi muốn áp lại cho non-FACTORY sau này:
+            //
+            //    int monthlyLateMinutes = isPartTime ? 0 : dc.lateMinutesForPenalty;
+            //    int consumedForLate = Math.min(monthlyLateMinutes, leaveBalanceMinutes);
+            //    int remainingLate   = monthlyLateMinutes - consumedForLate;
+            //    double lateDaysDeduct = remainingLate / (double) LEAVE_MINUTES_PER_DAY;
+            //    double adjustedActualDays = Math.max(0.0, dc.actualDays - lateDaysDeduct);
+
             actualFromPunch += dayActual;
             mealFromPunch   += dayMeal;
         }
 
         // (10/2026 — Issue 1) Dùng phép CÒN LẠI nâng ngày NỬA CÔNG → đầy đủ.
-        // Chỉ áp cho fulltime (parttime max 0.5/ngày, không có khái niệm "nâng").
+        // Chỉ áp cho fulltime FACTORY (parttime max 0.5/ngày, non-FACTORY tạm
+        // không tiêu phép → nhánh này cũng tắt luôn cho họ).
         int promotedCount = 0;
         int consumedForPromote = 0;
-        if (!isPartTime && dc.halfDayShortfalls != null && !dc.halfDayShortfalls.isEmpty()) {
+        if (applyLeaveDeduction && !isPartTime
+                && dc.halfDayShortfalls != null && !dc.halfDayShortfalls.isEmpty()) {
             java.util.List<Integer> sfs = new java.util.ArrayList<>(dc.halfDayShortfalls);
             java.util.Collections.sort(sfs);
             for (int sf : sfs) {

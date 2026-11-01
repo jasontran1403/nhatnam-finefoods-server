@@ -117,10 +117,24 @@ public class LeaveManagementService {
         Map<String, List<User>> grouped = new LinkedHashMap<>();
         for (String d : DEPARTMENT_ORDER) grouped.put(d, new ArrayList<>());
         for (User u : active) {
+            // (10/2026) OWNER / ADMIN → luôn thuộc nhóm "Quản lý cấp cao",
+            // kể cả khi cột payroll_role đang trỏ về bộ phận khác (data cũ
+            // của Nam Đức bị set nhầm FACTORY_PRODUCTION_WORKER → bị kéo vào
+            // Xưởng mặc dù là Chủ Tịch).
+            Set<Role> allRoles = u.getAllRoles();
+            boolean isTopManagement = allRoles != null
+                    && (allRoles.contains(Role.OWNER) || allRoles.contains(Role.ADMIN));
             PayrollDepartment pd = deptResolver.departmentOf(u);
-            if (pd == null) continue;
-            String key = (pd == PayrollDepartment.WAREHOUSE || pd == PayrollDepartment.DRIVER)
-                    ? "WAREHOUSE_AND_DRIVER" : pd.name();
+            if (!isTopManagement && pd == null) continue;
+
+            String key;
+            if (isTopManagement) {
+                key = "MANAGEMENT";
+            } else if (pd == PayrollDepartment.WAREHOUSE || pd == PayrollDepartment.DRIVER) {
+                key = "WAREHOUSE_AND_DRIVER";
+            } else {
+                key = pd.name();
+            }
             grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(u);
         }
         for (var e : grouped.entrySet()) {
@@ -434,7 +448,18 @@ public class LeaveManagementService {
         // tháng đó → sheet.unfinalize() → trả phần đã trừ về quỹ phép ngay,
         // không chờ re-import file. Entry vẫn giữ leaveMinutesUsed để lịch
         // sử tính lại khi re-publish đúng số cũ nếu file không thay đổi.
+        //
+        // (10/2026) Thêm điều kiện phòng: CHỈ FACTORY mới bị trừ phút trễ/sớm
+        // vào quỹ phép. Non-FACTORY luôn 0 dù entry cũ còn bake-in giá trị
+        // (data lịch sử từ chính sách cũ), để Quản lý phép khớp luật mới.
         if (!attendanceSheetRepo.isLockedForLeaveDeduction(month, year)) return 0;
+        User u = userRepository.findById(userId).orElse(null);
+        if (u == null) return 0;
+        // OWNER/ADMIN luôn bỏ, kể cả payroll_role bị set FACTORY_* nhầm.
+        if (u.getAllRoles() != null
+                && (u.getAllRoles().contains(Role.OWNER) || u.getAllRoles().contains(Role.ADMIN)))
+            return 0;
+        if (deptResolver.departmentOf(u) != PayrollDepartment.FACTORY) return 0;
         return attendanceEntryRepo
                 .findByUserAndPeriod(userId, month, year)
                 .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)

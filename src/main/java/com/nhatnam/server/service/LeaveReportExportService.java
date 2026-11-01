@@ -119,10 +119,19 @@ public class LeaveReportExportService {
         for (String dept : DEPARTMENT_ORDER) grouped.put(dept, new ArrayList<>());
 
         for (User u : activeUsers) {
+            // (10/2026) OWNER / ADMIN LUÔN thuộc Quản lý cấp cao — khớp với
+            // LeaveManagementService để trang và file export cùng kết quả.
+            java.util.Set<com.nhatnam.server.enumtype.Role> allRoles = u.getAllRoles();
+            boolean isTopManagement = allRoles != null
+                    && (allRoles.contains(com.nhatnam.server.enumtype.Role.OWNER)
+                    || allRoles.contains(com.nhatnam.server.enumtype.Role.ADMIN));
             PayrollDepartment pd = deptResolver.departmentOf(u);
-            if (pd == null) continue;
-            String key = (pd == PayrollDepartment.WAREHOUSE || pd == PayrollDepartment.DRIVER)
-                    ? "WAREHOUSE_AND_DRIVER" : pd.name();
+            if (!isTopManagement && pd == null) continue;
+            String key;
+            if (isTopManagement) key = "MANAGEMENT";
+            else if (pd == PayrollDepartment.WAREHOUSE || pd == PayrollDepartment.DRIVER)
+                key = "WAREHOUSE_AND_DRIVER";
+            else key = pd.name();
             grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(u);
         }
 
@@ -556,7 +565,16 @@ public class LeaveReportExportService {
         // (10/2026) Mirror EmployeeRequestService + LeaveManagementService:
         // CHỈ tính phần đã trừ vào quỹ phép nếu tháng đó đã PUBLIC. Khi OWNER
         // "Mở lại" lương tháng đó → refund tức thì, không chờ re-import file.
+        // Thêm điều kiện phòng: CHỈ FACTORY mới bị trừ phút trễ/sớm.
         if (!attendanceSheetRepo.isLockedForLeaveDeduction(month, year)) return 0;
+        com.nhatnam.server.entity.User u = userRepository.findById(userId).orElse(null);
+        if (u == null) return 0;
+        // OWNER/ADMIN luôn bỏ, kể cả payroll_role bị set FACTORY_* nhầm.
+        if (u.getAllRoles() != null
+                && (u.getAllRoles().contains(com.nhatnam.server.enumtype.Role.OWNER)
+                || u.getAllRoles().contains(com.nhatnam.server.enumtype.Role.ADMIN)))
+            return 0;
+        if (deptResolver.departmentOf(u) != PayrollDepartment.FACTORY) return 0;
         return attendanceEntryRepo
                 .findByUserAndPeriod(userId, month, year)
                 .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)

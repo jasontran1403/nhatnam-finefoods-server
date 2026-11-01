@@ -583,6 +583,19 @@ public class EmployeeRequestService {
         // Trước đây chỉ đếm effectivePaidLeaveDays (EmployeeRequest.paidLeaveDays)
         // cho CẢ năm, không phân tháng, không đọc manual, không đọc attendance.
         // → nhân viên có bù trễ/sớm ở tháng cũ sẽ thấy quỹ nhiều hơn thực tế.
+        // (10/2026) CHỈ phòng SẢN XUẤT (FACTORY) mới trừ phút đi trễ/về sớm
+        // vào quỹ phép. Non-FACTORY: skip attendance deduction KHÔNG kể entry
+        // cũ còn giá trị bake-in. Resolve 1 lần ngoài vòng for để không query
+        // dept cho từng tháng.
+        // OWNER/ADMIN: luôn bỏ, kể cả khi payroll_role đang bị set nhầm sang
+        // FACTORY_* (data cũ của Nam Đức) — họ không thuộc dây chuyền sản xuất.
+        java.util.Set<com.nhatnam.server.enumtype.Role> allRoles = u.getAllRoles();
+        boolean isTopManagement = allRoles != null
+                && (allRoles.contains(com.nhatnam.server.enumtype.Role.OWNER)
+                || allRoles.contains(com.nhatnam.server.enumtype.Role.ADMIN));
+        boolean isFactoryUser = !isTopManagement
+                && deptResolver.departmentOf(u) == PayrollDepartment.FACTORY;
+
         List<EmployeeRequest> yearLeaves = repo.findApprovedLeavesOfYear(userId, y);
         long usedMinutes = 0;
         for (int m = 1; m <= 12; m++) {
@@ -595,18 +608,18 @@ public class EmployeeRequestService {
                 double paidDays = calcPaidLeaveDaysInMonth(yearLeaves, m, y);
 
                 // (10/2026) Phần đi trễ/về sớm trừ vào quỹ phép CHỈ ĐƯỢC TÍNH
-                // khi lương tháng đó đã PUBLIC (sheet.finalized=true). Khi
-                // OWNER bấm "Mở lại" tháng đó → sheet.unfinalize() → phần đã
-                // trừ phải được REFUND vào quỹ phép ngay, không chờ re-import
-                // file. Trước đây leaveMinutesUsed vẫn còn trên entry nên quỹ
-                // phép vẫn hiển thị bị trừ → user phản ánh "mở lại mà vẫn trừ".
-                boolean monthLocked = attendanceSheetRepo.isLockedForLeaveDeduction(m, y);
-                int deductMinutes = monthLocked
-                        ? attendanceEntryRepo
-                        .findByUserAndPeriod(userId, m, y)
-                        .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)
-                        .orElse(0)
-                        : 0;
+                // khi (a) user thuộc phòng Xưởng (các phòng khác tạm bỏ) VÀ
+                // (b) lương tháng đó đã PUBLIC (sheet đang KHOÁ). Mở lại
+                // tháng → refund tức thì; non-FACTORY luôn 0 bất kể trạng
+                // thái sheet, vì luật mới không tính attendance deduct cho họ.
+                int deductMinutes = 0;
+                if (isFactoryUser
+                        && attendanceSheetRepo.isLockedForLeaveDeduction(m, y)) {
+                    deductMinutes = attendanceEntryRepo
+                            .findByUserAndPeriod(userId, m, y)
+                            .map(e -> e.getLeaveMinutesUsed() != null ? e.getLeaveMinutesUsed() : 0)
+                            .orElse(0);
+                }
                 usedMinutes += Math.round(paidDays * LEAVE_MINUTES_PER_DAY) + deductMinutes;
             }
         }
